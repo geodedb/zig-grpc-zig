@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "spice", .module = spice_mod }},
     });
+    server_mod.linkLibrary(zlib_lib);
 
     // Client module (for internal use and library export)
     const client_mod = b.addModule("grpc-client", .{
@@ -73,6 +74,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "spice", .module = spice_mod }},
     });
+    client_mod.linkLibrary(zlib_lib);
 
     // Benchmark executable
     const benchmark = b.addExecutable(.{
