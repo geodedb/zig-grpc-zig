@@ -375,7 +375,7 @@ pub const Transport = struct {
         if (value < mask) return .{ .value = value, .consumed = 1 };
         // Multi-byte integer
         var pos: usize = 1;
-        var m: u6 = 0;
+        var m: std.math.Log2Int(usize) = 0;
         while (pos < data.len) {
             const b = data[pos];
             value += @as(usize, b & 0x7F) << m;
