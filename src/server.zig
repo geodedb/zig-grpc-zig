@@ -7,9 +7,14 @@ const auth = @import("features/auth.zig");
 const streaming = @import("features/streaming.zig");
 const health = @import("features/health.zig");
 
+pub const Transport = transport.Transport;
+pub const TlsIo = transport.TlsIo;
+
 pub const Handler = struct {
     name: []const u8,
-    handler_fn: *const fn ([]const u8, std.mem.Allocator) anyerror![]u8,
+    /// Handler receives: request bytes, method path, transport (for streaming writes), allocator.
+    /// For unary RPCs, call trans.writeMessage(). For streaming, use writeStreamMessage()+endStream().
+    handler_fn: *const fn ([]const u8, []const u8, *transport.Transport, std.mem.Allocator) anyerror!void,
 };
 
 pub const GrpcServer = struct {
@@ -20,10 +25,11 @@ pub const GrpcServer = struct {
     compression: compression.Compression,
     auth: auth.Auth,
     health_check: health.HealthCheck,
+    on_tls_accept: ?*const fn (std.net.Stream) anyerror!transport.TlsIo = null,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, secret_key: []const u8) !GrpcServer {
-        const address = try std.net.Address.parseIp("127.0.0.1", port);
-        const server = try address.listen(.{ .reuse_address = false });
+        const address = try std.net.Address.parseIp("0.0.0.0", port);
+        const server = try address.listen(.{ .reuse_address = true });
         return GrpcServer{
             .allocator = allocator,
             .address = address,
@@ -55,7 +61,10 @@ pub const GrpcServer = struct {
     }
 
     fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection) !void {
-        var trans = try transport.Transport.initServer(self.allocator, conn.stream);
+        var trans = if (self.on_tls_accept) |accept_fn| blk: {
+            const tls_io = try accept_fn(conn.stream);
+            break :blk try transport.Transport.initServerTls(self.allocator, conn.stream, tls_io);
+        } else try transport.Transport.initServer(self.allocator, conn.stream);
         defer trans.deinit();
 
         // Setup streaming
@@ -69,28 +78,18 @@ pub const GrpcServer = struct {
             };
             defer self.allocator.free(message);
 
-            // TODO: Extract headers from HTTP/2 frames for auth verification
-            // For now, skip auth verification
-            // try self.auth.verifyToken("");
-
-            // TODO: Extract compression algorithm from HTTP/2 headers
-            // For now, assume no compression on incoming messages
             const compression_alg = compression.Compression.Algorithm.none;
             const decompressed = try self.compression.decompress(message, compression_alg);
             defer self.allocator.free(decompressed);
 
-            // Process message - only call the first handler
-            // TODO: Implement proper method routing based on request headers
+            // Route to handler, passing the method path and transport
+            const method = trans.lastMethod();
             if (self.handlers.items.len > 0) {
                 const handler = self.handlers.items[0];
-                const response = try handler.handler_fn(decompressed, self.allocator);
-                defer self.allocator.free(response);
-
-                // Use same compression as request
-                const compressed = try self.compression.compress(response, compression_alg);
-                defer self.allocator.free(compressed);
-
-                try trans.writeMessage(compressed);
+                handler.handler_fn(decompressed, method, &trans, self.allocator) catch |err| {
+                    std.log.err("Handler error: {}", .{err});
+                    continue;
+                };
             }
         }
     }

@@ -14,20 +14,51 @@ pub const TransportError = error{
     Http2Error,
 };
 
+/// HPACK dynamic table entry for tracking :path values across requests.
+const HpackDynEntry = struct {
+    is_path: bool = false,
+    path: [128]u8 = .{0} ** 128,
+    path_len: usize = 0,
+};
+
+const HPACK_DYN_MAX = 128;
+
+/// I/O abstraction for TLS-wrapped connections.
+/// The caller provides opaque context and function pointers for read/write/close.
+pub const TlsIo = struct {
+    ctx: *anyopaque,
+    read_fn: *const fn (*anyopaque, []u8) anyerror!usize,
+    write_fn: *const fn (*anyopaque, []const u8) anyerror!usize,
+    close_fn: *const fn (*anyopaque) void,
+};
+
 pub const Transport = struct {
     stream: net.Stream,
+    tls_io: ?TlsIo = null,
     read_buf: []u8,
     write_buf: []u8,
     allocator: std.mem.Allocator,
     http2_conn: ?http2.connection.Connection,
+    /// Track the stream ID from the client's HEADERS frame for responses
+    last_stream_id: u31,
+    /// The gRPC method path extracted from the last HEADERS frame (e.g. "/geode.GeodeService/Handshake")
+    last_method: [256]u8 = .{0} ** 256,
+    last_method_len: usize = 0,
+    /// HPACK dynamic table (ring buffer, newest entry at hpack_dyn_head)
+    hpack_dyn: [HPACK_DYN_MAX]HpackDynEntry = [_]HpackDynEntry{.{}} ** HPACK_DYN_MAX,
+    hpack_dyn_count: usize = 0,
+    hpack_dyn_head: usize = 0,
 
-    pub fn initClient(allocator: std.mem.Allocator, stream: net.Stream) !Transport {
+    pub fn initClient(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
         var transport = Transport{
-            .stream = stream,
+            .stream = stream_,
             .read_buf = try allocator.alloc(u8, 1024 * 64),
             .write_buf = try allocator.alloc(u8, 1024 * 64),
             .allocator = allocator,
             .http2_conn = null,
+            .last_stream_id = 1,
+            .last_method = .{0} ** 256,
+            .last_method_len = 0,
         };
 
         // Initialize HTTP/2 connection
@@ -37,13 +68,16 @@ pub const Transport = struct {
         return transport;
     }
 
-    pub fn initServer(allocator: std.mem.Allocator, stream: net.Stream) !Transport {
+    pub fn initServer(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
         var transport = Transport{
-            .stream = stream,
+            .stream = stream_,
             .read_buf = try allocator.alloc(u8, 1024 * 64),
             .write_buf = try allocator.alloc(u8, 1024 * 64),
             .allocator = allocator,
             .http2_conn = null,
+            .last_stream_id = 1,
+            .last_method = .{0} ** 256,
+            .last_method_len = 0,
         };
 
         // Initialize HTTP/2 connection
@@ -53,18 +87,53 @@ pub const Transport = struct {
         return transport;
     }
 
+    pub fn initServerTls(allocator: std.mem.Allocator, stream_: net.Stream, tls_io_: TlsIo) !Transport {
+        var transport = Transport{
+            .stream = stream_,
+            .tls_io = tls_io_,
+            .read_buf = try allocator.alloc(u8, 1024 * 64),
+            .write_buf = try allocator.alloc(u8, 1024 * 64),
+            .allocator = allocator,
+            .http2_conn = null,
+            .last_stream_id = 1,
+            .last_method = .{0} ** 256,
+            .last_method_len = 0,
+        };
+
+        // Initialize HTTP/2 connection
+        transport.http2_conn = try http2.connection.Connection.init(allocator);
+        try transport.setupHttp2Server();
+
+        return transport;
+    }
+
+    fn ioRead(self: *Transport, buf: []u8) !usize {
+        if (self.tls_io) |tio| return tio.read_fn(tio.ctx, buf);
+        return self.stream.read(buf);
+    }
+
+    fn ioWrite(self: *Transport, data: []const u8) !usize {
+        if (self.tls_io) |tio| return tio.write_fn(tio.ctx, data);
+        return self.stream.write(data);
+    }
+
+    fn ioClose(self: *Transport) void {
+        if (self.tls_io) |tio| tio.close_fn(tio.ctx);
+        self.stream.close();
+    }
+
     pub fn deinit(self: *Transport) void {
         if (self.http2_conn) |*conn| {
             conn.deinit();
         }
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
-        self.stream.close();
+        self.ioClose();
     }
 
     fn setupHttp2Client(self: *Transport) !void {
         // Client sends HTTP/2 connection preface
-        _ = try self.stream.write(http2.connection.Connection.PREFACE);
+        _ = try self.ioWrite(http2.connection.Connection.PREFACE);
 
         // Send initial SETTINGS frame
         const settings_header: [9]u8 = .{
@@ -73,106 +142,439 @@ pub const Transport = struct {
             0, // flags: none
             0, 0, 0, 0, // stream_id: 0
         };
-        _ = try self.stream.write(&settings_header);
+        _ = try self.ioWrite(&settings_header);
+    }
+
+    /// Read exactly `buf.len` bytes from the stream, handling partial reads.
+    fn readExact(self: *Transport, buf: []u8) !void {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = try self.ioRead(buf[total..]);
+            if (n == 0) return TransportError.ConnectionClosed;
+            total += n;
+        }
+    }
+
+    /// Read a single HTTP/2 frame header and payload.
+    /// Returns frame_type, flags, stream_id, and allocated payload.
+    fn readFrame(self: *Transport) !struct { frame_type: u8, flags: u8, stream_id: u31, payload: []u8 } {
+        var header: [9]u8 = undefined;
+        try self.readExact(&header);
+
+        const length: u24 = (@as(u24, header[0]) << 16) | (@as(u24, header[1]) << 8) | @as(u24, header[2]);
+        const frame_type = header[3];
+        const flags = header[4];
+        const stream_id: u31 = @intCast(
+            (@as(u32, header[5] & 0x7F) << 24) |
+                (@as(u32, header[6]) << 16) |
+                (@as(u32, header[7]) << 8) |
+                @as(u32, header[8]),
+        );
+
+        const payload = try self.allocator.alloc(u8, length);
+        errdefer self.allocator.free(payload);
+
+        if (length > 0) {
+            try self.readExact(payload);
+        }
+
+        return .{ .frame_type = frame_type, .flags = flags, .stream_id = stream_id, .payload = payload };
+    }
+
+    /// Write an HTTP/2 frame with the given type, flags, stream ID, and payload.
+    fn writeFrame(self: *Transport, frame_type: http2.frame.FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
+        const length: u24 = @intCast(payload.len);
+        var header: [9]u8 = undefined;
+        header[0] = @intCast((length >> 16) & 0xFF);
+        header[1] = @intCast((length >> 8) & 0xFF);
+        header[2] = @intCast(length & 0xFF);
+        header[3] = @intFromEnum(frame_type);
+        header[4] = flags;
+        header[5] = @intCast((@as(u32, stream_id) >> 24) & 0x7F);
+        header[6] = @intCast((@as(u32, stream_id) >> 16) & 0xFF);
+        header[7] = @intCast((@as(u32, stream_id) >> 8) & 0xFF);
+        header[8] = @intCast(@as(u32, stream_id) & 0xFF);
+
+        _ = try self.ioWrite(&header);
+        if (payload.len > 0) {
+            _ = try self.ioWrite(payload);
+        }
     }
 
     fn setupHttp2Server(self: *Transport) !void {
         // Server receives and validates HTTP/2 connection preface
         var preface_buf: [24]u8 = undefined;
-        const bytes_read = try self.stream.read(&preface_buf);
-        if (bytes_read < 24) return TransportError.ConnectionClosed;
+        try self.readExact(&preface_buf);
 
         // Validate preface
         if (!std.mem.eql(u8, &preface_buf, http2.connection.Connection.PREFACE)) {
             return TransportError.Http2Error;
         }
 
-        // Read client's SETTINGS frame
-        var settings_header: [9]u8 = undefined;
-        const settings_read = try self.stream.read(&settings_header);
-        if (settings_read < 9) return TransportError.ConnectionClosed;
+        // Read client's initial SETTINGS frame
+        const frame = try self.readFrame();
+        defer self.allocator.free(frame.payload);
 
-        // TODO: Parse and process SETTINGS frame properly
-        // For now, just skip the payload if any
-        const settings_length = (@as(u24, settings_header[0]) << 16) |
-                                (@as(u24, settings_header[1]) << 8) |
-                                @as(u24, settings_header[2]);
-        if (settings_length > 0) {
-            const settings_payload = try self.allocator.alloc(u8, settings_length);
-            defer self.allocator.free(settings_payload);
-            _ = try self.stream.read(settings_payload);
+        if (frame.frame_type != @intFromEnum(http2.frame.FrameType.SETTINGS)) {
+            return TransportError.Http2Error;
         }
 
-        // Send server's SETTINGS frame
-        const settings_response: [9]u8 = .{
-            0, 0, 0, // length: 0
-            @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0, // flags: none
-            0, 0, 0, 0, // stream_id: 0
-        };
-        _ = try self.stream.write(&settings_response);
+        // Send server's SETTINGS frame (empty = use defaults)
+        try self.writeFrame(.SETTINGS, 0, 0, &.{});
 
         // Send SETTINGS ACK for client's settings
-        const settings_ack: [9]u8 = .{
-            0, 0, 0, // length: 0
-            @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0x1, // flags: ACK
-            0, 0, 0, 0, // stream_id: 0
-        };
-        _ = try self.stream.write(&settings_ack);
+        try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
     }
 
+    /// Read the next gRPC message from the connection.
+    /// Handles standard gRPC framing: skips HEADERS, SETTINGS, WINDOW_UPDATE,
+    /// PING frames, and extracts the protobuf payload from DATA frames by
+    /// stripping the 5-byte gRPC length-prefixed message header.
     pub fn readMessage(self: *Transport) ![]const u8 {
-        // Read frame header first (9 bytes)
-        const header_size = 9;
-        var header: [header_size]u8 = undefined;
-        const bytes_read = try self.stream.read(&header);
-        if (bytes_read < header_size) return TransportError.ConnectionClosed;
+        while (true) {
+            const frame = try self.readFrame();
+            const frame_type = frame.frame_type;
+            const payload = frame.payload;
 
-        // Parse header manually
-        const length = (@as(u24, header[0]) << 16) | (@as(u24, header[1]) << 8) | @as(u24, header[2]);
-        const frame_type = header[3];
+            switch (frame_type) {
+                @intFromEnum(http2.frame.FrameType.DATA) => {
+                    // gRPC DATA frame: [1 byte compressed flag][4 bytes msg length][protobuf...]
+                    if (payload.len >= 5) {
+                        // Strip 5-byte gRPC header, return just the protobuf message
+                        const msg_len = (@as(u32, payload[1]) << 24) |
+                            (@as(u32, payload[2]) << 16) |
+                            (@as(u32, payload[3]) << 8) |
+                            @as(u32, payload[4]);
 
-        // Read payload
-        const payload = try self.allocator.alloc(u8, length);
-        errdefer self.allocator.free(payload);
+                        if (payload.len >= 5 + msg_len) {
+                            const result = try self.allocator.alloc(u8, msg_len);
+                            @memcpy(result, payload[5 .. 5 + msg_len]);
+                            self.allocator.free(payload);
+                            return result;
+                        }
+                    }
 
-        if (length > 0) {
-            const payload_read = try self.stream.read(payload);
-            if (payload_read < length) {
-                return TransportError.ConnectionClosed;
+                    // Fallback: if no gRPC header or too short, return payload as-is
+                    // (for backward compat with custom clients)
+                    return payload;
+                },
+                @intFromEnum(http2.frame.FrameType.HEADERS) => {
+                    // Standard gRPC sends HEADERS before DATA. Remember the
+                    // stream ID so we can respond on the same stream.
+                    self.last_stream_id = frame.stream_id;
+                    // Extract :path from HPACK-encoded headers
+                    self.extractPathFromHpack(payload);
+                    self.allocator.free(payload);
+                    // Continue reading to get the DATA frame
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.SETTINGS) => {
+                    // Could be client's SETTINGS ACK or new SETTINGS
+                    const is_ack = (frame.flags & 0x1) != 0;
+                    if (!is_ack) {
+                        // ACK the client's settings
+                        try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
+                    }
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
+                    // Flow control — acknowledge and continue
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.PING) => {
+                    // Respond with PONG (PING with ACK flag)
+                    const is_ack = (frame.flags & 0x1) != 0;
+                    if (!is_ack) {
+                        try self.writeFrame(.PING, 0x1, 0, payload);
+                    }
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.RST_STREAM) => {
+                    self.allocator.free(payload);
+                    return TransportError.ConnectionClosed;
+                },
+                @intFromEnum(http2.frame.FrameType.GOAWAY) => {
+                    self.allocator.free(payload);
+                    return TransportError.ConnectionClosed;
+                },
+                else => {
+                    // Unknown frame type — skip
+                    self.allocator.free(payload);
+                    continue;
+                },
             }
         }
-
-        // For DATA frames, return payload
-        if (frame_type == @intFromEnum(http2.frame.FrameType.DATA)) {
-            return payload;
-        }
-
-        return TransportError.Http2Error;
     }
 
-    pub fn writeMessage(self: *Transport, message: []const u8) !void {
-        const frame_type = http2.frame.FrameType.DATA;
-        const frame_flags = http2.frame.FrameFlags.END_STREAM;
-        const stream_id: u31 = 1; // Use appropriate stream ID
-        const length: u24 = @intCast(message.len);
+    /// Return the gRPC method path extracted from the last HEADERS frame.
+    pub fn lastMethod(self: *Transport) []const u8 {
+        return self.last_method[0..self.last_method_len];
+    }
 
-        // Write frame header
-        var header: [9]u8 = undefined;
-        header[0] = @intCast((length >> 16) & 0xFF);
-        header[1] = @intCast((length >> 8) & 0xFF);
-        header[2] = @intCast(length & 0xFF);
-        header[3] = @intFromEnum(frame_type);
-        header[4] = frame_flags;
-        header[5] = @intCast((stream_id >> 24) & 0xFF);
-        header[6] = @intCast((stream_id >> 16) & 0xFF);
-        header[7] = @intCast((stream_id >> 8) & 0xFF);
-        header[8] = @intCast(stream_id & 0xFF);
-
-        _ = try self.stream.write(&header);
-        if (message.len > 0) {
-            _ = try self.stream.write(message);
+    /// Push a new entry to the front of the HPACK dynamic table.
+    fn hpackDynPush(self: *Transport, is_path: bool) void {
+        // Move head backward (ring buffer)
+        if (self.hpack_dyn_count == 0) {
+            self.hpack_dyn_head = 0;
+        } else {
+            self.hpack_dyn_head = if (self.hpack_dyn_head == 0) HPACK_DYN_MAX - 1 else self.hpack_dyn_head - 1;
         }
+        self.hpack_dyn[self.hpack_dyn_head] = .{};
+        if (is_path) {
+            const len = @min(self.last_method_len, 128);
+            @memcpy(self.hpack_dyn[self.hpack_dyn_head].path[0..len], self.last_method[0..len]);
+            self.hpack_dyn[self.hpack_dyn_head].path_len = len;
+            self.hpack_dyn[self.hpack_dyn_head].is_path = true;
+        }
+        if (self.hpack_dyn_count < HPACK_DYN_MAX) {
+            self.hpack_dyn_count += 1;
+        }
+    }
+
+    /// Look up a dynamic table entry by index (0 = newest).
+    fn hpackDynGet(self: *Transport, dyn_idx: usize) ?*const HpackDynEntry {
+        if (dyn_idx >= self.hpack_dyn_count) return null;
+        const actual = (self.hpack_dyn_head + dyn_idx) % HPACK_DYN_MAX;
+        return &self.hpack_dyn[actual];
+    }
+
+    /// Look up an HPACK indexed reference and set last_method if it's a :path entry.
+    fn hpackLookupIndex(self: *Transport, index: usize) void {
+        if (index <= 61) return; // Static table — :path entries 4,5 are "/" and "/index.html"
+        const dyn_idx = index - 62;
+        if (self.hpackDynGet(dyn_idx)) |entry| {
+            if (entry.is_path) {
+                const len = @min(entry.path_len, self.last_method.len);
+                @memcpy(self.last_method[0..len], entry.path[0..len]);
+                self.last_method_len = len;
+            }
+        }
+    }
+
+    // Known gRPC method paths and their HPACK Huffman encodings
+    const KnownPath = struct { plain: []const u8, huffman: []const u8 };
+    const known_paths = [_]KnownPath{
+        .{ .plain = "/geode.GeodeService/Handshake", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x63, 0x1d, 0x52, 0x22, 0x71, 0xf5, 0x2f } },
+        .{ .plain = "/geode.GeodeService/Execute", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x60, 0xf2, 0x52, 0x5a, 0x92, 0xff } },
+        .{ .plain = "/geode.GeodeService/Pull", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6b, 0xb6, 0x8a, 0x3f } },
+        .{ .plain = "/geode.GeodeService/Ping", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6b, 0x35, 0x53, 0x7f } },
+        .{ .plain = "/geode.GeodeService/Begin", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x5d, 0x2c, 0xc6, 0xab } },
+        .{ .plain = "/geode.GeodeService/Commit", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x5e, 0x3d, 0x34, 0x99, 0x3f } },
+        .{ .plain = "/geode.GeodeService/Rollback", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6d, 0x3d, 0x14, 0x46, 0x32, 0x75 } },
+    };
+
+    /// Decode an HPACK integer with the given prefix size.
+    /// Returns the decoded value and the number of bytes consumed.
+    fn hpackDecodeInt(data: []const u8, comptime prefix_bits: u4) struct { value: usize, consumed: usize } {
+        if (data.len == 0) return .{ .value = 0, .consumed = 0 };
+        const mask: u8 = (@as(u8, 1) << @as(u3, @intCast(prefix_bits))) - 1;
+        var value: usize = data[0] & mask;
+        if (value < mask) return .{ .value = value, .consumed = 1 };
+        // Multi-byte integer
+        var pos: usize = 1;
+        var m: u6 = 0;
+        while (pos < data.len) {
+            const b = data[pos];
+            value += @as(usize, b & 0x7F) << m;
+            pos += 1;
+            if (b & 0x80 == 0) break;
+            m += 7;
+        }
+        return .{ .value = value, .consumed = pos };
+    }
+
+    /// Skip an HPACK string (returns bytes consumed).
+    fn hpackSkipString(data: []const u8) usize {
+        if (data.len == 0) return 0;
+        const int_result = hpackDecodeInt(data, 7);
+        return int_result.consumed + int_result.value;
+    }
+
+    /// Extract the :path header from HPACK-encoded payload.
+    /// Stores the result in last_method/last_method_len.
+    /// Tracks the HPACK dynamic table so indexed references to :path work.
+    fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
+        var pos: usize = 0;
+        var found_path = false;
+        while (pos < payload.len) {
+            const byte = payload[pos];
+
+            if (byte & 0x80 != 0) {
+                // Indexed header field (1xxxxxxx) — look up in dynamic table
+                const r = hpackDecodeInt(payload[pos..], 7);
+                pos += r.consumed;
+                if (!found_path) {
+                    self.hpackLookupIndex(r.value);
+                    if (r.value > 61) {
+                        // Check if we found a :path entry
+                        const dyn_idx = r.value - 62;
+                        if (self.hpackDynGet(dyn_idx)) |entry| {
+                            if (entry.is_path) found_path = true;
+                        }
+                    }
+                }
+            } else if (byte & 0xC0 == 0x40) {
+                // Literal with incremental indexing (01xxxxxx) — adds to dynamic table
+                const r = hpackDecodeInt(payload[pos..], 6);
+                pos += r.consumed;
+                const name_idx = r.value;
+                if (name_idx == 0) {
+                    // Literal name — skip it
+                    pos += hpackSkipString(payload[pos..]);
+                }
+                // Read value
+                if (pos >= payload.len) {
+                    // Still add a non-path entry to keep table in sync
+                    self.hpackDynPush(false);
+                    break;
+                }
+                if (name_idx == 4 or name_idx == 5) {
+                    // This is :path — decode and add to dynamic table
+                    self.setPathFromHpackString(payload[pos..]);
+                    pos += hpackSkipString(payload[pos..]);
+                    self.hpackDynPush(true);
+                    found_path = true;
+                } else {
+                    pos += hpackSkipString(payload[pos..]);
+                    self.hpackDynPush(false);
+                }
+            } else if (byte & 0xF0 == 0x00 or byte & 0xF0 == 0x10) {
+                // Literal without indexing (0000xxxx) or never indexed (0001xxxx)
+                // Does NOT add to dynamic table
+                const r = hpackDecodeInt(payload[pos..], 4);
+                pos += r.consumed;
+                const name_idx = r.value;
+                if (name_idx == 0) {
+                    pos += hpackSkipString(payload[pos..]);
+                }
+                if (pos >= payload.len) break;
+                if (name_idx == 4 or name_idx == 5) {
+                    self.setPathFromHpackString(payload[pos..]);
+                    found_path = true;
+                }
+                pos += hpackSkipString(payload[pos..]);
+            } else if (byte & 0xE0 == 0x20) {
+                // Dynamic table size update (001xxxxx) — skip
+                const r = hpackDecodeInt(payload[pos..], 5);
+                pos += r.consumed;
+            } else {
+                pos += 1; // unknown — skip byte
+            }
+        }
+    }
+
+    /// Read an HPACK string at position and set last_method from it.
+    /// Handles both Huffman and non-Huffman encoded strings.
+    fn setPathFromHpackString(self: *Transport, data: []const u8) void {
+        if (data.len == 0) return;
+        const is_huffman = (data[0] & 0x80) != 0;
+        const r = hpackDecodeInt(data, 7);
+        const str_start = r.consumed;
+        const str_len = r.value;
+        if (str_start + str_len > data.len) return;
+        const str_bytes = data[str_start .. str_start + str_len];
+
+        if (!is_huffman) {
+            // Plain text — copy directly
+            const copy_len = @min(str_len, self.last_method.len);
+            @memcpy(self.last_method[0..copy_len], str_bytes[0..copy_len]);
+            self.last_method_len = copy_len;
+        } else {
+            // Huffman encoded — match against known paths
+            for (known_paths) |kp| {
+                if (str_len == kp.huffman.len and std.mem.eql(u8, str_bytes, kp.huffman)) {
+                    const copy_len = @min(kp.plain.len, self.last_method.len);
+                    @memcpy(self.last_method[0..copy_len], kp.plain[0..copy_len]);
+                    self.last_method_len = copy_len;
+                    return;
+                }
+            }
+            // Unknown Huffman path — leave method empty
+        }
+    }
+
+    /// Write a single gRPC response message in a server stream.
+    /// Sends HEADERS (if first message) + DATA, but no TRAILERS — the stream stays open.
+    pub fn writeStreamMessage(self: *Transport, message: []const u8, is_first: bool) !void {
+        const sid = self.last_stream_id;
+
+        if (is_first) {
+            // Send HEADERS on first message
+            const response_headers = [_]u8{
+                0x88, // :status: 200
+                0x40 | 31, 16, 'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
+            };
+            try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
+        }
+
+        // Send DATA frame (no END_STREAM)
+        const grpc_msg_len: u32 = @intCast(message.len);
+        const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
+        defer self.allocator.free(grpc_frame);
+        grpc_frame[0] = 0;
+        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
+        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
+        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
+        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        @memcpy(grpc_frame[5..], message);
+        try self.writeFrame(.DATA, 0, sid, grpc_frame);
+    }
+
+    /// End a gRPC server stream by sending TRAILERS with grpc-status: 0.
+    pub fn endStream(self: *Transport) !void {
+        const sid = self.last_stream_id;
+        const trailers = [_]u8{
+            0x40, 11, 'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's', 1, '0',
+        };
+        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &trailers);
+    }
+
+    /// Write a gRPC response message.
+    /// Sends proper gRPC framing: HEADERS frame, then DATA frame with
+    /// 5-byte gRPC prefix, then TRAILERS with grpc-status: 0.
+    pub fn writeMessage(self: *Transport, message: []const u8) !void {
+        const sid = self.last_stream_id;
+
+        // 1. Send HEADERS frame with gRPC response headers
+        //    Minimal HPACK-encoded headers for gRPC:
+        //    :status: 200, content-type: application/grpc
+        const response_headers = [_]u8{
+            // :status: 200 (indexed header field, index 8)
+            0x88,
+            // content-type: application/grpc (literal header with incremental indexing)
+            // name index 31 = content-type, value = "application/grpc"
+            0x40 | 31, // incremental indexing, name index 31
+            16, // value length = 16
+            'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
+        };
+        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
+
+        // 2. Send DATA frame with gRPC-framed message
+        //    [1 byte: not compressed][4 bytes: message length BE][protobuf message]
+        const grpc_msg_len: u32 = @intCast(message.len);
+        const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
+        defer self.allocator.free(grpc_frame);
+        grpc_frame[0] = 0; // not compressed
+        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
+        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
+        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
+        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        @memcpy(grpc_frame[5..], message);
+
+        try self.writeFrame(.DATA, 0, sid, grpc_frame);
+
+        // 3. Send TRAILERS frame with grpc-status: 0 (OK)
+        //    HPACK: literal header, name "grpc-status", value "0"
+        const trailers = [_]u8{
+            0x40, // literal header with incremental indexing, new name
+            11, // name length = 11
+            'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's',
+            1, // value length = 1
+            '0', // status = OK
+        };
+        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &trailers);
     }
 };
