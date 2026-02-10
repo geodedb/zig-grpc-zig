@@ -50,10 +50,15 @@ pub const Transport = struct {
     hpack_dyn_head: usize = 0,
 
     pub fn initClient(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
-        var transport = Transport{
+        const read_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(write_buf);
+
+        var trans = Transport{
             .stream = stream_,
-            .read_buf = try allocator.alloc(u8, 1024 * 64),
-            .write_buf = try allocator.alloc(u8, 1024 * 64),
+            .read_buf = read_buf,
+            .write_buf = write_buf,
             .allocator = allocator,
             .http2_conn = null,
             .last_stream_id = 1,
@@ -62,17 +67,23 @@ pub const Transport = struct {
         };
 
         // Initialize HTTP/2 connection
-        transport.http2_conn = try http2.connection.Connection.init(allocator);
-        try transport.setupHttp2Client();
+        trans.http2_conn = try http2.connection.Connection.init(allocator);
+        errdefer trans.http2_conn.?.deinit();
+        try trans.setupHttp2Client();
 
-        return transport;
+        return trans;
     }
 
     pub fn initServer(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
-        var transport = Transport{
+        const read_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(write_buf);
+
+        var trans = Transport{
             .stream = stream_,
-            .read_buf = try allocator.alloc(u8, 1024 * 64),
-            .write_buf = try allocator.alloc(u8, 1024 * 64),
+            .read_buf = read_buf,
+            .write_buf = write_buf,
             .allocator = allocator,
             .http2_conn = null,
             .last_stream_id = 1,
@@ -81,30 +92,40 @@ pub const Transport = struct {
         };
 
         // Initialize HTTP/2 connection
-        transport.http2_conn = try http2.connection.Connection.init(allocator);
-        try transport.setupHttp2Server();
+        trans.http2_conn = try http2.connection.Connection.init(allocator);
+        errdefer trans.http2_conn.?.deinit();
+        try trans.setupHttp2Server();
 
-        return transport;
+        return trans;
     }
 
     pub fn initServerTls(allocator: std.mem.Allocator, stream_: net.Stream, tls_io_: TlsIo) !Transport {
-        var transport = Transport{
+        const read_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, 1024 * 64);
+        errdefer allocator.free(write_buf);
+
+        var trans = Transport{
             .stream = stream_,
             .tls_io = tls_io_,
-            .read_buf = try allocator.alloc(u8, 1024 * 64),
-            .write_buf = try allocator.alloc(u8, 1024 * 64),
+            .read_buf = read_buf,
+            .write_buf = write_buf,
             .allocator = allocator,
             .http2_conn = null,
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
         };
+        // If setup fails, close the TLS connection to avoid leaking the
+        // SSL object and SslConn allocation.
+        errdefer tls_io_.close_fn(tls_io_.ctx);
 
         // Initialize HTTP/2 connection
-        transport.http2_conn = try http2.connection.Connection.init(allocator);
-        try transport.setupHttp2Server();
+        trans.http2_conn = try http2.connection.Connection.init(allocator);
+        errdefer trans.http2_conn.?.deinit();
+        try trans.setupHttp2Server();
 
-        return transport;
+        return trans;
     }
 
     fn ioRead(self: *Transport, buf: []u8) !usize {
@@ -247,7 +268,10 @@ pub const Transport = struct {
                             @as(u32, payload[4]);
 
                         if (payload.len >= 5 + msg_len) {
-                            const result = try self.allocator.alloc(u8, msg_len);
+                            const result = self.allocator.alloc(u8, msg_len) catch {
+                                self.allocator.free(payload);
+                                return error.OutOfMemory;
+                            };
                             @memcpy(result, payload[5 .. 5 + msg_len]);
                             self.allocator.free(payload);
                             return result;
@@ -272,10 +296,13 @@ pub const Transport = struct {
                     // Could be client's SETTINGS ACK or new SETTINGS
                     const is_ack = (frame.flags & 0x1) != 0;
                     if (!is_ack) {
-                        // ACK the client's settings
+                        // ACK the client's settings -- free payload before try
+                        // to avoid leak if writeFrame fails
+                        self.allocator.free(payload);
                         try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
+                    } else {
+                        self.allocator.free(payload);
                     }
-                    self.allocator.free(payload);
                     continue;
                 },
                 @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
@@ -285,11 +312,18 @@ pub const Transport = struct {
                 },
                 @intFromEnum(http2.frame.FrameType.PING) => {
                     // Respond with PONG (PING with ACK flag)
+                    // Copy payload data before freeing, since writeFrame
+                    // needs the data and payload must be freed to avoid leaks
                     const is_ack = (frame.flags & 0x1) != 0;
                     if (!is_ack) {
-                        try self.writeFrame(.PING, 0x1, 0, payload);
+                        var ping_data: [8]u8 = .{0} ** 8;
+                        const copy_len = @min(payload.len, 8);
+                        @memcpy(ping_data[0..copy_len], payload[0..copy_len]);
+                        self.allocator.free(payload);
+                        try self.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]);
+                    } else {
+                        self.allocator.free(payload);
                     }
-                    self.allocator.free(payload);
                     continue;
                 },
                 @intFromEnum(http2.frame.FrameType.RST_STREAM) => {

@@ -62,9 +62,21 @@ pub const GrpcServer = struct {
 
     fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection) !void {
         var trans = if (self.on_tls_accept) |accept_fn| blk: {
-            const tls_io = try accept_fn(conn.stream);
-            break :blk try transport.Transport.initServerTls(self.allocator, conn.stream, tls_io);
-        } else try transport.Transport.initServer(self.allocator, conn.stream);
+            const tls_io = accept_fn(conn.stream) catch |err| {
+                // TLS accept failed — close the stream before returning
+                conn.stream.close();
+                return err;
+            };
+            break :blk transport.Transport.initServerTls(self.allocator, conn.stream, tls_io) catch |err| {
+                // Transport init failed — initServerTls errdefers handle
+                // buffer/TLS cleanup; we just close the stream here
+                conn.stream.close();
+                return err;
+            };
+        } else transport.Transport.initServer(self.allocator, conn.stream) catch |err| {
+            conn.stream.close();
+            return err;
+        };
         defer trans.deinit();
 
         // Setup streaming
@@ -74,6 +86,14 @@ pub const GrpcServer = struct {
         while (true) {
             const message = trans.readMessage() catch |err| switch (err) {
                 error.ConnectionClosed => break,
+                // TLS errors indicate the connection is gone — treat like
+                // ConnectionClosed to avoid propagating the error which could
+                // cause cleanup issues (double-free on aarch64).
+                error.TlsReadFailed,
+                error.TlsWriteFailed,
+                error.TlsHandshakeFailed,
+                error.TlsNotInitialized,
+                => break,
                 else => return err,
             };
             defer self.allocator.free(message);
