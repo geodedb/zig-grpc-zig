@@ -1,5 +1,6 @@
 const std = @import("std");
-const GrpcServer = @import("grpc").GrpcServer;
+const grpc = @import("grpc");
+const GrpcServer = grpc.GrpcServer;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -30,13 +31,12 @@ pub fn main() !void {
     try server.start();
 }
 
-fn sayHello(request: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    _ = request;
-    return allocator.dupe(u8, "Hello from gRPC!");
+fn sayHello(_: []const u8, _: []const u8, trans: *grpc.Transport, _: std.mem.Allocator) anyerror!void {
+    try trans.writeMessage("Hello from gRPC!");
 }
 
-fn benchmarkHandler(request: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    // Echo the request back with a timestamp for benchmarking
+fn benchmarkHandler(request: []const u8, _: []const u8, trans: *grpc.Transport, allocator: std.mem.Allocator) anyerror!void {
     const response = try std.fmt.allocPrint(allocator, "Echo: {s} (processed at {d})", .{ request, std.time.milliTimestamp() });
-    return response;
+    defer allocator.free(response);
+    try trans.writeMessage(response);
 }
