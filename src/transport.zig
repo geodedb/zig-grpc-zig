@@ -476,8 +476,11 @@ pub const Transport = struct {
     /// Stores the result in last_method/last_method_len.
     /// Tracks the HPACK dynamic table so indexed references to :path work.
     fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
-        // Debug: log HPACK payload bytes
-        std.log.debug("HPACK payload ({d} bytes): {s}", .{ payload.len, std.fmt.fmtSliceHexLower(payload) });
+        // Debug: log HPACK payload length and first bytes
+        if (payload.len > 0) {
+            const show = @min(payload.len, 32);
+            std.log.debug("HPACK payload ({d} bytes), first {d}: {any}", .{ payload.len, show, payload[0..show] });
+        }
         var pos: usize = 0;
         var found_path = false;
         while (pos < payload.len) {
