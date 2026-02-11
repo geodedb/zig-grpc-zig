@@ -68,8 +68,8 @@ pub const GrpcServer = struct {
                 return err;
             };
             break :blk transport.Transport.initServerTls(self.allocator, conn.stream, tls_io) catch |err| {
-                // Transport init failed — initServerTls errdefers handle
-                // buffer/TLS cleanup; we just close the stream here
+                // Transport init failed — clean up TLS I/O and close stream
+                tls_io.close_fn(tls_io.ctx);
                 conn.stream.close();
                 return err;
             };

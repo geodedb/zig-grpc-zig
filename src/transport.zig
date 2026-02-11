@@ -388,17 +388,62 @@ pub const Transport = struct {
         }
     }
 
-    // Known gRPC method paths and their HPACK Huffman encodings
-    const KnownPath = struct { plain: []const u8, huffman: []const u8 };
-    const known_paths = [_]KnownPath{
-        .{ .plain = "/geode.GeodeService/Handshake", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x63, 0x1d, 0x52, 0x22, 0x71, 0xf5, 0x2f } },
-        .{ .plain = "/geode.GeodeService/Execute", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x60, 0xf2, 0x52, 0x5a, 0x92, 0xff } },
-        .{ .plain = "/geode.GeodeService/Pull", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6b, 0xb6, 0x8a, 0x3f } },
-        .{ .plain = "/geode.GeodeService/Ping", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6b, 0x35, 0x53, 0x7f } },
-        .{ .plain = "/geode.GeodeService/Begin", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x5d, 0x2c, 0xc6, 0xab } },
-        .{ .plain = "/geode.GeodeService/Commit", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x5e, 0x3d, 0x34, 0x99, 0x3f } },
-        .{ .plain = "/geode.GeodeService/Rollback", .huffman = &.{ 0x62, 0x62, 0x9e, 0x42, 0xaf, 0x88, 0xa7, 0x90, 0xbb, 0x8b, 0x67, 0x73, 0x10, 0xac, 0x6d, 0x3d, 0x14, 0x46, 0x32, 0x75 } },
+    // RFC 7541 Appendix B Huffman decode table, organized by code bit-length.
+    // Each group: codes [first_code .. first_code+syms.len) map to syms[] in order.
+    // Symbols are sorted by value within each group (canonical Huffman assignment).
+    const HuffGroup = struct { bits: u8, first_code: u32, syms: []const u8 };
+    const huff_groups = [_]HuffGroup{
+        .{ .bits = 5, .first_code = 0x00, .syms = &[_]u8{ '0', '1', '2', 'a', 'c', 'e', 'i', 'o', 's', 't' } },
+        .{ .bits = 6, .first_code = 0x14, .syms = &[_]u8{ ' ', '%', '-', '.', '/', '3', '4', '5', '6', '7', '8', '9', '=', 'A', '_', 'b', 'd', 'f', 'g', 'h', 'l', 'm', 'n', 'p', 'r', 'u' } },
+        .{ .bits = 7, .first_code = 0x5c, .syms = &[_]u8{ ':', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'Y', 'j', 'k', 'q', 'v', 'w', 'x', 'y', 'z' } },
+        .{ .bits = 8, .first_code = 0xf8, .syms = &[_]u8{ '&', '*', ',', ';', 'X', 'Z' } },
+        .{ .bits = 10, .first_code = 0x3f8, .syms = &[_]u8{ '!', '"', '(', ')', '?' } },
+        .{ .bits = 11, .first_code = 0x7fa, .syms = &[_]u8{ '\'', '+', '|' } },
+        .{ .bits = 12, .first_code = 0xffa, .syms = &[_]u8{ '#', '>' } },
+        .{ .bits = 13, .first_code = 0x1ff8, .syms = &[_]u8{ 0, '$', '@', '[', ']', '~' } },
+        .{ .bits = 14, .first_code = 0x3ffc, .syms = &[_]u8{ '^', '}' } },
+        .{ .bits = 15, .first_code = 0x7ffc, .syms = &[_]u8{ '<', '`' } },
+        .{ .bits = 19, .first_code = 0x7fff0, .syms = &[_]u8{ '\\', '{' } },
     };
+
+    /// Decode an RFC 7541 HPACK Huffman-encoded byte string into plaintext.
+    /// Returns the number of decoded bytes written to `out`.
+    fn huffmanDecode(encoded: []const u8, out: []u8) usize {
+        var out_pos: usize = 0;
+        var acc: u32 = 0; // bit accumulator
+        var acc_bits: u8 = 0; // number of valid bits in acc
+
+        for (encoded) |byte| {
+            // Process each bit from MSB to LSB
+            var b: u8 = byte;
+            var bit_i: u4 = 0;
+            while (bit_i < 8) : (bit_i += 1) {
+                acc = (acc << 1) | ((b >> 7) & 1);
+                acc_bits += 1;
+                b <<= 1;
+
+                // Try to match accumulated bits against each group
+                for (huff_groups) |grp| {
+                    if (acc_bits == grp.bits) {
+                        if (acc >= grp.first_code and acc < grp.first_code + grp.syms.len) {
+                            if (out_pos < out.len) {
+                                out[out_pos] = grp.syms[acc - grp.first_code];
+                                out_pos += 1;
+                            }
+                            acc = 0;
+                            acc_bits = 0;
+                            break;
+                        }
+                    }
+                }
+
+                // If we've accumulated too many bits without a match, stop
+                // (would only happen for control chars / high bytes not in table)
+                if (acc_bits > 19) return out_pos;
+            }
+        }
+        return out_pos;
+    }
 
     /// Decode an HPACK integer with the given prefix size.
     /// Returns the decoded value and the number of bytes consumed.
@@ -517,16 +562,8 @@ pub const Transport = struct {
             @memcpy(self.last_method[0..copy_len], str_bytes[0..copy_len]);
             self.last_method_len = copy_len;
         } else {
-            // Huffman encoded — match against known paths
-            for (known_paths) |kp| {
-                if (str_len == kp.huffman.len and std.mem.eql(u8, str_bytes, kp.huffman)) {
-                    const copy_len = @min(kp.plain.len, self.last_method.len);
-                    @memcpy(self.last_method[0..copy_len], kp.plain[0..copy_len]);
-                    self.last_method_len = copy_len;
-                    return;
-                }
-            }
-            // Unknown Huffman path — leave method empty
+            // Huffman encoded — decode using RFC 7541 table
+            self.last_method_len = huffmanDecode(str_bytes, &self.last_method);
         }
     }
 
