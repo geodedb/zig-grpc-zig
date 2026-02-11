@@ -476,6 +476,8 @@ pub const Transport = struct {
     /// Stores the result in last_method/last_method_len.
     /// Tracks the HPACK dynamic table so indexed references to :path work.
     fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
+        // Debug: log HPACK payload bytes
+        std.log.debug("HPACK payload ({d} bytes): {s}", .{ payload.len, std.fmt.fmtSliceHexLower(payload) });
         var pos: usize = 0;
         var found_path = false;
         while (pos < payload.len) {
@@ -561,9 +563,11 @@ pub const Transport = struct {
             const copy_len = @min(str_len, self.last_method.len);
             @memcpy(self.last_method[0..copy_len], str_bytes[0..copy_len]);
             self.last_method_len = copy_len;
+            std.log.debug("HPACK path (plain): {s}", .{self.last_method[0..self.last_method_len]});
         } else {
             // Huffman encoded — decode using RFC 7541 table
             self.last_method_len = huffmanDecode(str_bytes, &self.last_method);
+            std.log.debug("HPACK path (huffman, {d} bytes -> {d}): {s}", .{ str_len, self.last_method_len, self.last_method[0..self.last_method_len] });
         }
     }
 
