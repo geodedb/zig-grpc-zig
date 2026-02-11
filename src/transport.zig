@@ -472,6 +472,17 @@ pub const Transport = struct {
         return int_result.consumed + int_result.value;
     }
 
+    /// Check if an HPACK string (plain-text, not Huffman) matches `expected`.
+    fn hpackStringIs(data: []const u8, expected: []const u8) bool {
+        if (data.len == 0) return false;
+        const is_huffman = (data[0] & 0x80) != 0;
+        if (is_huffman) return false; // only match plain-text names
+        const r = hpackDecodeInt(data, 7);
+        if (r.value != expected.len) return false;
+        if (r.consumed + r.value > data.len) return false;
+        return std.mem.eql(u8, data[r.consumed .. r.consumed + r.value], expected);
+    }
+
     /// Extract the :path header from HPACK-encoded payload.
     /// Stores the result in last_method/last_method_len.
     /// Tracks the HPACK dynamic table so indexed references to :path work.
@@ -505,8 +516,12 @@ pub const Transport = struct {
                 const r = hpackDecodeInt(payload[pos..], 6);
                 pos += r.consumed;
                 const name_idx = r.value;
+                var is_path_header = (name_idx == 4 or name_idx == 5);
                 if (name_idx == 0) {
-                    // Literal name — skip it
+                    // Literal name — check if it's ":path" before skipping
+                    if (!is_path_header) {
+                        is_path_header = hpackStringIs(payload[pos..], ":path");
+                    }
                     pos += hpackSkipString(payload[pos..]);
                 }
                 // Read value
@@ -515,7 +530,7 @@ pub const Transport = struct {
                     self.hpackDynPush(false);
                     break;
                 }
-                if (name_idx == 4 or name_idx == 5) {
+                if (is_path_header) {
                     // This is :path — decode and add to dynamic table
                     self.setPathFromHpackString(payload[pos..]);
                     pos += hpackSkipString(payload[pos..]);
@@ -531,11 +546,15 @@ pub const Transport = struct {
                 const r = hpackDecodeInt(payload[pos..], 4);
                 pos += r.consumed;
                 const name_idx = r.value;
+                var is_path_hdr = (name_idx == 4 or name_idx == 5);
                 if (name_idx == 0) {
+                    if (!is_path_hdr) {
+                        is_path_hdr = hpackStringIs(payload[pos..], ":path");
+                    }
                     pos += hpackSkipString(payload[pos..]);
                 }
                 if (pos >= payload.len) break;
-                if (name_idx == 4 or name_idx == 5) {
+                if (is_path_hdr) {
                     self.setPathFromHpackString(payload[pos..]);
                     found_path = true;
                 }
