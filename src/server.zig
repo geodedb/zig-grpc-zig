@@ -52,12 +52,20 @@ pub const GrpcServer = struct {
 
         while (true) {
             const connection = try self.server.accept();
-            // Handle connection errors gracefully - don't crash the server
-            self.handleConnection(connection) catch |err| {
-                std.log.err("Connection handling failed: {}", .{err});
+            // Spawn a thread per connection for concurrent handling
+            const thread = std.Thread.spawn(.{}, connectionThread, .{ self, connection }) catch |err| {
+                std.log.err("Failed to spawn connection thread: {}", .{err});
+                connection.stream.close();
                 continue;
             };
+            thread.detach();
         }
+    }
+
+    fn connectionThread(self: *GrpcServer, conn: std.net.Server.Connection) void {
+        self.handleConnection(conn) catch |err| {
+            std.log.err("Connection handling failed: {}", .{err});
+        };
     }
 
     fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection) !void {
