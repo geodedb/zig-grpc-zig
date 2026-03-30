@@ -5,7 +5,7 @@
     .dependencies = .{
         .spice = .{
             .url = "https://github.com/judofyr/spice/archive/refs/heads/main.tar.gz",
-            .hash = "spice-0.0.0-3FtxfEq9AAD-Ghd-0OtZhifuq9DzPROtSMYbsAWAOYA2",
+            .hash = "spice-0.0.0-3FtxfKu_AADWhWk0I60jjBhn7y-d3K_49oefAeOWwx_S",
         },
         .zlib = .{
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
