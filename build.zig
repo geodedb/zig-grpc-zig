@@ -4,8 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const spice_dep = b.dependency("spice", .{});
-    const spice_mod = spice_dep.module("spice");
+    // Spice parallelism — can be disabled by parent builds to avoid diamond dep conflicts
+    const enable_spice = b.option(bool, "spice", "Enable spice parallelism") orelse true;
+    const spice_mod: ?*std.Build.Module = if (enable_spice) blk: {
+        const spice_dep = b.dependency("spice", .{});
+        break :blk spice_dep.module("spice");
+    } else null;
+
+    // Helper to conditionally add spice import
+    const addSpice = struct {
+        fn f(mod: *std.Build.Module, sm: ?*std.Build.Module) void {
+            if (sm) |s| mod.addImport("spice", s);
+        }
+    }.f;
 
     // Build zlib from upstream source
     const zlib_dep = b.dependency("zlib", .{});
@@ -63,8 +74,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/server.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "spice", .module = spice_mod }},
     });
+    addSpice(server_mod, spice_mod);
     server_mod.linkLibrary(zlib_lib);
 
     // Client module (for internal use and library export)
@@ -72,8 +83,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "spice", .module = spice_mod }},
     });
+    addSpice(client_mod, spice_mod);
     client_mod.linkLibrary(zlib_lib);
 
     // Benchmark executable
@@ -83,9 +94,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/benchmark.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "spice", .module = spice_mod }},
         }),
     });
+    addSpice(benchmark.root_module, spice_mod);
     benchmark.linkLibrary(zlib_lib);
     b.installArtifact(benchmark);
 
@@ -121,12 +132,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/basic_server.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "spice", .module = spice_mod },
-                .{ .name = "grpc", .module = server_mod },
-            },
+
         }),
     });
+    addSpice(server_example.root_module, spice_mod);
+    server_example.root_module.addImport("grpc", server_mod);
     server_example.linkLibrary(zlib_lib);
     b.installArtifact(server_example);
 
@@ -136,12 +146,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/basic_client.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "spice", .module = spice_mod },
-                .{ .name = "grpcclient", .module = client_mod },
-            },
+
         }),
     });
+    addSpice(client_example.root_module, spice_mod);
+    client_example.root_module.addImport("grpcclient", client_mod);
     client_example.linkLibrary(zlib_lib);
     b.installArtifact(client_example);
 
@@ -152,9 +161,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "spice", .module = spice_mod }},
         }),
     });
+    addSpice(tests.root_module, spice_mod);
     tests.linkLibrary(zlib_lib);
 
     const run_tests = b.addRunArtifact(tests);
@@ -166,8 +175,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("integration_test/proto.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "spice", .module = spice_mod }},
     });
+    addSpice(integration_test_mod, spice_mod);
 
     const integration_test_server = b.addExecutable(.{
         .name = "grpc-test-server",
@@ -175,13 +184,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("integration_test/test_server.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "spice", .module = spice_mod },
-                .{ .name = "grpc", .module = server_mod },
-                .{ .name = "proto", .module = integration_test_mod },
-            },
+
         }),
     });
+    addSpice(integration_test_server.root_module, spice_mod);
+    integration_test_server.root_module.addImport("grpc", server_mod);
+    integration_test_server.root_module.addImport("proto", integration_test_mod);
     integration_test_server.linkLibrary(zlib_lib);
 
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
