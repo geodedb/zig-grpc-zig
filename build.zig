@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
 
     for (zlib_sources) |src| {
         const src_path = zlib_dep.path(src);
-        zlib_lib.addCSourceFile(.{
+        zlib_lib.root_module.addCSourceFile(.{
             .file = src_path,
             .flags = &[_][]const u8{
                 "-DHAVE_SYS_TYPES_H",
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    zlib_lib.linkLibC();
+    zlib_lib.root_module.link_libc = true;
     zlib_lib.installHeadersDirectory(
         zlib_dep.path("."),
         ".",
@@ -97,7 +97,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addSpice(benchmark.root_module, spice_mod);
-    benchmark.linkLibrary(zlib_lib);
+    benchmark.root_module.linkLibrary(zlib_lib);
     b.installArtifact(benchmark);
 
     // Benchmark step with automatic server management
@@ -137,7 +137,7 @@ pub fn build(b: *std.Build) void {
     });
     addSpice(server_example.root_module, spice_mod);
     server_example.root_module.addImport("grpc", server_mod);
-    server_example.linkLibrary(zlib_lib);
+    server_example.root_module.linkLibrary(zlib_lib);
     b.installArtifact(server_example);
 
     const client_example = b.addExecutable(.{
@@ -151,7 +151,7 @@ pub fn build(b: *std.Build) void {
     });
     addSpice(client_example.root_module, spice_mod);
     client_example.root_module.addImport("grpcclient", client_mod);
-    client_example.linkLibrary(zlib_lib);
+    client_example.root_module.linkLibrary(zlib_lib);
     b.installArtifact(client_example);
 
     // Tests
@@ -164,7 +164,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addSpice(tests.root_module, spice_mod);
-    tests.linkLibrary(zlib_lib);
+    tests.root_module.linkLibrary(zlib_lib);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     addSpice(integration_test_server.root_module, spice_mod);
     integration_test_server.root_module.addImport("grpc", server_mod);
     integration_test_server.root_module.addImport("proto", integration_test_mod);
-    integration_test_server.linkLibrary(zlib_lib);
+    integration_test_server.root_module.linkLibrary(zlib_lib);
 
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
     const integration_test_step = b.step("integration_test", "Build integration test server");
