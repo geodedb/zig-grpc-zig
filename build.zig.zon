@@ -3,10 +3,6 @@
     .version = "0.1.0",
     .fingerprint = 0xbcaa61f2a4ef59ec,
     .dependencies = .{
-        .spice = .{
-            .url = "git+https://gitlab.com/devnw/zig/spice.git#79a291ee55789160f9aa4af2ddf526fa38e15dc2",
-            .hash = "spice-0.0.0-HnDb5-nKAABohkh8SemVSOtpb7nZestAanVGqrY2fuvC",
-        },
         .zlib = .{
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
             .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",

@@ -1,7 +1,6 @@
 const std = @import("std");
 const GrpcServer = @import("grpc").GrpcServer;
 const proto = @import("proto.zig");
-const spice = @import("spice");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

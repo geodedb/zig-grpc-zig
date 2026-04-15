@@ -1,7 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
 const proto = @import("proto/service.zig");
-const spice = @import("spice");
 const benchmark = @import("benchmark.zig");
 
 // TODO: Update these tests for the new Spice API
