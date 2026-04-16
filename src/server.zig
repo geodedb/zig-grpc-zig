@@ -54,7 +54,12 @@ pub const GrpcServer = struct {
 
         while (true) {
             const stream_ = try self.server.accept(self.io);
-            // Spawn a thread per connection for concurrent handling
+            // Daemon per connection: handleConnection serves the connection
+            // for its entire lifetime (while-true readMessage loop). Not a
+            // thread-pool candidate — a bounded pool would starve under
+            // long-lived or streaming RPCs, and a blocked readMessage has no
+            // cooperative reschedule. Dedicated OS thread + detach is the
+            // correct primitive for this shape.
             const thread = std.Thread.spawn(.{}, connectionThread, .{ self, stream_ }) catch |err| {
                 std.log.err("Failed to spawn connection thread: {}", .{err});
                 stream_.close(self.io);
