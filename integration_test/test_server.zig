@@ -53,7 +53,7 @@ pub fn main() !void {
 
 fn echoHandler(request: []const u8, allocator: std.mem.Allocator) ![]u8 {
     // For now, just echo back the request with server info
-    // TODO: Implement proper protobuf decode/encode when Spice API is stable
+    // TODO: Implement proper protobuf decode/encode when gRPC API is stable
     const timestamp = std.time.timestamp();
     const response = try std.fmt.allocPrint(
         allocator,
