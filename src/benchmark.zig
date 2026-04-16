@@ -2,6 +2,7 @@ const std = @import("std");
 const GrpcClient = @import("client.zig").GrpcClient;
 const GrpcServer = @import("server.zig").GrpcServer;
 const json = std.json;
+const compat = @import("compat.zig");
 
 // Benchmark configuration
 const BenchmarkConfig = struct {
@@ -40,12 +41,12 @@ const Timer = struct {
 
     fn start() Timer {
         return Timer{
-            .start_time = std.time.nanoTimestamp(),
+            .start_time = compat.nanoTimestamp(),
         };
     }
 
     fn elapsed_ms(self: Timer) f64 {
-        const end_time = std.time.nanoTimestamp();
+        const end_time = compat.nanoTimestamp();
         return @as(f64, @floatFromInt(end_time - self.start_time)) / 1_000_000.0;
     }
 };
@@ -53,12 +54,14 @@ const Timer = struct {
 // Test client worker
 const ClientWorker = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: BenchmarkConfig,
     results: std.ArrayList(f64),
 
-    fn init(allocator: std.mem.Allocator, config: BenchmarkConfig) ClientWorker {
+    fn init(allocator: std.mem.Allocator, io: std.Io, config: BenchmarkConfig) ClientWorker {
         return ClientWorker{
             .allocator = allocator,
+            .io = io,
             .config = config,
             .results = .empty,
         };
@@ -69,7 +72,7 @@ const ClientWorker = struct {
     }
 
     fn runBenchmark(self: *ClientWorker) !void {
-        var client = try GrpcClient.init(self.allocator, self.config.host, self.config.port);
+        var client = try GrpcClient.init(self.allocator, self.io, self.config.host, self.config.port);
         defer client.deinit();
 
         try client.setAuth(self.config.secret_key);
@@ -106,7 +109,7 @@ const ClientWorker = struct {
 
     fn generatePayload(self: *ClientWorker) ![]u8 {
         const payload = try self.allocator.alloc(u8, self.config.request_size_bytes);
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(compat.milliTimestamp())));
         const random = prng.random();
 
         for (payload) |*byte| {
@@ -148,7 +151,7 @@ fn calculateLatencyStats(latencies: []f64) BenchmarkResults.LatencyStats {
     };
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, config: BenchmarkConfig) !BenchmarkResults {
+fn runBenchmark(allocator: std.mem.Allocator, io: std.Io, config: BenchmarkConfig) !BenchmarkResults {
     std.log.info("Starting benchmark with {} concurrent clients, {} requests each", .{ config.concurrent_clients, config.num_requests });
 
     var all_latencies = try std.ArrayList(f64).initCapacity(allocator, config.concurrent_clients);
@@ -167,7 +170,7 @@ fn runBenchmark(allocator: std.mem.Allocator, config: BenchmarkConfig) !Benchmar
 
     // Initialize workers
     for (0..config.concurrent_clients) |_| {
-        const worker = ClientWorker.init(allocator, config);
+        const worker = ClientWorker.init(allocator, io, config);
         workers.appendAssumeCapacity(worker);
     }
 
@@ -202,7 +205,7 @@ fn runBenchmark(allocator: std.mem.Allocator, config: BenchmarkConfig) !Benchmar
         .requests_per_second = requests_per_second,
         .latency_stats = calculateLatencyStats(all_latencies.items),
         .error_rate = @as(f64, @floatFromInt(total_failed)) / @as(f64, @floatFromInt(total_requests)),
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.timestamp(),
     };
 }
 
@@ -248,37 +251,44 @@ fn outputResults(_: std.mem.Allocator, results: BenchmarkResults, format: Format
 
 pub const Format = enum { json, text };
 
-fn parseArgs(allocator: std.mem.Allocator) !struct { config: BenchmarkConfig, output_format: Format } {
+fn parseArgs(allocator: std.mem.Allocator, args_raw: std.process.Args) !struct { config: BenchmarkConfig, output_format: Format } {
     var config = BenchmarkConfig{};
     var format: Format = .text;
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = std.process.Args.Iterator.init(args_raw);
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
-            config.host = try allocator.dupe(u8, args[i + 1]);
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            config.port = try std.fmt.parseInt(u16, args[i + 1], 10);
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--requests") and i + 1 < args.len) {
-            config.num_requests = try std.fmt.parseInt(u32, args[i + 1], 10);
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--clients") and i + 1 < args.len) {
-            config.concurrent_clients = try std.fmt.parseInt(u32, args[i + 1], 10);
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--size") and i + 1 < args.len) {
-            config.request_size_bytes = try std.fmt.parseInt(u32, args[i + 1], 10);
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--output") and i + 1 < args.len) {
-            if (std.mem.eql(u8, args[i + 1], "json")) {
-                format = .json;
-            } else if (std.mem.eql(u8, args[i + 1], "text")) {
-                format = .text;
+    // Skip program name
+    _ = args_iter.next();
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--host")) {
+            if (args_iter.next()) |val| {
+                config.host = try allocator.dupe(u8, val);
             }
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--help")) {
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            if (args_iter.next()) |val| {
+                config.port = try std.fmt.parseInt(u16, val, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--requests")) {
+            if (args_iter.next()) |val| {
+                config.num_requests = try std.fmt.parseInt(u32, val, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--clients")) {
+            if (args_iter.next()) |val| {
+                config.concurrent_clients = try std.fmt.parseInt(u32, val, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            if (args_iter.next()) |val| {
+                config.request_size_bytes = try std.fmt.parseInt(u32, val, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--output")) {
+            if (args_iter.next()) |val| {
+                if (std.mem.eql(u8, val, "json")) {
+                    format = .json;
+                } else if (std.mem.eql(u8, val, "text")) {
+                    format = .text;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             std.process.exit(0);
         }
@@ -304,16 +314,15 @@ fn printUsage() void {
 // Simple benchmark handler for testing
 pub fn benchmarkHandler(request: []const u8, allocator: std.mem.Allocator) ![]u8 {
     // Echo the request back with a timestamp
-    const response = try std.fmt.allocPrint(allocator, "Echo: {s} (processed at {})", .{ request, std.time.milliTimestamp() });
+    const response = try std.fmt.allocPrint(allocator, "Echo: {s} (processed at {})", .{ request, compat.milliTimestamp() });
     return response;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
-    const parsed = try parseArgs(allocator);
+    const parsed = try parseArgs(allocator, init.minimal.args);
     const config = parsed.config;
     const output_format = parsed.output_format;
     // Free the duplicated host string at the end
@@ -327,6 +336,6 @@ pub fn main() !void {
     std.debug.print("  Request size: {} bytes", .{config.request_size_bytes});
     std.debug.print("  Output format: {}", .{output_format});
 
-    const results = try runBenchmark(allocator, config);
+    const results = try runBenchmark(allocator, init.io, config);
     try outputResults(allocator, results, output_format);
 }

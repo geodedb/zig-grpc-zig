@@ -5,6 +5,7 @@ const compression = @import("features/compression.zig");
 const auth = @import("features/auth.zig");
 const streaming = @import("features/streaming.zig");
 const health = @import("features/health.zig");
+const net = std.Io.net;
 
 pub const Transport = transport.Transport;
 pub const TlsIo = transport.TlsIo;
@@ -18,19 +19,21 @@ pub const Handler = struct {
 
 pub const GrpcServer = struct {
     allocator: std.mem.Allocator,
-    address: std.net.Address,
-    server: std.net.Server,
+    io: std.Io,
+    address: net.IpAddress,
+    server: net.Server,
     handlers: std.ArrayList(Handler),
     compression: compression.Compression,
     auth: auth.Auth,
     health_check: health.HealthCheck,
-    on_tls_accept: ?*const fn (std.net.Stream) anyerror!transport.TlsIo = null,
+    on_tls_accept: ?*const fn (net.Stream) anyerror!transport.TlsIo = null,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16, secret_key: []const u8) !GrpcServer {
-        const address = try std.net.Address.parseIp("0.0.0.0", port);
-        const server = try address.listen(.{ .reuse_address = true });
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
+        const address = try net.IpAddress.parseIp4("0.0.0.0", port);
+        const server = try address.listen(io, .{ .reuse_address = true });
         return GrpcServer{
             .allocator = allocator,
+            .io = io,
             .address = address,
             .server = server,
             .handlers = try std.ArrayList(Handler).initCapacity(allocator, 1),
@@ -42,7 +45,7 @@ pub const GrpcServer = struct {
 
     pub fn deinit(self: *GrpcServer) void {
         self.handlers.deinit(self.allocator);
-        self.server.deinit();
+        self.server.deinit(self.io);
         self.health_check.deinit();
     }
 
@@ -50,38 +53,38 @@ pub const GrpcServer = struct {
         try self.health_check.setStatus("grpc.health.v1.Health", .SERVING);
 
         while (true) {
-            const connection = try self.server.accept();
+            const stream_ = try self.server.accept(self.io);
             // Spawn a thread per connection for concurrent handling
-            const thread = std.Thread.spawn(.{}, connectionThread, .{ self, connection }) catch |err| {
+            const thread = std.Thread.spawn(.{}, connectionThread, .{ self, stream_ }) catch |err| {
                 std.log.err("Failed to spawn connection thread: {}", .{err});
-                connection.stream.close();
+                stream_.close(self.io);
                 continue;
             };
             thread.detach();
         }
     }
 
-    fn connectionThread(self: *GrpcServer, conn: std.net.Server.Connection) void {
-        self.handleConnection(conn) catch |err| {
+    fn connectionThread(self: *GrpcServer, stream_: net.Stream) void {
+        self.handleConnection(stream_) catch |err| {
             std.log.err("Connection handling failed: {}", .{err});
         };
     }
 
-    fn handleConnection(self: *GrpcServer, conn: std.net.Server.Connection) !void {
+    fn handleConnection(self: *GrpcServer, stream_: net.Stream) !void {
         var trans = if (self.on_tls_accept) |accept_fn| blk: {
-            const tls_io = accept_fn(conn.stream) catch |err| {
+            const tls_io = accept_fn(stream_) catch |err| {
                 // TLS accept failed — close the stream before returning
-                conn.stream.close();
+                stream_.close(self.io);
                 return err;
             };
-            break :blk transport.Transport.initServerTls(self.allocator, conn.stream, tls_io) catch |err| {
+            break :blk transport.Transport.initServerTls(self.allocator, self.io, stream_, tls_io) catch |err| {
                 // initServerTls already cleans up tls_io via errdefer —
                 // only close the underlying stream here to avoid double-free.
-                conn.stream.close();
+                stream_.close(self.io);
                 return err;
             };
-        } else transport.Transport.initServer(self.allocator, conn.stream) catch |err| {
-            conn.stream.close();
+        } else transport.Transport.initServer(self.allocator, self.io, stream_) catch |err| {
+            stream_.close(self.io);
             return err;
         };
         defer trans.deinit();

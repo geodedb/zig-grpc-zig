@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = std.crypto;
+const compat = @import("../compat.zig");
 
 pub const AuthError = error{
     InvalidToken,
@@ -51,7 +52,7 @@ pub const Auth = struct {
     }
 
     pub fn generateToken(self: *Auth, subject: []const u8, expires_in: i64) ![]u8 {
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
 
         // Simplified JWT creation without JSON - just create a simple token string
         // Format: "HS256.JWT.{subject}.{exp}.{iat}"

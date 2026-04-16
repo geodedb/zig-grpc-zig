@@ -28,7 +28,7 @@ const benchmark = @import("benchmark.zig");
 // }
 
 test "benchmark handler" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -45,7 +45,7 @@ test "benchmark handler" {
 test "compression - gzip" {
     const compression = @import("features/compression.zig");
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -72,7 +72,7 @@ test "compression - gzip" {
 test "compression - deflate" {
     const compression = @import("features/compression.zig");
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -99,7 +99,7 @@ test "compression - deflate" {
 test "compression - none algorithm" {
     const compression = @import("features/compression.zig");
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

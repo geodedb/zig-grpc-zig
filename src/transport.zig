@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const http2 = struct {
     pub const connection = @import("http2/connection.zig");
     pub const frame = @import("http2/frame.zig");
@@ -34,6 +34,7 @@ pub const TlsIo = struct {
 
 pub const Transport = struct {
     stream: net.Stream,
+    io: std.Io,
     tls_io: ?TlsIo = null,
     read_buf: []u8,
     write_buf: []u8,
@@ -49,7 +50,7 @@ pub const Transport = struct {
     hpack_dyn_count: usize = 0,
     hpack_dyn_head: usize = 0,
 
-    pub fn initClient(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
+    pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
@@ -57,6 +58,7 @@ pub const Transport = struct {
 
         var trans = Transport{
             .stream = stream_,
+            .io = io,
             .read_buf = read_buf,
             .write_buf = write_buf,
             .allocator = allocator,
@@ -74,7 +76,7 @@ pub const Transport = struct {
         return trans;
     }
 
-    pub fn initServer(allocator: std.mem.Allocator, stream_: net.Stream) !Transport {
+    pub fn initServer(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
@@ -82,6 +84,7 @@ pub const Transport = struct {
 
         var trans = Transport{
             .stream = stream_,
+            .io = io,
             .read_buf = read_buf,
             .write_buf = write_buf,
             .allocator = allocator,
@@ -99,7 +102,7 @@ pub const Transport = struct {
         return trans;
     }
 
-    pub fn initServerTls(allocator: std.mem.Allocator, stream_: net.Stream, tls_io_: TlsIo) !Transport {
+    pub fn initServerTls(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, tls_io_: TlsIo) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
@@ -107,6 +110,7 @@ pub const Transport = struct {
 
         var trans = Transport{
             .stream = stream_,
+            .io = io,
             .tls_io = tls_io_,
             .read_buf = read_buf,
             .write_buf = write_buf,
@@ -130,17 +134,18 @@ pub const Transport = struct {
 
     fn ioRead(self: *Transport, buf: []u8) !usize {
         if (self.tls_io) |tio| return tio.read_fn(tio.ctx, buf);
-        return self.stream.read(buf);
+        var bufs = [_][]u8{buf};
+        return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &bufs);
     }
 
     fn ioWrite(self: *Transport, data: []const u8) !usize {
         if (self.tls_io) |tio| return tio.write_fn(tio.ctx, data);
-        return self.stream.write(data);
+        return self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, data, &.{}, 0);
     }
 
     fn ioClose(self: *Transport) void {
         if (self.tls_io) |tio| tio.close_fn(tio.ctx);
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     pub fn deinit(self: *Transport) void {

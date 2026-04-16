@@ -1,12 +1,12 @@
 const std = @import("std");
 const GrpcClient = @import("grpcclient").GrpcClient;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var client = try GrpcClient.init(allocator, "localhost", 50051);
+    var client = try GrpcClient.init(allocator, init.io, "localhost", 50051);
     defer client.deinit();
 
     // Set authentication
