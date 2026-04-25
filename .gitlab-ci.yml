@@ -135,6 +135,7 @@ stages:
   - lint
   - build
   - test
+  - interop
   - security
   - sbom
   - release
@@ -229,3 +230,41 @@ loopback-test:
     - zig build loopback-test
     - timeout 60 ./zig-out/bin/grpc-loopback-test
   needs: ["zig-build-0.16.0"]
+
+# Go-Go interop is the control: proves the harness itself works.
+# Must pass — this never fails because of grpc-zig protocol gaps.
+interop-go-go:
+  stage: interop
+  image: "golang:1.22"
+  tags: ["company", "linux"]
+  needs: []
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates
+    - mkdir -p zig-out/bin
+  script:
+    - cd interop/go
+    - go build -o ../../zig-out/bin/grpc-interop-go-server ./server
+    - go build -o ../../zig-out/bin/grpc-interop-go-client ./client
+    - cd ../..
+    - chmod +x interop/scripts/run-pair.sh
+    - interop/scripts/run-pair.sh ./zig-out/bin/grpc-interop-go-server ./zig-out/bin/grpc-interop-go-client 50061 --message ci-hello --tag go-go
+
+# Cross-pair (Zig × Go in either direction) is allowed to fail until
+# the protocol gaps documented in docs/interop/findings.md are fixed.
+# Keeping the job in CI means we'll see the moment it goes green.
+interop-cross:
+  stage: interop
+  image: "golang:1.22"
+  tags: ["company", "linux"]
+  needs: ["zig-build-0.16.0"]
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates xz-utils python3 build-essential
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
+    - zig build interop-server interop-client
+    - cd interop/go && go build -o ../../zig-out/bin/grpc-interop-go-server ./server && go build -o ../../zig-out/bin/grpc-interop-go-client ./client && cd ../..
+  script:
+    - chmod +x interop/scripts/run-pair.sh interop/scripts/run-matrix.sh
+    - interop/scripts/run-matrix.sh
