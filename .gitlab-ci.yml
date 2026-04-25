@@ -56,7 +56,7 @@ include:
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.22.0
     inputs:
       zig_version: "0.16.0"
-      paths: "src/ examples/ integration_test/"
+      paths: "src/ examples/ integration_test/ interop/zig/"
 
   # Zig build (Linux): compile lib + tests via the build.zig `check` step.
   - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
@@ -263,6 +263,7 @@ interop-cross:
     - bash scripts/install-zig.sh "$ZIG_VERSION"
     - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
     - zig version
+    - mkdir -p zig-out/bin
     - zig build interop-server interop-client
     - cd interop/go && go build -o ../../zig-out/bin/grpc-interop-go-server ./server && go build -o ../../zig-out/bin/grpc-interop-go-client ./client && cd ../..
   script:
