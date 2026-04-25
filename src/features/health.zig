@@ -19,10 +19,19 @@ pub const HealthCheck = struct {
     }
 
     pub fn deinit(self: *HealthCheck) void {
+        var it = self.status.keyIterator();
+        while (it.next()) |key_ptr| self.allocator.free(key_ptr.*);
         self.status.deinit();
     }
 
     pub fn setStatus(self: *HealthCheck, service: []const u8, status: HealthStatus) !void {
+        // If the key already exists, replace the value without re-duplicating
+        // the key string. Otherwise, dup once and insert; on insert failure
+        // free the dup to avoid leaking it.
+        if (self.status.getEntry(service)) |entry| {
+            entry.value_ptr.* = status;
+            return;
+        }
         const service_key = try self.allocator.dupe(u8, service);
         errdefer self.allocator.free(service_key);
         try self.status.put(service_key, status);

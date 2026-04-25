@@ -100,7 +100,17 @@ pub const GrpcServer = struct {
 
         while (true) {
             const message = trans.readMessage() catch |err| switch (err) {
-                error.ConnectionClosed => break,
+                // Treat all "client went away" signals as a clean shutdown.
+                // The kernel surfaces a peer-side close as ConnectionClosed
+                // when the read returns 0 bytes, but it can also surface as
+                // ConnectionResetByPeer or EndOfStream depending on whether
+                // the peer sent FIN cleanly or RST. Logging these as errors
+                // produces noise on every legitimate disconnect.
+                error.ConnectionClosed,
+                error.ConnectionResetByPeer,
+                error.EndOfStream,
+                error.BrokenPipe,
+                => break,
                 // TLS errors indicate the connection is gone — treat like
                 // ConnectionClosed to avoid propagating the error which could
                 // cause cleanup issues (double-free on aarch64).

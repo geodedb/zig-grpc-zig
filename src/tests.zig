@@ -96,6 +96,28 @@ test "compression - deflate" {
     try testing.expectEqualStrings(original, decompressed);
 }
 
+test "health check - setStatus does not leak duped keys" {
+    const health = @import("features/health.zig");
+
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("HealthCheck leaked memory");
+    const allocator = gpa.allocator();
+
+    var hc = health.HealthCheck.init(allocator);
+    defer hc.deinit();
+
+    // Insert and update repeatedly: each set must not leak its key, and the
+    // dedup path on update must not leak either.
+    try hc.setStatus("svc.a", .SERVING);
+    try hc.setStatus("svc.b", .SERVING);
+    try hc.setStatus("svc.a", .NOT_SERVING); // update — must reuse existing key
+    try hc.setStatus("svc.c", .SERVING);
+
+    try testing.expectEqual(health.HealthStatus.NOT_SERVING, hc.getStatus("svc.a"));
+    try testing.expectEqual(health.HealthStatus.SERVING, hc.getStatus("svc.b"));
+    try testing.expectEqual(health.HealthStatus.SERVING, hc.getStatus("svc.c"));
+}
+
 test "compression - none algorithm" {
     const compression = @import("features/compression.zig");
 
