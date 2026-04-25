@@ -199,4 +199,17 @@ pub fn build(b: *std.Build) void {
     const install_loopback_test = b.addInstallArtifact(loopback_test, .{});
     const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
     loopback_test_step.dependOn(&install_loopback_test.step);
+
+    // Interop wire-codec unit tests.
+    const interop_codec_tests = b.addTest(.{
+        .name = "interop-codec-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/zig/harness_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_interop_codec_tests = b.addRunArtifact(interop_codec_tests);
+    const interop_codec_test_step = b.step("interop-codec-test", "Run the interop wire-codec unit tests");
+    interop_codec_test_step.dependOn(&run_interop_codec_tests.step);
 }
