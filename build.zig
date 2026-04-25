@@ -226,4 +226,18 @@ pub fn build(b: *std.Build) void {
     const install_interop_server = b.addInstallArtifact(interop_server, .{});
     const interop_server_step = b.step("interop-server", "Build the Zig interop server binary");
     interop_server_step.dependOn(&install_interop_server.step);
+
+    const interop_client = b.addExecutable(.{
+        .name = "grpc-interop-zig-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/zig/client_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    interop_client.root_module.linkLibrary(zlib_lib);
+    interop_client.root_module.addImport("grpc-client", client_mod);
+    const install_interop_client = b.addInstallArtifact(interop_client, .{});
+    const interop_client_step = b.step("interop-client", "Build the Zig interop client binary");
+    interop_client_step.dependOn(&install_interop_client.step);
 }
