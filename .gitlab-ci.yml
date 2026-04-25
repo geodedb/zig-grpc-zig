@@ -83,12 +83,15 @@ include:
       optimize: "ReleaseSmall"
 
   # Cross-OS build smoke (gated). The Linux test matrix above is the source
-  # of truth; macOS/Windows just confirm we still compile everywhere.
+  # of truth; macOS/Windows just confirm we still compile everywhere. The
+  # macOS/Windows catalog components run `zig build "$build_step" $build_options`,
+  # so use `build_step: "check"` and leave `build_options` empty — our
+  # build.zig defines `check` but not a top-level `build` step.
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.22.0
     inputs:
       zig_version: "0.16.0"
-      build_step: "build"
-      build_options: "check"
+      build_step: "check"
+      build_options: ""
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
     inputs:
       zig_version: "0.16.0"
@@ -97,8 +100,8 @@ include:
   - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.22.0
     inputs:
       zig_version: "0.16.0"
-      build_step: "build"
-      build_options: "check"
+      build_step: "check"
+      build_options: ""
       tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
     inputs:
