@@ -131,19 +131,43 @@ stages:
   - when: manual
     allow_failure: true
 
+# Cross-OS jobs are best-effort: GitLab's SaaS macOS fleet has been known
+# to hang for >25 min provisioning a VM. `allow_failure: true` keeps a
+# stuck cross-OS job from failing the pipeline; the explicit `needs:`
+# overrides on the Linux test jobs (below) keep them from waiting on a
+# stuck cross-OS build before they can start.
 zig-build-macos-0.16.0:
   rules: *cross-os-rules
+  allow_failure: true
 
 zig-test-macos-unit-0.16.0:
   rules: *cross-os-rules
   needs: ["zig-build-macos-0.16.0"]
+  allow_failure: true
 
 zig-build-windows-0.16.0:
   rules: *cross-os-rules
+  allow_failure: true
 
 zig-test-windows-unit-0.16.0:
   rules: *cross-os-rules
   needs: ["zig-build-windows-0.16.0"]
+  allow_failure: true
+
+# Linux unit tests should fan out as soon as the Linux build is green;
+# they must not wait on cross-OS builds. Catalog v1.22.0 doesn't expose a
+# `needs` input, so we override here.
+zig-test-unit-debug-0.16.0:
+  needs: ["zig-build-0.16.0"]
+
+zig-test-unit-releasesafe-0.16.0:
+  needs: ["zig-build-0.16.0"]
+
+zig-test-unit-releasefast-0.16.0:
+  needs: ["zig-build-0.16.0"]
+
+zig-test-unit-releasesmall-0.16.0:
+  needs: ["zig-build-0.16.0"]
 
 # ---------------------------------------------------------------
 # grpc-zig-specific jobs.
