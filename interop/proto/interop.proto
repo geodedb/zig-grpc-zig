@@ -1,0 +1,24 @@
+// interop/proto/interop.proto
+syntax = "proto3";
+
+package interop;
+
+option go_package = "gitlab.com/devnw/zig/grpc-zig/interop/go/genproto;genproto";
+
+// Minimal service for cross-stack interop: unary echo only.
+// Keep the message shape small so the hand-written Zig wire codec
+// stays trivial — bytes + string covers fields 1 (length-delimited
+// LEN wire type 2) and proves end-to-end framing works.
+service Interop {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  bytes payload = 1;
+  string tag    = 2;
+}
+
+message EchoResponse {
+  bytes payload = 1;
+  string tag    = 2;
+}
