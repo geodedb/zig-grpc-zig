@@ -1,0 +1,276 @@
+//! `ClientMux` — multiplexed gRPC-over-HTTP/2 client.
+//!
+//! Wraps a single `Transport` connection and lets multiple threads issue
+//! `call()` invocations concurrently. Each call gets a fresh odd-numbered
+//! stream id; a dedicated reader thread demultiplexes incoming frames by
+//! stream id into per-call completion slots.
+//!
+//! The single-call `GrpcClient` API in `client.zig` remains for simple
+//! request/response use; `ClientMux` is what you reach for when you need
+//! N concurrent in-flight RPCs on a single connection.
+
+const std = @import("std");
+const transport = @import("transport.zig");
+const compression = @import("features/compression.zig");
+const net = std.Io.net;
+const http2 = struct {
+    pub const frame = @import("http2/frame.zig");
+};
+
+const Allocator = std.mem.Allocator;
+
+/// Per-stream completion slot. The owning call() thread allocates this on
+/// its stack, registers it with the mux, writes its request, then blocks on
+/// `cond` until the reader thread sets `end_stream` (or `err`).
+const StreamSlot = struct {
+    /// Concatenated DATA-frame payloads for this stream, gRPC 5-byte prefix
+    /// stripped. Built up by the reader thread; consumed by the caller after
+    /// `end_stream` is signaled.
+    data: std.ArrayList(u8) = .empty,
+    end_stream: bool = false,
+    err: ?anyerror = null,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+
+    fn deinit(self: *StreamSlot, allocator: Allocator) void {
+        self.data.deinit(allocator);
+    }
+};
+
+pub const ClientMux = struct {
+    allocator: Allocator,
+    io: std.Io,
+    transport: transport.Transport,
+    compression: compression.Compression,
+
+    streams: std.AutoHashMap(u31, *StreamSlot) = undefined,
+    streams_mutex: std.Io.Mutex = .init,
+
+    /// Next outgoing stream id. Client-initiated streams must be odd
+    /// (RFC 7540 §5.1.1) and monotonically increasing. We reserve id 1 for
+    /// the legacy single-call code path that lives in `Transport`, so the
+    /// mux starts allocating at 3.
+    next_stream_id: u31 = 3,
+
+    reader_thread: std.Thread = undefined,
+    reader_started: bool = false,
+    shutdown: std.atomic.Value(bool) = .init(false),
+
+    pub fn init(allocator: Allocator, io: std.Io, host: []const u8, port: u16) !*ClientMux {
+        const self = try allocator.create(ClientMux);
+        errdefer allocator.destroy(self);
+
+        const address = try net.IpAddress.resolve(io, host, port);
+        const conn = try address.connect(io, .{ .mode = .stream });
+
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .transport = try transport.Transport.initClient(allocator, io, conn),
+            .compression = compression.Compression.init(allocator),
+            .streams = std.AutoHashMap(u31, *StreamSlot).init(allocator),
+        };
+        errdefer self.transport.deinit();
+        errdefer self.streams.deinit();
+
+        self.reader_thread = try std.Thread.spawn(.{}, readerLoop, .{self});
+        self.reader_started = true;
+
+        return self;
+    }
+
+    pub fn deinit(self: *ClientMux) void {
+        self.shutdown.store(true, .release);
+
+        // POSIX `close()` on one thread does not wake another thread blocked
+        // in `read()` on the same fd; we need `shutdown(SHUT_RDWR, fd)` to
+        // make the in-flight read return EOF/error so the reader thread can
+        // exit. Best-effort: ignore failure (e.g. NotConnected if peer
+        // already closed) since we'll close the fd next anyway.
+        // SHUT_RDWR == 2 (POSIX).
+        if (self.transport.tls_io == null) {
+            _ = std.c.shutdown(self.transport.stream.socket.handle, 2);
+        }
+
+        if (self.reader_started) {
+            self.reader_thread.join();
+        }
+
+        self.transport.deinit();
+        self.streams.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn allocStreamId(self: *ClientMux) u31 {
+        self.streams_mutex.lockUncancelable(self.io);
+        defer self.streams_mutex.unlock(self.io);
+        const sid = self.next_stream_id;
+        self.next_stream_id +%= 2;
+        return sid;
+    }
+
+    fn registerStream(self: *ClientMux, sid: u31, slot: *StreamSlot) !void {
+        self.streams_mutex.lockUncancelable(self.io);
+        defer self.streams_mutex.unlock(self.io);
+        try self.streams.put(sid, slot);
+    }
+
+    fn unregisterStream(self: *ClientMux, sid: u31) void {
+        self.streams_mutex.lockUncancelable(self.io);
+        defer self.streams_mutex.unlock(self.io);
+        _ = self.streams.remove(sid);
+    }
+
+    fn findStream(self: *ClientMux, sid: u31) ?*StreamSlot {
+        self.streams_mutex.lockUncancelable(self.io);
+        defer self.streams_mutex.unlock(self.io);
+        return self.streams.get(sid);
+    }
+
+    /// Wake every waiting call() with the same error. Used when the reader
+    /// thread can no longer make progress (socket closed, GOAWAY, etc.) so
+    /// nobody waits forever.
+    fn broadcastError(self: *ClientMux, err: anyerror) void {
+        self.streams_mutex.lockUncancelable(self.io);
+        defer self.streams_mutex.unlock(self.io);
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const slot = entry.value_ptr.*;
+            slot.mutex.lockUncancelable(self.io);
+            slot.err = err;
+            slot.end_stream = true;
+            slot.cond.broadcast(self.io);
+            slot.mutex.unlock(self.io);
+        }
+    }
+
+    /// Issue a unary RPC. Thread-safe — multiple threads can call this
+    /// concurrently on the same `ClientMux`. Each call gets a fresh stream
+    /// id and waits on its own completion slot.
+    pub fn call(
+        self: *ClientMux,
+        request: []const u8,
+        compression_alg: compression.Compression.Algorithm,
+    ) ![]u8 {
+        const compressed = try self.compression.compress(request, compression_alg);
+        defer self.allocator.free(compressed);
+
+        const sid = self.allocStreamId();
+
+        var slot: StreamSlot = .{};
+        defer slot.deinit(self.allocator);
+
+        try self.registerStream(sid, &slot);
+        defer self.unregisterStream(sid);
+
+        try self.transport.writeMessageOnStream(sid, compressed);
+
+        // Block until the reader thread signals end-of-stream or an error.
+        slot.mutex.lockUncancelable(self.io);
+        defer slot.mutex.unlock(self.io);
+        while (!slot.end_stream) {
+            slot.cond.waitUncancelable(self.io, &slot.mutex);
+        }
+        if (slot.err) |e| return e;
+
+        // Decompress and hand back to caller as an owned slice.
+        return try self.compression.decompress(slot.data.items, compression_alg);
+    }
+};
+
+fn readerLoop(self: *ClientMux) void {
+    while (!self.shutdown.load(.acquire)) {
+        const frame = self.transport.readFrame() catch |err| {
+            self.broadcastError(err);
+            return;
+        };
+        const ftype = frame.frame_type;
+        const flags = frame.flags;
+        const sid = frame.stream_id;
+        const payload = frame.payload;
+
+        const FT = http2.frame.FrameType;
+        const FF = http2.frame.FrameFlags;
+
+        switch (@as(FT, @enumFromInt(ftype))) {
+            .DATA => {
+                const end = (flags & FF.END_STREAM) != 0;
+                if (self.findStream(sid)) |slot| {
+                    slot.mutex.lockUncancelable(self.io);
+                    defer slot.mutex.unlock(self.io);
+                    if (payload.len >= 5) {
+                        const msg_len = (@as(u32, payload[1]) << 24) |
+                            (@as(u32, payload[2]) << 16) |
+                            (@as(u32, payload[3]) << 8) |
+                            @as(u32, payload[4]);
+                        if (payload.len >= 5 + msg_len) {
+                            slot.data.appendSlice(self.allocator, payload[5 .. 5 + msg_len]) catch |e| {
+                                slot.err = e;
+                            };
+                        }
+                    }
+                    if (end) {
+                        slot.end_stream = true;
+                        slot.cond.broadcast(self.io);
+                    }
+                }
+                self.allocator.free(payload);
+            },
+            .HEADERS => {
+                const end = (flags & FF.END_STREAM) != 0;
+                if (end) {
+                    if (self.findStream(sid)) |slot| {
+                        slot.mutex.lockUncancelable(self.io);
+                        defer slot.mutex.unlock(self.io);
+                        slot.end_stream = true;
+                        slot.cond.broadcast(self.io);
+                    }
+                }
+                self.allocator.free(payload);
+            },
+            .SETTINGS => {
+                const is_ack = (flags & 0x1) != 0;
+                self.allocator.free(payload);
+                if (!is_ack) {
+                    self.transport.writeFrame(.SETTINGS, 0x1, 0, &.{}) catch |err| {
+                        self.broadcastError(err);
+                        return;
+                    };
+                }
+            },
+            .PING => {
+                const is_ack = (flags & 0x1) != 0;
+                if (!is_ack) {
+                    var ping_data: [8]u8 = .{0} ** 8;
+                    const copy_len = @min(payload.len, 8);
+                    @memcpy(ping_data[0..copy_len], payload[0..copy_len]);
+                    self.allocator.free(payload);
+                    self.transport.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]) catch |err| {
+                        self.broadcastError(err);
+                        return;
+                    };
+                } else {
+                    self.allocator.free(payload);
+                }
+            },
+            .RST_STREAM => {
+                if (self.findStream(sid)) |slot| {
+                    slot.mutex.lockUncancelable(self.io);
+                    defer slot.mutex.unlock(self.io);
+                    slot.err = error.StreamReset;
+                    slot.end_stream = true;
+                    slot.cond.broadcast(self.io);
+                }
+                self.allocator.free(payload);
+            },
+            .GOAWAY => {
+                self.allocator.free(payload);
+                self.broadcastError(error.GoAway);
+                return;
+            },
+            else => {
+                self.allocator.free(payload);
+            },
+        }
+    }
+}

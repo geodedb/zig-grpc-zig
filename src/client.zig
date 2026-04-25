@@ -40,6 +40,41 @@ pub const GrpcClient = struct {
         return .UNKNOWN;
     }
 
+    /// Server-streaming RPC: send a single request, then read messages until
+    /// the server signals END_STREAM. Each message is appended to `out`,
+    /// allocated by `self.allocator`. On return, the caller owns every slice
+    /// in `out` and must free them (and clear the list) before reuse.
+    ///
+    /// `compression_alg` is applied symmetrically: the request is compressed
+    /// outbound and each response message is decompressed inbound. The server
+    /// must echo the algorithm or use a passthrough handler that does not
+    /// transform the bytes — see notes in `Compression`.
+    pub fn streamCall(
+        self: *GrpcClient,
+        _: []const u8,
+        request: []const u8,
+        compression_alg: compression.Compression.Algorithm,
+        out: *std.ArrayList([]u8),
+    ) !void {
+        const compressed = try self.compression.compress(request, compression_alg);
+        defer self.allocator.free(compressed);
+
+        try self.transport.writeMessage(compressed);
+
+        while (true) {
+            const sf = try self.transport.readStreamFrame();
+            if (sf.data) |raw| {
+                const decompressed = self.compression.decompress(raw, compression_alg) catch |err| {
+                    self.allocator.free(raw);
+                    return err;
+                };
+                self.allocator.free(raw);
+                try out.append(self.allocator, decompressed);
+            }
+            if (sf.end_stream) break;
+        }
+    }
+
     pub fn call(self: *GrpcClient, _: []const u8, request: []const u8, compression_alg: compression.Compression.Algorithm) ![]u8 {
         // Add auth token if available
         var headers = std.StringHashMap([]const u8).init(self.allocator);

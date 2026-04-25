@@ -49,6 +49,16 @@ pub const Transport = struct {
     hpack_dyn: [HPACK_DYN_MAX]HpackDynEntry = [_]HpackDynEntry{.{}} ** HPACK_DYN_MAX,
     hpack_dyn_count: usize = 0,
     hpack_dyn_head: usize = 0,
+    /// Serializes byte-level writes to the socket. Multi-frame sequences
+    /// (HEADERS+DATA+TRAILERS) acquire this once for the whole sequence so
+    /// frames from different threads cannot interleave on the wire. The
+    /// reader-thread side of `ClientMux` also acquires this briefly when
+    /// sending control-frame ACKs (SETTINGS, PING).
+    ///
+    /// Uses `std.Io.Mutex` (Zig 0.16's IO-aware primitive) and the
+    /// `*Uncancelable` variants because cancelling a half-written frame on
+    /// the wire would desynchronize the peer.
+    write_mutex: std.Io.Mutex = .init,
 
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
@@ -138,7 +148,8 @@ pub const Transport = struct {
         return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &bufs);
     }
 
-    fn ioWrite(self: *Transport, data: []const u8) !usize {
+    /// Low-level socket write. Caller MUST hold `write_mutex`.
+    fn ioWriteLocked(self: *Transport, data: []const u8) !usize {
         if (self.tls_io) |tio| return tio.write_fn(tio.ctx, data);
         // `std.Io.Threaded.netWritePosix` indexes `data[data.len - 1]`
         // unconditionally, so passing `&.{}` as the additional-buffers
@@ -148,6 +159,15 @@ pub const Transport = struct {
         // semantics this method needs.
         const trailing = [_][]const u8{data};
         return self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, "", &trailing, 1);
+    }
+
+    /// Single-shot socket write, takes the write_mutex internally. Used by
+    /// callers that emit a single self-contained chunk (the HTTP/2 preface,
+    /// for example) where atomicity with surrounding frames isn't required.
+    fn ioWrite(self: *Transport, data: []const u8) !usize {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        return self.ioWriteLocked(data);
     }
 
     fn ioClose(self: *Transport) void {
@@ -188,9 +208,19 @@ pub const Transport = struct {
         }
     }
 
-    /// Read a single HTTP/2 frame header and payload.
-    /// Returns frame_type, flags, stream_id, and allocated payload.
-    fn readFrame(self: *Transport) !struct { frame_type: u8, flags: u8, stream_id: u31, payload: []u8 } {
+    /// Decoded HTTP/2 frame header + owned payload. The `payload` slice is
+    /// allocated via the Transport's allocator and the caller is responsible
+    /// for freeing it when finished.
+    pub const RawFrame = struct {
+        frame_type: u8,
+        flags: u8,
+        stream_id: u31,
+        payload: []u8,
+    };
+
+    /// Read a single HTTP/2 frame header and payload. Public so a
+    /// multiplexing reader (`ClientMux`) can drive its own dispatch loop.
+    pub fn readFrame(self: *Transport) !RawFrame {
         var header: [9]u8 = undefined;
         try self.readExact(&header);
 
@@ -214,8 +244,19 @@ pub const Transport = struct {
         return .{ .frame_type = frame_type, .flags = flags, .stream_id = stream_id, .payload = payload };
     }
 
-    /// Write an HTTP/2 frame with the given type, flags, stream ID, and payload.
-    fn writeFrame(self: *Transport, frame_type: http2.frame.FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
+    /// Write an HTTP/2 frame; takes `write_mutex` for the header+payload
+    /// pair so they can't interleave with another writer. Public so the
+    /// `ClientMux` reader thread can send connection-level ACKs.
+    pub fn writeFrame(self: *Transport, frame_type: http2.frame.FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        try self.writeFrameLocked(frame_type, flags, stream_id, payload);
+    }
+
+    /// Write an HTTP/2 frame; caller MUST hold `write_mutex`. Used inside
+    /// multi-frame sequences (e.g. HEADERS+DATA+TRAILERS in `writeMessage`)
+    /// so the whole sequence is atomic on the wire.
+    fn writeFrameLocked(self: *Transport, frame_type: http2.frame.FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
         const length: u24 = @intCast(payload.len);
         var header: [9]u8 = undefined;
         header[0] = @intCast((length >> 16) & 0xFF);
@@ -228,9 +269,9 @@ pub const Transport = struct {
         header[7] = @intCast((@as(u32, stream_id) >> 8) & 0xFF);
         header[8] = @intCast(@as(u32, stream_id) & 0xFF);
 
-        _ = try self.ioWrite(&header);
+        _ = try self.ioWriteLocked(&header);
         if (payload.len > 0) {
-            _ = try self.ioWrite(payload);
+            _ = try self.ioWriteLocked(payload);
         }
     }
 
@@ -348,6 +389,99 @@ pub const Transport = struct {
                 },
                 else => {
                     // Unknown frame type — skip
+                    self.allocator.free(payload);
+                    continue;
+                },
+            }
+        }
+    }
+
+    /// One frame in a server-streaming response sequence.
+    /// `data` is non-null for DATA frames carrying a gRPC message (caller
+    /// owns and must free). `end_stream` is true when the peer has signaled
+    /// that no further frames will arrive on this stream — either via a
+    /// DATA frame with the END_STREAM flag, or via a trailing HEADERS
+    /// frame with END_STREAM (the standard gRPC trailers form).
+    pub const StreamFrame = struct {
+        data: ?[]u8,
+        end_stream: bool,
+    };
+
+    /// Read the next gRPC message in a server-streaming response, with an
+    /// explicit end-of-stream signal. Has the same connection-level frame
+    /// handling as `readMessage` (SETTINGS, PING, WINDOW_UPDATE, etc.) but
+    /// surfaces END_STREAM to the caller so it knows when the server is
+    /// done sending. Returns `{ data: null, end_stream: true }` for the
+    /// trailers frame that ends a streaming response with no payload.
+    pub fn readStreamFrame(self: *Transport) !StreamFrame {
+        while (true) {
+            const frame = try self.readFrame();
+            const frame_type = frame.frame_type;
+            const flags = frame.flags;
+            const payload = frame.payload;
+
+            switch (frame_type) {
+                @intFromEnum(http2.frame.FrameType.DATA) => {
+                    const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
+                    if (payload.len >= 5) {
+                        const msg_len = (@as(u32, payload[1]) << 24) |
+                            (@as(u32, payload[2]) << 16) |
+                            (@as(u32, payload[3]) << 8) |
+                            @as(u32, payload[4]);
+                        if (payload.len >= 5 + msg_len) {
+                            const result = self.allocator.alloc(u8, msg_len) catch {
+                                self.allocator.free(payload);
+                                return error.OutOfMemory;
+                            };
+                            @memcpy(result, payload[5 .. 5 + msg_len]);
+                            self.allocator.free(payload);
+                            return .{ .data = result, .end_stream = end };
+                        }
+                    }
+                    return .{ .data = payload, .end_stream = end };
+                },
+                @intFromEnum(http2.frame.FrameType.HEADERS) => {
+                    const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
+                    self.last_stream_id = frame.stream_id;
+                    self.extractPathFromHpack(payload);
+                    self.allocator.free(payload);
+                    if (end) return .{ .data = null, .end_stream = true };
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.SETTINGS) => {
+                    const is_ack = (flags & 0x1) != 0;
+                    if (!is_ack) {
+                        self.allocator.free(payload);
+                        try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
+                    } else {
+                        self.allocator.free(payload);
+                    }
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
+                    self.allocator.free(payload);
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.PING) => {
+                    const is_ack = (flags & 0x1) != 0;
+                    if (!is_ack) {
+                        var ping_data: [8]u8 = .{0} ** 8;
+                        const copy_len = @min(payload.len, 8);
+                        @memcpy(ping_data[0..copy_len], payload[0..copy_len]);
+                        self.allocator.free(payload);
+                        try self.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]);
+                    } else {
+                        self.allocator.free(payload);
+                    }
+                    continue;
+                },
+                @intFromEnum(http2.frame.FrameType.RST_STREAM),
+                @intFromEnum(http2.frame.FrameType.GOAWAY),
+                => {
+                    self.allocator.free(payload);
+                    return TransportError.ConnectionClosed;
+                },
+                else => {
                     self.allocator.free(payload);
                     continue;
                 },
@@ -603,16 +737,17 @@ pub const Transport = struct {
     pub fn writeStreamMessage(self: *Transport, message: []const u8, is_first: bool) !void {
         const sid = self.last_stream_id;
 
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         if (is_first) {
-            // Send HEADERS on first message
             const response_headers = [_]u8{
                 0x88, // :status: 200
                 0x40 | 31, 16, 'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
             };
-            try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
+            try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
         }
 
-        // Send DATA frame (no END_STREAM)
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
@@ -622,7 +757,7 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
-        try self.writeFrame(.DATA, 0, sid, grpc_frame);
+        try self.writeFrameLocked(.DATA, 0, sid, grpc_frame);
     }
 
     /// End a gRPC server stream by sending TRAILERS with grpc-status: 0.
@@ -638,45 +773,44 @@ pub const Transport = struct {
     /// Sends proper gRPC framing: HEADERS frame, then DATA frame with
     /// 5-byte gRPC prefix, then TRAILERS with grpc-status: 0.
     pub fn writeMessage(self: *Transport, message: []const u8) !void {
-        const sid = self.last_stream_id;
+        return self.writeMessageOnStream(self.last_stream_id, message);
+    }
 
-        // 1. Send HEADERS frame with gRPC response headers
-        //    Minimal HPACK-encoded headers for gRPC:
-        //    :status: 200, content-type: application/grpc
+    /// Write a gRPC message on a specific HTTP/2 stream id. Holds the
+    /// `write_mutex` for the entire HEADERS+DATA+TRAILERS sequence so
+    /// concurrent writers (multiple in-flight client calls) can't
+    /// interleave their frames on the wire.
+    pub fn writeMessageOnStream(self: *Transport, stream_id: u31, message: []const u8) !void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         const response_headers = [_]u8{
-            // :status: 200 (indexed header field, index 8)
             0x88,
-            // content-type: application/grpc (literal header with incremental indexing)
-            // name index 31 = content-type, value = "application/grpc"
-            0x40 | 31, // incremental indexing, name index 31
-            16, // value length = 16
+            0x40 | 31,
+            16,
             'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
         };
-        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &response_headers);
 
-        // 2. Send DATA frame with gRPC-framed message
-        //    [1 byte: not compressed][4 bytes: message length BE][protobuf message]
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
-        grpc_frame[0] = 0; // not compressed
+        grpc_frame[0] = 0;
         grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
         grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
+        try self.writeFrameLocked(.DATA, 0, stream_id, grpc_frame);
 
-        try self.writeFrame(.DATA, 0, sid, grpc_frame);
-
-        // 3. Send TRAILERS frame with grpc-status: 0 (OK)
-        //    HPACK: literal header, name "grpc-status", value "0"
         const trailers = [_]u8{
-            0x40, // literal header with incremental indexing, new name
-            11, // name length = 11
+            0x40,
+            11,
             'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's',
-            1, // value length = 1
-            '0', // status = OK
+            1,
+            '0',
         };
-        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &trailers);
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, stream_id, &trailers);
     }
+
 };

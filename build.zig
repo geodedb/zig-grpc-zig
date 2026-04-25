@@ -172,4 +172,25 @@ pub fn build(b: *std.Build) void {
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
     const integration_test_step = b.step("integration_test", "Build integration test server");
     integration_test_step.dependOn(&install_integration_test.step);
+
+    // In-process loopback smoke test (server + client in same process).
+    // Run with a process-level timeout to catch deadlocks:
+    //   `timeout 10 ./zig-out/bin/grpc-loopback-test`
+    //
+    // Imports server.zig and client.zig via relative paths so they live in a
+    // single compile-unit (avoids the "file in two modules" error that occurs
+    // when both grpc and grpcclient modules are imported together).
+    const loopback_test = b.addExecutable(.{
+        .name = "grpc-loopback-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/loopback_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    loopback_test.root_module.linkLibrary(zlib_lib);
+
+    const install_loopback_test = b.addInstallArtifact(loopback_test, .{});
+    const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
+    loopback_test_step.dependOn(&install_loopback_test.step);
 }
