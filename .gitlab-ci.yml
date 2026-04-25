@@ -65,31 +65,40 @@ include:
       zig_version: "0.16.0"
       build_options: "check"
 
-  # Zig unit tests across all four optimize modes (Linux).
+  # Zig unit tests across all four optimize modes (Linux). Pass `tags`
+  # explicitly because the catalog template sets `tags: $[[ inputs.tags ]]`
+  # which (with an empty default) blasts through the workflow-level
+  # default — so without this, jobs match any untagged runner including
+  # the broken Lab Devices ARM GPU box (`linux` is in its tag_list, but
+  # `company` is not).
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
+      tags: ["company", "linux"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
+      tags: ["company", "linux"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
+      tags: ["company", "linux"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
+      tags: ["company", "linux"]
 
   # Cross-OS build smoke (gated). The Linux test matrix above is the source
   # of truth; macOS/Windows just confirm we still compile everywhere. The
