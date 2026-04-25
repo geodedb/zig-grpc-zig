@@ -135,27 +135,35 @@ stages:
     allow_failure: true
 
 # Cross-OS jobs are best-effort: GitLab's SaaS macOS fleet has been known
-# to hang for >25 min provisioning a VM. `allow_failure: true` keeps a
-# stuck cross-OS job from failing the pipeline; the explicit `needs:`
-# overrides on the Linux test jobs (below) keep them from waiting on a
-# stuck cross-OS build before they can start.
+# to hang for >25 min provisioning a VM (stuck on
+# "Creating nesting VM macos-15-xcode-16"). Three guards:
+#   * `allow_failure: true` — a stuck cross-OS job never fails the pipeline.
+#   * `timeout: 10m` — auto-cancel anything that sits in provisioning
+#     longer than a real run could plausibly need.
+#   * Explicit `needs:` overrides on the Linux test jobs (below) — Linux
+#     fans out as soon as the Linux build is green, regardless of cross-OS
+#     state.
 zig-build-macos-0.16.0:
   rules: *cross-os-rules
   allow_failure: true
+  timeout: 10m
 
 zig-test-macos-unit-0.16.0:
   rules: *cross-os-rules
   needs: ["zig-build-macos-0.16.0"]
   allow_failure: true
+  timeout: 10m
 
 zig-build-windows-0.16.0:
   rules: *cross-os-rules
   allow_failure: true
+  timeout: 10m
 
 zig-test-windows-unit-0.16.0:
   rules: *cross-os-rules
   needs: ["zig-build-windows-0.16.0"]
   allow_failure: true
+  timeout: 10m
 
 # Linux unit tests should fan out as soon as the Linux build is green;
 # they must not wait on cross-OS builds. Catalog v1.22.0 doesn't expose a
