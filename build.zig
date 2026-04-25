@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     zlib_lib.installHeadersDirectory(
         zlib_dep.path("."),
         ".",
-        .{ .include_extensions = &[_][]const u8{ ".h" } },
+        .{ .include_extensions = &[_][]const u8{".h"} },
     );
 
     // Server module (for internal use and library export)
@@ -91,10 +91,10 @@ pub fn build(b: *std.Build) void {
         "sh",
         "-c",
         "trap 'kill $SERVER_PID 2>/dev/null' EXIT; " ++
-        "./zig-out/bin/grpc-server-example & SERVER_PID=$!; " ++
-        "sleep 2; " ++
-        "./zig-out/bin/grpc-benchmark --host localhost --port 50051 --requests 10 --clients 1 --size 512 --output text; " ++
-        "kill $SERVER_PID 2>/dev/null || true",
+            "./zig-out/bin/grpc-server-example & SERVER_PID=$!; " ++
+            "sleep 2; " ++
+            "./zig-out/bin/grpc-benchmark --host localhost --port 50051 --requests 10 --clients 1 --size 512 --output text; " ++
+            "kill $SERVER_PID 2>/dev/null || true",
     });
     benchmark_cmd.step.dependOn(b.getInstallStep());
     benchmark_step.dependOn(&benchmark_cmd.step);
@@ -115,7 +115,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/basic_server.zig"),
             .target = target,
             .optimize = optimize,
-
         }),
     });
     server_example.root_module.addImport("grpc", server_mod);
@@ -128,7 +127,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/basic_client.zig"),
             .target = target,
             .optimize = optimize,
-
         }),
     });
     client_example.root_module.addImport("grpcclient", client_mod);
@@ -168,7 +166,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("integration_test/test_server.zig"),
             .target = target,
             .optimize = optimize,
-
         }),
     });
     integration_test_server.root_module.addImport("grpc", server_mod);
@@ -212,4 +209,21 @@ pub fn build(b: *std.Build) void {
     const run_interop_codec_tests = b.addRunArtifact(interop_codec_tests);
     const interop_codec_test_step = b.step("interop-codec-test", "Run the interop wire-codec unit tests");
     interop_codec_test_step.dependOn(&run_interop_codec_tests.step);
+
+    // Zig interop server: uses a named import for grpc-server so src/ files
+    // are reachable from interop/zig/ without escaping the module boundary.
+    // Transport is accessed via grpc_server.Transport (re-exported by server.zig).
+    const interop_server = b.addExecutable(.{
+        .name = "grpc-interop-zig-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("interop/zig/server_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    interop_server.root_module.linkLibrary(zlib_lib);
+    interop_server.root_module.addImport("grpc-server", server_mod);
+    const install_interop_server = b.addInstallArtifact(interop_server, .{});
+    const interop_server_step = b.step("interop-server", "Build the Zig interop server binary");
+    interop_server_step.dependOn(&install_interop_server.step);
 }
