@@ -26,8 +26,17 @@ workflow:
 
 default:
   interruptible: true
+  # Default to a Linux runner. The catalog `zig-build` / `zig-test` /
+  # `zig-format` components don't expose a `tags` input, and the company
+  # runner pool advertises both Linux (`Lab Servers`) and Windows
+  # (`Hosted Windows Runners`) under the bare `company` tag — so a
+  # bash/ubuntu-image job will land on the Windows runner about half the
+  # time and PowerShell will fail trying to interpret bash as cmdlets.
+  # Pinning `linux` here scopes every default job to a Linux runner;
+  # Windows-specific jobs override with `tags: ["company", "windows"]`.
   tags:
     - company
+    - linux
 
 include:
   # Security scanning.
