@@ -190,7 +190,7 @@ pub const Transport = struct {
 
         // Send initial SETTINGS frame
         const settings_header: [9]u8 = .{
-            0, 0, 0, // length: 0 (no settings parameters)
+            0,                                            0, 0, // length: 0 (no settings parameters)
             @intFromEnum(http2.frame.FrameType.SETTINGS),
             0, // flags: none
             0, 0, 0, 0, // stream_id: 0
@@ -743,7 +743,24 @@ pub const Transport = struct {
         if (is_first) {
             const response_headers = [_]u8{
                 0x88, // :status: 200
-                0x40 | 31, 16, 'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
+                0x40 | 31,
+                16,
+                'a',
+                'p',
+                'p',
+                'l',
+                'i',
+                'c',
+                'a',
+                't',
+                'i',
+                'o',
+                'n',
+                '/',
+                'g',
+                'r',
+                'p',
+                'c',
             };
             try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
         }
@@ -788,7 +805,22 @@ pub const Transport = struct {
             0x88,
             0x40 | 31,
             16,
-            'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
+            'a',
+            'p',
+            'p',
+            'l',
+            'i',
+            'c',
+            'a',
+            't',
+            'i',
+            'o',
+            'n',
+            '/',
+            'g',
+            'r',
+            'p',
+            'c',
         };
         try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &response_headers);
 
@@ -806,11 +838,20 @@ pub const Transport = struct {
         const trailers = [_]u8{
             0x40,
             11,
-            'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's',
+            'g',
+            'r',
+            'p',
+            'c',
+            '-',
+            's',
+            't',
+            'a',
+            't',
+            'u',
+            's',
             1,
             '0',
         };
         try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, stream_id, &trailers);
     }
-
 };

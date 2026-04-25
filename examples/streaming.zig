@@ -17,7 +17,7 @@ pub fn main() !void {
 
     // Read messages
     while (stream.pop()) |msg| {
-        std.debug.print("Message: {s}, End: {}\n", .{msg.data, msg.is_end});
+        std.debug.print("Message: {s}, End: {}\n", .{ msg.data, msg.is_end });
         allocator.free(msg.data);
     }
 }
