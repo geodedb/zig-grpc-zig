@@ -140,7 +140,14 @@ pub const Transport = struct {
 
     fn ioWrite(self: *Transport, data: []const u8) !usize {
         if (self.tls_io) |tio| return tio.write_fn(tio.ctx, data);
-        return self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, data, &.{}, 0);
+        // `std.Io.Threaded.netWritePosix` indexes `data[data.len - 1]`
+        // unconditionally, so passing `&.{}` as the additional-buffers
+        // slice triggers an integer underflow panic. Pass `data` itself
+        // as the trailing pattern with splat=1; the function then writes
+        // the empty header followed by `data` exactly once, which is the
+        // semantics this method needs.
+        const trailing = [_][]const u8{data};
+        return self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, "", &trailing, 1);
     }
 
     fn ioClose(self: *Transport) void {
