@@ -1,0 +1,178 @@
+---
+# GitLab CI/CD Pipeline for grpc-zig
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reusable components live in gitlab.com/devnw/ci-catalog and are pinned to
+# the same versions other Zig projects in this group use (thread-pool, otel).
+# Linux jobs run on the self-hosted `company` runner group; macOS/Windows
+# jobs are gated and only run on default branch, schedule, or with
+# RUN_CROSS_OS=true so pipelines without those runners still pass.
+
+# Cancel in-flight pipelines on new commits except for release-producing
+# runs (tag pipelines and default-branch pipelines, which feed
+# release-semantic). Jobs default to interruptible so the auto-cancel
+# actually kicks in.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      auto_cancel:
+        on_new_commit: none
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      auto_cancel:
+        on_new_commit: none
+    - when: always
+
+default:
+  interruptible: true
+  tags:
+    - company
+
+include:
+  # Security scanning.
+  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.7.1
+
+  # SBOM.
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.7.1
+
+  # Semantic release on main / tags.
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.7.1
+
+  # Zig formatting (Linux). Paths cover everything we author in this repo.
+  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      paths: "src/ examples/ integration_test/"
+
+  # Zig build (Linux): compile lib + tests via the build.zig `check` step.
+  - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
+    inputs:
+      stage: build
+      zig_version: "0.16.0"
+      build_options: "check"
+
+  # Zig unit tests across all four optimize modes (Linux).
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit-debug"
+      test_step: "test"
+      optimize: "Debug"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasesafe"
+      test_step: "test"
+      optimize: "ReleaseSafe"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasefast"
+      test_step: "test"
+      optimize: "ReleaseFast"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasesmall"
+      test_step: "test"
+      optimize: "ReleaseSmall"
+
+  # Cross-OS build smoke (gated). The Linux test matrix above is the source
+  # of truth; macOS/Windows just confirm we still compile everywhere.
+  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      build_step: "build"
+      build_options: "check"
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit"
+      test_step: "test"
+  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      build_step: "build"
+      build_options: "check"
+      tags: ["company", "windows"]
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit"
+      test_step: "test"
+      tags: ["company", "windows"]
+
+variables:
+  ZIG_VERSION: "0.16.0"
+
+stages:
+  - lint
+  - build
+  - test
+  - security
+  - sbom
+  - release
+
+# ---------------------------------------------------------------
+# Cross-OS gating: catalog jobs above run unconditionally; we
+# tighten them to only run on default branch, schedule, or with
+# RUN_CROSS_OS=true so MR pipelines without those runners pass.
+# ---------------------------------------------------------------
+
+.cross-os-rules: &cross-os-rules
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_CROSS_OS == "true"'
+  - when: manual
+    allow_failure: true
+
+zig-build-macos-0.16.0:
+  rules: *cross-os-rules
+
+zig-test-macos-unit-0.16.0:
+  rules: *cross-os-rules
+  needs: ["zig-build-macos-0.16.0"]
+
+zig-build-windows-0.16.0:
+  rules: *cross-os-rules
+
+zig-test-windows-unit-0.16.0:
+  rules: *cross-os-rules
+  needs: ["zig-build-windows-0.16.0"]
+
+# ---------------------------------------------------------------
+# grpc-zig-specific jobs.
+#
+# We install Zig directly via scripts/install-zig.sh on a stock
+# ubuntu:24.04 image. The catalog publishes :0.15.2 but not :0.16.0
+# yet (as of v1.22.0); the catalog-driven zig-build / zig-test jobs
+# bootstrap zig themselves, so we mirror that pattern here.
+# ---------------------------------------------------------------
+
+.zig-host-base:
+  image: "ubuntu:24.04"
+  interruptible: true
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
+
+# In-process loopback test: builds a binary that runs server + client in one
+# process and exercises six end-to-end scenarios (sequential, large payload,
+# compression, server streaming, parallel connections, multiplexed
+# in-flight). Ran under a 60 s wall clock — if the binary deadlocks the job
+# fails with exit 124.
+loopback-test:
+  extends: .zig-host-base
+  stage: test
+  script:
+    - zig build loopback-test
+    - timeout 60 ./zig-out/bin/grpc-loopback-test
+  needs: ["zig-build-0.16.0"]

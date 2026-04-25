@@ -150,6 +150,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
 
+    // `check` step: compile everything (lib modules + test binary) without
+    // running the tests. CI uses this for fast type/compile checks separate
+    // from the full test execution.
+    const check_step = b.step("check", "Compile lib + tests without running");
+    check_step.dependOn(&tests.step);
+
     // Integration test server
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("integration_test/proto.zig"),
