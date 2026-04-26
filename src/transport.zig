@@ -12,7 +12,88 @@ pub const TransportError = error{
     PayloadTooLarge,
     CompressionNotSupported,
     Http2Error,
+    MethodPathTooLong,
+    AuthorityTooLong,
 };
+
+/// Build the HPACK-encoded HEADERS payload for a CLIENT request. The
+/// caller owns the returned slice and must free it with `allocator`.
+///
+/// Header order (RFC 7541 + gRPC over HTTP/2):
+///   :method POST                  -> indexed static idx 3      (0x83)
+///   :scheme http                  -> indexed static idx 6      (0x86)
+///   :path <method_path>           -> LIE name idx 4 (0x44) + literal
+///   :authority <authority>        -> LIE name idx 1 (0x41) + literal
+///   content-type application/grpc -> LIE name idx 31 (0x5f) + literal
+///   te trailers                   -> LIE literal name (0x40) + "te" + "trailers"
+///
+/// Phase 1: paths and authorities are short, so we only encode 7-bit-prefix
+/// varints (length < 128). Longer values yield error.MethodPathTooLong /
+/// error.AuthorityTooLong rather than silently mis-encoding.
+pub fn writeRequestHeaders(
+    allocator: std.mem.Allocator,
+    method_path: []const u8,
+    authority: []const u8,
+) ![]u8 {
+    if (method_path.len > 126) return TransportError.MethodPathTooLong;
+    if (authority.len > 126) return TransportError.AuthorityTooLong;
+
+    const ctype_value = "application/grpc";
+
+    // 2 (indexed) + 2 + path + 2 + authority + 2 + ctype + (1 + 1 + 2 + 1 + 8)
+    const total = 2 + (2 + method_path.len) + (2 + authority.len) + (2 + ctype_value.len) + 13;
+    var out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+
+    var i: usize = 0;
+
+    // :method POST -> indexed static index 3 (0x80 | 3)
+    out[i] = 0x83;
+    i += 1;
+    // :scheme http -> indexed static index 6 (0x80 | 6)
+    out[i] = 0x86;
+    i += 1;
+
+    // :path -> LIE name idx 4 (0x40 | 4)
+    out[i] = 0x44;
+    i += 1;
+    out[i] = @intCast(method_path.len);
+    i += 1;
+    @memcpy(out[i .. i + method_path.len], method_path);
+    i += method_path.len;
+
+    // :authority -> LIE name idx 1 (0x40 | 1)
+    out[i] = 0x41;
+    i += 1;
+    out[i] = @intCast(authority.len);
+    i += 1;
+    @memcpy(out[i .. i + authority.len], authority);
+    i += authority.len;
+
+    // content-type -> LIE name idx 31 (0x40 | 31)
+    out[i] = 0x5f;
+    i += 1;
+    out[i] = @intCast(ctype_value.len);
+    i += 1;
+    @memcpy(out[i .. i + ctype_value.len], ctype_value);
+    i += ctype_value.len;
+
+    // te trailers -> LIE literal name (0x40), name "te", value "trailers"
+    out[i] = 0x40;
+    i += 1;
+    out[i] = 0x02;
+    i += 1;
+    out[i] = 't';
+    out[i + 1] = 'e';
+    i += 2;
+    out[i] = 0x08;
+    i += 1;
+    @memcpy(out[i .. i + 8], "trailers");
+    i += 8;
+
+    std.debug.assert(i == total);
+    return out;
+}
 
 /// HPACK dynamic table entry for tracking :path values across requests.
 const HpackDynEntry = struct {
@@ -42,6 +123,10 @@ pub const Transport = struct {
     http2_conn: ?http2.connection.Connection,
     /// Track the stream ID from the client's HEADERS frame for responses
     last_stream_id: u31,
+    /// HTTP/2 `:authority` header value used by client write paths.
+    /// Heap-allocated via `allocator.dupe`; freed in `deinit`. For server
+    /// transports this is an empty slice and unused.
+    authority: []const u8 = "",
     /// The gRPC method path extracted from the last HEADERS frame (e.g. "/geode.GeodeService/Handshake")
     last_method: [256]u8 = .{0} ** 256,
     last_method_len: usize = 0,
@@ -60,11 +145,13 @@ pub const Transport = struct {
     /// the wire would desynchronize the peer.
     write_mutex: std.Io.Mutex = .init,
 
-    pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
+    pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(write_buf);
+        const authority_owned = try allocator.dupe(u8, authority);
+        errdefer allocator.free(authority_owned);
 
         var trans = Transport{
             .stream = stream_,
@@ -76,6 +163,7 @@ pub const Transport = struct {
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
+            .authority = authority_owned,
         };
 
         // Initialize HTTP/2 connection
@@ -91,6 +179,8 @@ pub const Transport = struct {
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(write_buf);
+        const authority_owned = try allocator.dupe(u8, "");
+        errdefer allocator.free(authority_owned);
 
         var trans = Transport{
             .stream = stream_,
@@ -102,6 +192,7 @@ pub const Transport = struct {
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
+            .authority = authority_owned,
         };
 
         // Initialize HTTP/2 connection
@@ -117,6 +208,8 @@ pub const Transport = struct {
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 1024 * 64);
         errdefer allocator.free(write_buf);
+        const authority_owned = try allocator.dupe(u8, "");
+        errdefer allocator.free(authority_owned);
 
         var trans = Transport{
             .stream = stream_,
@@ -129,6 +222,7 @@ pub const Transport = struct {
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
+            .authority = authority_owned,
         };
         // If setup fails, close the TLS connection to avoid leaking the
         // SSL object and SslConn allocation.
@@ -181,6 +275,7 @@ pub const Transport = struct {
         }
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
+        self.allocator.free(self.authority);
         self.ioClose();
     }
 
@@ -853,5 +948,38 @@ pub const Transport = struct {
             '0',
         };
         try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, stream_id, &trailers);
+    }
+
+    /// Write a CLIENT request: HEADERS (request-shaped) + DATA with
+    /// END_STREAM. Uses `self.last_stream_id` for the legacy single-call
+    /// path. Holds `write_mutex` for the whole sequence.
+    pub fn writeRequest(self: *Transport, message: []const u8, method_path: []const u8) !void {
+        return self.writeRequestOnStream(self.last_stream_id, message, method_path);
+    }
+
+    /// Write a CLIENT request on the given stream id. Emits request-shaped
+    /// HPACK HEADERS (`:method POST`, `:scheme http`, `:path`, `:authority`,
+    /// `content-type`, `te trailers`) followed by a single gRPC-framed DATA
+    /// frame with END_STREAM. Holds `write_mutex` for the whole sequence so
+    /// HEADERS+DATA cannot interleave with another writer.
+    pub fn writeRequestOnStream(self: *Transport, stream_id: u31, message: []const u8, method_path: []const u8) !void {
+        const headers_bytes = try writeRequestHeaders(self.allocator, method_path, self.authority);
+        defer self.allocator.free(headers_bytes);
+
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, headers_bytes);
+
+        const grpc_msg_len: u32 = @intCast(message.len);
+        const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
+        defer self.allocator.free(grpc_frame);
+        grpc_frame[0] = 0;
+        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
+        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
+        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
+        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        @memcpy(grpc_frame[5..], message);
+        try self.writeFrameLocked(.DATA, http2.frame.FrameFlags.END_STREAM, stream_id, grpc_frame);
     }
 };

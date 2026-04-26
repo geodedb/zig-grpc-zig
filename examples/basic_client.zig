@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     try client.setAuth("secret-key");
 
     // Make a simple call
-    const response = try client.call("SayHello", "World", .none);
+    const response = try client.call("/grpc.example/SayHello", "World", .none);
     defer allocator.free(response);
 
     std.debug.print("Response: {s}\n", .{response});

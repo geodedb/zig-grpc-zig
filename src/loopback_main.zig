@@ -221,7 +221,7 @@ fn runMuxClient(args: *MuxArgs) !void {
     while (i < 16) : (i += 1) {
         var buf: [32]u8 = undefined;
         const req = std.fmt.bufPrint(&buf, "mux-c{d}-r{d}", .{ args.id, i }) catch unreachable;
-        const resp = try args.mux.call(req, .none);
+        const resp = try args.mux.call("/loopback.Mux/Echo", req, .none);
         defer args.allocator.free(resp);
         if (!std.mem.eql(u8, resp, req)) return error.RoundTripMismatch;
     }

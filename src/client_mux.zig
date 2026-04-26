@@ -42,6 +42,10 @@ pub const ClientMux = struct {
     io: std.Io,
     transport: transport.Transport,
     compression: compression.Compression,
+    /// Hostname provided at init time, owned by this struct (heap allocated
+    /// via `allocator.dupe`). Combined with the port to form the
+    /// `:authority` header for outgoing requests.
+    host: []const u8,
 
     streams: std.AutoHashMap(u31, *StreamSlot) = undefined,
     streams_mutex: std.Io.Mutex = .init,
@@ -63,11 +67,18 @@ pub const ClientMux = struct {
         const address = try net.IpAddress.resolve(io, host, port);
         const conn = try address.connect(io, .{ .mode = .stream });
 
+        const host_owned = try allocator.dupe(u8, host);
+        errdefer allocator.free(host_owned);
+
+        const authority = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+        defer allocator.free(authority);
+
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .transport = try transport.Transport.initClient(allocator, io, conn),
+            .transport = try transport.Transport.initClient(allocator, io, conn, authority),
             .compression = compression.Compression.init(allocator),
+            .host = host_owned,
             .streams = std.AutoHashMap(u31, *StreamSlot).init(allocator),
         };
         errdefer self.transport.deinit();
@@ -98,6 +109,7 @@ pub const ClientMux = struct {
 
         self.transport.deinit();
         self.streams.deinit();
+        self.allocator.free(self.host);
         self.allocator.destroy(self);
     }
 
@@ -149,6 +161,7 @@ pub const ClientMux = struct {
     /// id and waits on its own completion slot.
     pub fn call(
         self: *ClientMux,
+        method_path: []const u8,
         request: []const u8,
         compression_alg: compression.Compression.Algorithm,
     ) ![]u8 {
@@ -163,7 +176,7 @@ pub const ClientMux = struct {
         try self.registerStream(sid, &slot);
         defer self.unregisterStream(sid);
 
-        try self.transport.writeMessageOnStream(sid, compressed);
+        try self.transport.writeRequestOnStream(sid, compressed, method_path);
 
         // Block until the reader thread signals end-of-stream or an error.
         slot.mutex.lockUncancelable(self.io);

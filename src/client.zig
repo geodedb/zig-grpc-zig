@@ -18,10 +18,13 @@ pub const GrpcClient = struct {
         const address = try net.IpAddress.resolve(io, host, port);
         const connection = try address.connect(io, .{ .mode = .stream });
 
+        const authority = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+        defer allocator.free(authority);
+
         return GrpcClient{
             .allocator = allocator,
             .io = io,
-            .transport = try transport.Transport.initClient(allocator, io, connection),
+            .transport = try transport.Transport.initClient(allocator, io, connection, authority),
             .compression = compression.Compression.init(allocator),
             .auth = null,
         };
@@ -51,7 +54,7 @@ pub const GrpcClient = struct {
     /// transform the bytes — see notes in `Compression`.
     pub fn streamCall(
         self: *GrpcClient,
-        _: []const u8,
+        method_path: []const u8,
         request: []const u8,
         compression_alg: compression.Compression.Algorithm,
         out: *std.ArrayList([]u8),
@@ -59,7 +62,7 @@ pub const GrpcClient = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        try self.transport.writeMessage(compressed);
+        try self.transport.writeRequest(compressed, method_path);
 
         while (true) {
             const sf = try self.transport.readStreamFrame();
@@ -75,7 +78,7 @@ pub const GrpcClient = struct {
         }
     }
 
-    pub fn call(self: *GrpcClient, _: []const u8, request: []const u8, compression_alg: compression.Compression.Algorithm) ![]u8 {
+    pub fn call(self: *GrpcClient, method_path: []const u8, request: []const u8, compression_alg: compression.Compression.Algorithm) ![]u8 {
         // Add auth token if available
         var headers = std.StringHashMap([]const u8).init(self.allocator);
         defer headers.deinit();
@@ -90,7 +93,7 @@ pub const GrpcClient = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        try self.transport.writeMessage(compressed);
+        try self.transport.writeRequest(compressed, method_path);
         const response_bytes = try self.transport.readMessage();
         defer self.allocator.free(response_bytes);
 

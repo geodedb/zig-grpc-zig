@@ -83,7 +83,7 @@ const ClientWorker = struct {
 
         // Warmup requests
         for (0..self.config.warmup_requests) |_| {
-            if (client.call("Benchmark", payload, .none)) |warmup_response| {
+            if (client.call("/grpc.benchmark/Benchmark", payload, .none)) |warmup_response| {
                 self.allocator.free(warmup_response);
             } else |_| {
                 // Ignore warmup errors
@@ -95,7 +95,7 @@ const ClientWorker = struct {
         for (0..self.config.num_requests) |_| {
             const timer = Timer.start();
 
-            const response = client.call("Benchmark", payload, .none) catch |err| {
+            const response = client.call("/grpc.benchmark/Benchmark", payload, .none) catch |err| {
                 std.log.warn("Request failed: {}", .{err});
                 continue;
             };
