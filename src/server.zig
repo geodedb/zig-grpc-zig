@@ -35,10 +35,56 @@ pub const GrpcServer = struct {
     /// every request directly — the legacy behaviour, kept for tests and
     /// for endpoints that don't need an auth gate.
     require_auth: bool = false,
+    /// Counting semaphore that bounds the number of concurrent
+    /// connection threads (closes CC-1 + MW-4). The accept loop
+    /// `wait`s for a permit before spawning, and `connectionThread`
+    /// `post`s on exit. Sized from the `GRPC_ZIG_MAX_CONNS` env var,
+    /// falling back to `DEFAULT_MAX_CONNS = 1024`.
+    conn_sem: std.Io.Semaphore = .{ .permits = DEFAULT_MAX_CONNS },
+
+    /// Default cap on concurrent accepted connections when
+    /// `GRPC_ZIG_MAX_CONNS` is unset.
+    pub const DEFAULT_MAX_CONNS: usize = 1024;
+
+    /// Read GRPC_ZIG_MAX_CONNS via libc `getenv`; return
+    /// DEFAULT_MAX_CONNS when missing, or propagate
+    /// `error.InvalidMaxConns` for malformed values.
+    /// Public so `init` and unit tests can both reach it.
+    ///
+    /// We use `std.c.getenv` directly rather than going through
+    /// `std.process.Environ`. The Environ-based API in Zig 0.16
+    /// requires access to a process-level Environ instance (passed
+    /// via the `Init` argument to `main`), which the existing
+    /// `GrpcServer.init` signature doesn't have a path to. Since
+    /// the gRPC server module already links libc transitively for
+    /// zlib, libc's `getenv` is available everywhere we ship.
+    pub fn maxConnsFromEnv(allocator: std.mem.Allocator) !usize {
+        _ = allocator; // libc owns the returned buffer
+        const raw_ptr = std.c.getenv("GRPC_ZIG_MAX_CONNS") orelse return DEFAULT_MAX_CONNS;
+        const raw = std.mem.span(raw_ptr);
+        return parseMaxConnsValue(raw);
+    }
+
+    /// Test-only alias.
+    pub fn maxConnsFromEnvForTest(allocator: std.mem.Allocator) !usize {
+        return maxConnsFromEnv(allocator);
+    }
+
+    /// Parse a GRPC_ZIG_MAX_CONNS value into a usable cap. Rejects 0
+    /// (would deadlock the accept loop) and any non-digit input.
+    pub fn parseMaxConnsValue(raw: []const u8) !usize {
+        if (raw.len == 0) return error.InvalidMaxConns;
+        const n = std.fmt.parseInt(usize, raw, 10) catch return error.InvalidMaxConns;
+        if (n == 0) return error.InvalidMaxConns;
+        return n;
+    }
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
         const address = try net.IpAddress.parseIp4("0.0.0.0", port);
         const server = try address.listen(io, .{ .reuse_address = true });
+        // Resolve the admission cap. Fall back silently to the default
+        // on any malformed env value rather than refusing to boot.
+        const max_conns = maxConnsFromEnv(allocator) catch DEFAULT_MAX_CONNS;
         return GrpcServer{
             .allocator = allocator,
             .io = io,
@@ -48,6 +94,7 @@ pub const GrpcServer = struct {
             .compression = compression.Compression.init(allocator),
             .auth = auth.Auth.init(allocator, secret_key),
             .health_check = health.HealthCheck.init(allocator),
+            .conn_sem = .{ .permits = max_conns },
         };
     }
 
@@ -62,6 +109,14 @@ pub const GrpcServer = struct {
 
         while (true) {
             const stream_ = try self.server.accept(self.io);
+            // CC-1 + MW-4 — bound concurrent connections. Acquire a
+            // semaphore permit BEFORE spawning so a hostile or buggy
+            // client cannot exhaust system memory by opening 100k
+            // sockets. The accept loop blocks here until a thread
+            // exits and posts a permit, applying back-pressure all the
+            // way up to the kernel listen queue.
+            self.conn_sem.waitUncancelable(self.io);
+
             // Daemon per connection: handleConnection serves the connection
             // for its entire lifetime (while-true readMessage loop). Not a
             // thread-pool candidate — a bounded pool would starve under
@@ -78,6 +133,8 @@ pub const GrpcServer = struct {
             const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, connectionThread, .{ self, stream_ }) catch |err| {
                 std.log.err("Failed to spawn connection thread: {}", .{err});
                 stream_.close(self.io);
+                // Spawn failed — return the permit we reserved.
+                self.conn_sem.post(self.io);
                 continue;
             };
             thread.detach();
@@ -85,6 +142,9 @@ pub const GrpcServer = struct {
     }
 
     fn connectionThread(self: *GrpcServer, stream_: net.Stream) void {
+        // Always release the admission permit on thread exit, no
+        // matter how handleConnection returned.
+        defer self.conn_sem.post(self.io);
         self.handleConnection(stream_) catch |err| {
             std.log.err("Connection handling failed: {}", .{err});
         };

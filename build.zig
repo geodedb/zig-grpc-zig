@@ -222,6 +222,22 @@ pub fn build(b: *std.Build) void {
     const run_flow_control_tests = b.addRunArtifact(flow_control_tests);
     test_step.dependOn(&run_flow_control_tests.step);
 
+    // Bounded admission control unit tests (closes CC-1 + MW-4 /
+    // GitLab #20 + #18). Tests the env-var parsing helpers; the live
+    // accept-loop semaphore behaviour is covered by the loopback
+    // binary's concurrent-connection scenario.
+    const admission_tests = b.addTest(.{
+        .name = "admission-control-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/admission_control_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    admission_tests.root_module.linkLibrary(zlib_lib);
+    const run_admission_tests = b.addRunArtifact(admission_tests);
+    test_step.dependOn(&run_admission_tests.step);
+
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
     // from the full test execution.
@@ -232,6 +248,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&hpack_varint_tests.step);
     check_step.dependOn(&max_frame_size_tests.step);
     check_step.dependOn(&flow_control_tests.step);
+    check_step.dependOn(&admission_tests.step);
 
     // Integration test server
     const integration_test_mod = b.createModule(.{
