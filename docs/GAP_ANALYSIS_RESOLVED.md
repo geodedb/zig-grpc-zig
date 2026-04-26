@@ -1,0 +1,199 @@
+# Gap Analysis -- Resolved
+
+Repository: `devnw/zig/grpc-zig`
+Last sync: 2026-04-26 (gap-close pass)
+Companion files:
+- `docs/GAP_ANALYSIS.md` (open functional/feature gaps)
+- `docs/QUALITY_GAP_ANALYSIS.md` (open quality findings)
+- `docs/PERF_GAP_ANALYSIS.md` (open performance findings)
+- `docs/SECURITY_GAP_ANALYSIS.md` (open security findings)
+
+Resolved or invalidated gaps are recorded here for historical traceability.
+
+---
+
+### GAP-0017: "Zero dependencies" claim verified [RESOLVED]
+- **Issue:** none (resolved at gap-detection time; no platform issue created)
+- **Category:** Docs
+- **Source tag:** G-DOC-01
+- **Resolution:** Phase 3 gap-detector verified the README's "zero dependencies" claim by inspecting `build.zig.zon` and `build.zig`. No third-party package declarations were found beyond Zig standard library usage.
+- **Evidence:**
+  - `build.zig.zon` -- no `.dependencies` entries.
+  - `build.zig` -- no `b.dependency(...)` calls.
+  - README.md -- "Zero dependencies" claim confirmed accurate.
+- **Resolved date:** 2026-04-26
+
+---
+
+### GAP-0001: Server accepts every RPC unauthenticated despite advertising JWT auth [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/2 (closed)
+- **Category:** Security (Critical)
+- **Resolution commit:** `51a5924` -- *fix(security): close GAP-0001 - reject requests with missing or invalid authorization*
+- **Resolution summary:** Added `GrpcServer.require_auth` (default off for back-compat). When enabled, the dispatch loop reads `trans.lastAuthorization()` and calls `auth.verifyToken`; missing or invalid token short-circuits with `endStreamWithStatus(stream_id, 16, @errorName(err))` (UNAUTHENTICATED). Transport now captures the `authorization` header into a 1024-byte bounded buffer during HPACK extraction (handles LIE-with-incremental-indexing, Literal-Without-Indexing, static-table index 23, plain-text and Huffman strings). Multi-byte HPACK 7-bit-prefix integer encoding (`hpackInt7Encode`) added so JWT values >127 bytes round-trip.
+- **Evidence:**
+  - `src/server.zig` -- new `require_auth` field + verify-then-dispatch flow.
+  - `src/transport.zig` -- `last_authorization`, `lastAuthorization()`, `setAuthorizationFromHpackString`.
+  - `src/auth_gate_test_main.zig` -- end-to-end test: valid token (handler runs), missing header (status 16), tampered token (status 16). Wired via `zig build auth-gate-test`.
+- **Resolved date:** 2026-04-26
+
+### GAP-0002: Per-RPC authorization metadata silently dropped on the wire [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/3 (closed)
+- **Category:** Correctness / Security (Critical)
+- **Resolution commit:** `cc2d9b7` -- *fix: close GAP-0002 - transmit per-RPC metadata in HEADERS*
+- **Resolution summary:** Introduced `writeRequestHeadersWithMetadata` which appends each metadata entry as an HPACK Literal-with-Incremental-Indexing header after the canonical pseudo-headers. `GrpcClient.call` now plumbs the headers map (and JWT, when `auth` is set) through `writeRequestWithMetadata` instead of dropping it. Existing `writeRequestHeaders` is a null-metadata wrapper, so byte-for-byte output is unchanged for metadata-free callers.
+- **Evidence:**
+  - `src/transport.zig` -- `writeRequestHeadersWithMetadata`, `writeRequestWithMetadata`, `writeRequestOnStreamWithMetadata`.
+  - `src/client.zig` -- `call` now forwards metadata + JWT.
+  - `src/client_mux.zig` -- `callWithMetadata` for the multiplexed path.
+  - `src/transport_request_headers_test.zig` -- wire-bytes assertions for `authorization: Bearer xyz123` LIE signature and byte-identical null-metadata output.
+- **Resolved date:** 2026-04-26
+
+### GAP-0003: Server always invokes handlers.items[0] regardless of :path [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/4 (closed)
+- **Category:** Correctness (Critical)
+- **Resolution commit:** `bf55446` -- *fix: close GAP-0003 - dispatch by :path instead of handlers[0]*
+- **Resolution summary:** Server dispatch now linear-scans `self.handlers` for a name == method match. On miss, emits `grpc-status: 12` (UNIMPLEMENTED) trailer-only HEADERS via `endStreamWithStatus` and continues. Loopback scenarios now register one handler per `:path` (`/Echo`, `/Passthrough`, `/Stream`, `/loopback.Mux/Echo`).
+- **Evidence:**
+  - `src/server.zig` -- new dispatch loop + UNIMPLEMENTED fallback.
+  - `src/dispatch_test_main.zig` -- end-to-end: `/svc.A/Foo` to A, `/svc.B/Bar` to B, unregistered path returns status 12.
+- **Resolved date:** 2026-04-26
+
+### GAP-0004: Flow control window never decremented; large streams stall [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/5 (closed); also closes perf #13 (NW-1+NW-2+NW-3)
+- **Category:** Correctness / HTTP/2 protocol (High)
+- **Resolution commit:** `efd9ef6` -- *fix: close GAP-0004 - track and honor HTTP/2 flow control + h2spec CI*
+- **Resolution summary:** Full HTTP/2 flow-control state machine. Server and client now advertise non-default SETTINGS (INITIAL_WINDOW_SIZE 1 MiB, MAX_FRAME_SIZE 16384, MAX_CONCURRENT_STREAMS 100, MAX_HEADER_LIST_SIZE 8192). Per-stream and connection windows tracked as `i32 send_window` / `i32 recv_window`. `processWindowUpdate` validates non-zero and rejects overflow past 2^31-1 with FLOW_CONTROL_ERROR. `reserveSendCredit` uses `flow_cv` to block writers; `maybeRefillRecvWindow` emits WINDOW_UPDATE below the half-threshold. `applyPeerSettings` honours SETTINGS_INITIAL_WINDOW_SIZE per RFC 7540 §6.9.2. Outbound DATA fragmenter fragments a gRPC-framed buffer into max_frame_size-sized DATA frames; reassembly accumulates into a per-call ArrayList until the gRPC length-prefix indicates a complete message. CI now runs h2spec generic + http2 conformance suites against the Zig interop server.
+- **Evidence:**
+  - `src/http2/stream.zig` -- `i32 send_window`, `i32 recv_window`.
+  - `src/transport.zig` -- `conn_send_window`, `conn_recv_window`, `flow_mutex`, `flow_cv`, `reserveSendCredit`, `maybeRefillRecvWindow`, `applyPeerSettings`, `processWindowUpdate`.
+  - `src/client_mux.zig` -- reader loop honours peer SETTINGS + WINDOW_UPDATE.
+  - `src/flow_control_test.zig` -- 8 unit tests cover initial windows, WINDOW_UPDATE validation/overflow, half-threshold refill, §6.9.2 delta math + i32-overflow rejection, SETTINGS-frame builder, WINDOW_UPDATE-frame builder.
+  - `.gitlab-ci.yml` -- `interop-h2spec` job (h2spec v2.6.0).
+- **Resolved date:** 2026-04-26
+
+---
+
+## Quality Domain Resolutions
+
+### Q-R1: Server swallows handler errors -- wire-contract breach [RESOLVED]
+- **Issue:** none filed (quality findings tracker creation deferred)
+- **Category:** Reliability / api-contract (Critical, PriorityScore 200)
+- **Resolution commits:** `19fcf38` (precursor: `endStreamWithStatus` helper) + `0993e5e` (R1 fix)
+- **Resolution summary:** Handler-error path in `src/server.zig` now calls `endStreamWithStatus(stream_id, 2, @errorName(err))`, emitting a trailer-only HEADERS frame with `grpc-status: 2` (UNKNOWN) and `grpc-message=<err>`. Failing client no longer hangs until deadline.
+- **Note:** Implementation chose gRPC-canonical trailer-only HEADERS|END_STREAM rather than RST_STREAM (the original criterion text mentioned RST_STREAM); see follow-up `GAP-FU-001` to update the criterion wording.
+- **Evidence:**
+  - `src/server.zig` -- handler-error catch arm.
+  - `src/transport.zig:875-882` -- `endStreamWithStatus` helper (also closes Q-A1).
+  - `src/handler_error_test_main.zig` -- handler returns `error.IntentionalFailure`; client observes `grpc-status: 2`, `grpc-message: "IntentionalFailure"`. Wired via `zig build handler-error-test`.
+- **Resolved date:** 2026-04-26
+
+### Q-A1: gRPC error contract not modelled -- no `endStreamWithStatus(code, message)` helper [RESOLVED]
+- **Issue:** none filed
+- **Category:** api-contract (High, PriorityScore 112.5)
+- **Resolution commit:** `19fcf38` -- *feat(transport): add endStreamWithStatus helper for non-zero gRPC status*
+- **Resolution summary:** New helper `Transport.endStreamWithStatus(stream_id, code, message)` builds a wire-correct trailer-only HEADERS frame containing `grpc-status: <code>` and `grpc-message: <message>`, with END_STREAM. Consumed by R1, GAP-0001, GAP-0003.
+- **Evidence:**
+  - `src/transport.zig` -- `endStreamWithStatus`.
+  - `src/transport_endstream_test.zig` -- wire-bytes test.
+- **Resolved date:** 2026-04-26
+
+---
+
+## Security Domain Resolutions
+
+### S-A1: AuthN never invoked on dispatch path [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/2 (same as GAP-0001; closed)
+- **Category:** Authentication (Critical, Risk 30, CWE-306 / OWASP A07:2021)
+- **Resolution commit:** `51a5924`
+- **Resolution summary:** See GAP-0001.
+- **Resolved date:** 2026-04-26
+
+### S-A2: Client never serializes `authorization` metadata [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/3 (same as GAP-0002; closed)
+- **Category:** Authentication (Critical, Risk 24, CWE-287 / OWASP A07:2021)
+- **Resolution commit:** `cc2d9b7`
+- **Resolution summary:** See GAP-0002.
+- **Resolved date:** 2026-04-26
+
+### S-A3: `generateToken` emits no signature; `verifyToken` compares HMAC bytes to decimal `iat` [RESOLVED]
+- **Issue:** none filed (held back per disclosure policy until fix landed)
+- **Category:** Authentication / Cryptography (Critical, Risk 30, CWE-347 / OWASP A02:2021)
+- **Resolution commit:** `5ec22b8` -- *fix(security): close A3 - implement RFC 7519 JWT with constant-time HMAC compare* (also closes M3)
+- **Resolution summary:** Full rewrite of `src/features/auth.zig`. `generateToken` now produces a true RFC 7519 JWT: `base64url(json_header).base64url(json_payload).base64url(hmac_sha256)` with header `{"alg":"HS256","typ":"JWT"}` and payload `{sub, iat, exp}`. `verifyToken` decodes, asserts `alg==HS256` and `typ==JWT`, recomputes HMAC-SHA256 over the literal `<header_b64>.<payload_b64>` prefix, and compares with `std.crypto.timing_safe.eql([32]u8, ...)` (closes M3 timing oracle). Signature verified BEFORE payload claim parsing so a forged token can't reveal anything via parse-error timing. Distinct error variants: `MalformedToken`, `InvalidToken`, `InvalidSignature`, `TokenExpired`, `TokenNotYetValid`.
+- **Evidence:**
+  - `src/features/auth.zig` -- new `generateToken` / `verifyToken` / `Claims`.
+  - `src/auth_test.zig` -- round-trip success, payload tamper, expired (negative TTL), wrong key, malformed segments, `timing_safe.eql` smoke.
+- **Resolved date:** 2026-04-26
+
+### S-M3: Non-constant-time `std.mem.eql` for HMAC compare [RESOLVED]
+- **Issue:** none filed
+- **Category:** Memory safety / timing (Medium, CWE-208)
+- **Resolution commit:** `5ec22b8` (folded into S-A3 fix)
+- **Evidence:** `src/features/auth.zig` now uses `std.crypto.timing_safe.eql([32]u8, ...)`.
+- **Resolved date:** 2026-04-26
+
+### S-I1: HPACK `hpackDecodeInt` shift-counter overflow [RESOLVED]
+- **Issue:** none filed (held back per disclosure policy)
+- **Category:** Input parsing (Critical, Risk 18, CWE-190)
+- **Resolution commit:** `9322f96` -- *fix(security): close I1 - cap HPACK varint shift to prevent overflow*
+- **Resolution summary:** `hpackDecodeInt` now uses a u32 shift counter (so the addition itself is safe), rejects before each shift if `m + 7 > @bitSizeOf(usize)` returning `error.HpackIntegerOverflow`, and caps continuation bytes at `MAX_HPACK_VARINT_CONTINUATIONS = 5`. All callers (`hpackStringIs`, `setPathFromHpackString`, `setAuthorizationFromHpackString`, `extractPathFromHpack`) propagate or catch the new error so a malicious peer triggers a protocol error instead of panicking the connection thread. Pre-auth single-packet DoS path closed.
+- **Evidence:**
+  - `src/transport.zig` -- `hpackDecodeInt` guard + `MAX_HPACK_VARINT_CONTINUATIONS`.
+  - `src/hpack_varint_test.zig` -- regression coverage. Wired via `zig build hpack-varint-tests` and the `check` step.
+- **Resolved date:** 2026-04-26
+
+### S-I3: `SETTINGS_MAX_FRAME_SIZE` not enforced [RESOLVED]
+- **Issue:** none filed (held back per disclosure policy)
+- **Category:** Resource exhaustion (High, Risk 18, CWE-770)
+- **Resolution commit:** `8919308` -- *fix(security): close I3 - enforce SETTINGS_MAX_FRAME_SIZE on inbound frames*
+- **Resolution summary:** `Transport.max_frame_size` (default `DEFAULT_MAX_FRAME_SIZE = 16384` per RFC 7540 §6.5.2) is consulted in `readFrame` before allocating the payload buffer. Oversize frames return `error.FrameSizeError` and emit a connection-level GOAWAY with `FRAME_SIZE_ERROR (0x06)`. `applyPeerSettings` parses (id, value) tuples and updates `max_frame_size` on parameter id 0x05, clamping to `[16384, 2^24-1]`. Required correctness fallout: outbound DATA fragmenter (`writeDataFragmentedLocked`) and multi-frame gRPC reassembly added so `readMessage`/`readStreamFrame` accumulate until the gRPC length-prefix indicates a complete message. Pre-auth memory-amplification DoS closed.
+- **Evidence:**
+  - `src/transport.zig` -- `DEFAULT_MAX_FRAME_SIZE`, `max_frame_size`, `checkFrameSize`, `applyPeerSettings`, `writeDataFragmentedLocked`, multi-frame reassembly.
+  - `src/transport_max_frame_size_test.zig` -- 4 tests: cap value, accept-at-cap/reject-above, peer-SETTINGS update, GOAWAY wire bytes.
+- **Resolved date:** 2026-04-26
+
+---
+
+## Performance Domain Resolutions
+
+### P-MW-1 + P-MW-2: Unused 64 KiB read_buf + write_buf per Transport [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/24 (closed)
+- **Category:** Memory (P1, Score 20)
+- **Resolution commit:** `3238c26` -- *perf: close MW-1/2/3 - remove unused per-Transport buffers and dead http2_conn*
+- **Resolution summary:** Deleted `read_buf` and `write_buf` fields and their alloc/free in `initClient`, `initServer`, `initServerTls`, `deinit`. No code path ever read from or wrote to either slice -- every byte movement went through stack buffers in `readExact` / `ioWriteLocked`. -128 KiB per connection.
+- **Evidence:** `src/transport.zig` (deletions); existing endstream/loopback/flow-control tests still pass.
+- **Resolved date:** 2026-04-26
+
+### P-MW-3: Dead `http2_conn` Connection field; `sendFrame` is a no-op [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/25 (closed)
+- **Category:** Memory / cleanup (P1, Score 15)
+- **Resolution commit:** `3238c26`
+- **Resolution summary:** Removed `http2_conn` field plus matching alloc/free; deleted the no-op `sendFrame` stub in `src/http2/connection.zig`. Saves a per-connection HPACK encoder/decoder + AutoHashMap allocation pair.
+- **Evidence:** `src/http2/connection.zig`, `src/transport.zig`, `src/transport_endstream_test.zig`.
+- **Resolved date:** 2026-04-26
+
+### P-MW-4: ~131 KiB heap + 8 MiB stack/conn -- ~8 GiB at 1k conns [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/18 (closed)
+- **Category:** Memory umbrella (P0, Score 16)
+- **Resolution commits:** `3238c26` (MW-1/2/3) + `0fd05ac` (CC-4) + `ac7f771` (CC-1 + admission cap) collectively
+- **Resolution summary:** With MW-1/2/3 deletions (-128 KiB heap/conn), CC-4 stack cap (8 MiB to 512 KiB stack/conn), and CC-1 admission cap (default 1024 conns), the combined resident-memory ceiling drops from ~8 GiB to well under 600 MiB at the cap. Further gating now happens at admission rather than after thread spawn.
+- **Evidence:** see MW-1/2/3, CC-4, CC-1 entries.
+- **Resolved date:** 2026-04-26
+
+### P-CC-1: Unbounded thread-per-connection accept loop [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/20 (closed)
+- **Category:** Concurrency / admission control (P0, Score 32)
+- **Resolution commit:** `ac7f771` -- *perf(server): close CC-1 + MW-4 - bound concurrent connections*
+- **Resolution summary:** Bounded admission control. `GRPC_ZIG_MAX_CONNS` env var (default 1024) caps live connection count; exceeded limit gates accept via a counting semaphore. Outstanding accept counter decremented on connection-thread exit. Combined with CC-4 stack cap, this puts a hard ceiling under the per-conn memory cost.
+- **Evidence:**
+  - `src/server.zig` -- accept gate + counter.
+  - `src/admission_control_test.zig` -- exercises cap behaviour.
+- **Resolved date:** 2026-04-26
+
+### P-CC-4: 8 MiB pthread stack per connection [RESOLVED]
+- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/21 (closed)
+- **Category:** Concurrency / memory (P0, Score 32)
+- **Resolution commit:** `0fd05ac` -- *perf: close CC-4 - cap connection-thread stack at 512 KiB*
+- **Resolution summary:** `SpawnConfig.stack_size = 512 * 1024` for the per-connection thread. ~16x reduction in idle-connection memory; combined with the CC-1 admission cap, saves ~7.5 GiB at fleet steady state vs the glibc default.
+- **Evidence:** `src/server.zig` -- `SpawnConfig.stack_size`.
+- **Resolved date:** 2026-04-26
