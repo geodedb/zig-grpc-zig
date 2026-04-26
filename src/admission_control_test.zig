@@ -42,6 +42,25 @@ test "GrpcServer.DEFAULT_MAX_CONNS is 1024" {
     try testing.expectEqual(@as(usize, 1024), server_mod.GrpcServer.DEFAULT_MAX_CONNS);
 }
 
+test "parseFlowCreditTimeoutMs accepts non-negative integers including 0 (disable)" {
+    // GAP-FU-002 — unlike GRPC_ZIG_MAX_CONNS, a value of 0 is valid
+    // here (disables the per-stream credit timeout entirely). Empty
+    // and non-digit input is still rejected.
+    try testing.expectEqual(@as(u64, 0), try server_mod.GrpcServer.parseFlowCreditTimeoutMs("0"));
+    try testing.expectEqual(@as(u64, 30000), try server_mod.GrpcServer.parseFlowCreditTimeoutMs("30000"));
+    try testing.expectEqual(@as(u64, 1), try server_mod.GrpcServer.parseFlowCreditTimeoutMs("1"));
+}
+
+test "parseFlowCreditTimeoutMs rejects empty and non-numeric input" {
+    try testing.expectError(error.InvalidFlowCreditTimeout, server_mod.GrpcServer.parseFlowCreditTimeoutMs(""));
+    try testing.expectError(error.InvalidFlowCreditTimeout, server_mod.GrpcServer.parseFlowCreditTimeoutMs("forever"));
+    try testing.expectError(error.InvalidFlowCreditTimeout, server_mod.GrpcServer.parseFlowCreditTimeoutMs("-1"));
+}
+
+test "GrpcServer.DEFAULT_FLOW_CREDIT_TIMEOUT_MS is 30_000 (30 s)" {
+    try testing.expectEqual(@as(u64, 30_000), server_mod.GrpcServer.DEFAULT_FLOW_CREDIT_TIMEOUT_MS);
+}
+
 test "Semaphore wait then post does not block" {
     // Smoke test that the std.Io.Semaphore primitive we depend on
     // behaves as expected: with 2 permits, two waits return without

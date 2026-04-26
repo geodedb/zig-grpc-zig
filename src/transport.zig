@@ -335,10 +335,32 @@ pub const Transport = struct {
     stream_send_windows: []i32 = &[_]i32{},
     stream_recv_windows: []i32 = &[_]i32{},
     /// Coordinates blocking writers waiting for additional send-window
-    /// credit (peer sent WINDOW_UPDATE) without busy-spinning. The
-    /// reader thread broadcasts on this whenever it credits any window.
+    /// credit (peer sent WINDOW_UPDATE) without busy-spinning.
+    ///
+    /// Implemented as a futex over `flow_epoch` (incremented on every
+    /// credit) rather than `std.Io.Condition` because Zig 0.16's
+    /// Condition does not expose a timed-wait variant, and we need a
+    /// bounded wait to mitigate a slow-loris peer that opens streams
+    /// but never advertises credit (closes GAP-FU-002). The writer
+    /// side reads `flow_epoch` under `flow_mutex`, releases the mutex,
+    /// then `futexWaitTimeout`s on `flow_epoch` for the configured
+    /// timeout (`flow_credit_timeout_ns`). The credit side bumps
+    /// `flow_epoch` (under the same mutex) and `futexWake`s every
+    /// blocked writer.
     flow_mutex: std.Io.Mutex = .init,
-    flow_cv: std.Io.Condition = .init,
+    flow_epoch: std.atomic.Value(u32) = .init(0),
+    /// Maximum time a writer thread will park in `reserveSendCredit`
+    /// waiting for the peer to advertise send-window credit before
+    /// giving up with `error.FlowControlTimeout`. On timeout the writer
+    /// emits `RST_STREAM (FLOW_CONTROL_ERROR)` for the offending
+    /// stream and propagates the error to its caller. A value of `0`
+    /// disables the timeout entirely (legacy behaviour: park forever).
+    /// Default 30s -- long enough that legitimate large unary calls
+    /// and server-streaming responses on a healthy peer complete
+    /// without false positives, short enough that a deliberate slow-
+    /// loris peer can't pin a writer thread for the lifetime of the
+    /// process. Closes GAP-FU-002.
+    flow_credit_timeout_ns: u64 = 30 * std.time.ns_per_s,
 
     /// Allocate the per-stream flow-control arrays on the heap. Used by
     /// every init path so the embedded slices are non-empty and indexable.
@@ -752,11 +774,13 @@ pub const Transport = struct {
             (@as(u32, payload[1]) << 16) |
             (@as(u32, payload[2]) << 8) |
             @as(u32, payload[3]);
-        // Hold flow_mutex while updating the window AND broadcasting:
-        // std.Io.Condition.broadcast() is a no-op if no waiters are
-        // registered (the lost-wakeup race), so the writer side must
-        // observe the update under the same lock that protects its
-        // predicate check.
+        // Hold flow_mutex while updating the window AND bumping the
+        // epoch: a writer that observed the predicate as false and is
+        // about to read `flow_epoch` (still under the same lock) must
+        // see either (a) the new credit, in which case it skips the
+        // wait, or (b) the old credit but a new epoch, in which case
+        // its futex wait returns immediately. Doing the bump under
+        // the lock closes the lost-wakeup race.
         self.flow_mutex.lockUncancelable(self.io);
         defer self.flow_mutex.unlock(self.io);
         if (stream_id == 0) {
@@ -767,7 +791,7 @@ pub const Transport = struct {
             applyWindowUpdate(&self.stream_send_windows[idx], increment) catch return;
         }
         // Wake any writers blocked on send credit.
-        self.flow_cv.broadcast(self.io);
+        self.wakeFlowWaiters();
     }
 
     /// Credit our connection-level receive window (and optionally a
@@ -802,16 +826,50 @@ pub const Transport = struct {
         }
     }
 
+    /// Wake every writer thread blocked in `reserveSendCredit`. Called
+    /// after the caller has updated send-window state under
+    /// `flow_mutex`. The epoch bump (release order) plus the
+    /// `futexWake` together close the lost-wakeup race: a waiter that
+    /// observed the old epoch will see the bump (and wake), and a
+    /// waiter that hasn't yet entered the futex will skip the wait
+    /// because its `epoch` argument no longer matches the current
+    /// value (futex returns `EAGAIN`).
+    fn wakeFlowWaiters(self: *Transport) void {
+        _ = self.flow_epoch.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.flow_epoch.raw, std.math.maxInt(u32));
+    }
+
     /// Reserve `n` octets of send-window credit, blocking until both
-    /// the connection and per-stream send windows have enough headroom.
-    /// Decrements both windows by `n`. Caller must NOT hold flow_mutex.
-    fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) void {
+    /// the connection and per-stream send windows have enough headroom
+    /// or the configured `flow_credit_timeout_ns` elapses (whichever
+    /// comes first). On success decrements both windows by `n` and
+    /// returns. On timeout returns `error.FlowControlTimeout` without
+    /// touching the windows. Caller must NOT hold flow_mutex.
+    ///
+    /// The bounded wait closes GAP-FU-002: a slow-loris peer that
+    /// opens streams but never advertises credit can no longer pin
+    /// `MAX_CONNS` writer threads forever. When `flow_credit_timeout_ns`
+    /// is `0` the wait is unbounded (legacy behaviour).
+    pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{FlowControlTimeout}!void {
         if (n == 0) return;
         const idx: ?usize = blk: {
             if (stream_id == 0) break :blk null;
             const i: usize = @intCast(stream_id);
             if (i >= self.stream_send_windows.len) break :blk null;
             break :blk i;
+        };
+
+        // Compute the deadline once, before entering the loop, so
+        // spurious wake-ups + partial-credit advances cannot extend
+        // the cumulative wait past `flow_credit_timeout_ns`.
+        const deadline: ?std.Io.Clock.Timestamp = blk: {
+            const ns = self.flow_credit_timeout_ns;
+            if (ns == 0) break :blk null;
+            const dur = std.Io.Clock.Duration{
+                .clock = .awake,
+                .raw = std.Io.Duration.fromNanoseconds(@as(i96, @intCast(ns))),
+            };
+            break :blk std.Io.Clock.Timestamp.fromNow(self.io, dur);
         };
 
         self.flow_mutex.lockUncancelable(self.io);
@@ -826,8 +884,77 @@ pub const Transport = struct {
                 if (idx) |i| self.stream_send_windows[i] -= @as(i32, @intCast(n));
                 return;
             }
-            self.flow_cv.waitUncancelable(self.io, &self.flow_mutex);
+
+            // Past the deadline? `std.Io.futexWaitTimeout` does NOT
+            // return `error.Timeout` -- it surfaces a deadline
+            // expiry as a successful (spurious-style) wake-up. We
+            // therefore check the deadline ourselves before sleeping
+            // again, and bail with `error.FlowControlTimeout` if it
+            // has elapsed.
+            if (deadline) |d| {
+                const remaining = d.durationFromNow(self.io);
+                if (remaining.raw.nanoseconds <= 0) return error.FlowControlTimeout;
+            }
+
+            // Snapshot the epoch BEFORE releasing the mutex. The
+            // credit side bumps the epoch under `flow_mutex`, so any
+            // bump that happens after this load will produce
+            // `EAGAIN` on the futex (epoch mismatch) and the wait
+            // returns immediately; any bump that happens before this
+            // load already implies an updated window, which we just
+            // failed to find -- so the writer side must have changed
+            // it in between, which is fine: we'll loop, observe the
+            // new credit, and proceed.
+            const epoch = self.flow_epoch.load(.acquire);
+            self.flow_mutex.unlock(self.io);
+
+            const wait_result = if (deadline) |d|
+                self.io.futexWaitTimeout(u32, &self.flow_epoch.raw, epoch, .{ .deadline = d })
+            else
+                self.io.futexWaitTimeout(u32, &self.flow_epoch.raw, epoch, .none);
+
+            self.flow_mutex.lockUncancelable(self.io);
+
+            wait_result catch |err| switch (err) {
+                // grpc-zig's connection threads are detached and not
+                // wired to the cancelation surface; treat a cancel
+                // signal as equivalent to a timeout so callers still
+                // emit RST_STREAM and tear the stream down cleanly.
+                error.Canceled => return error.FlowControlTimeout,
+            };
+            // Successful return from the futex covers all of: real
+            // wakeup, spurious wakeup, AND deadline expiry. Loop back
+            // to the top: the predicate-then-deadline checks above
+            // will decide whether we proceed, retry, or time out.
         }
+    }
+
+    /// Wrapper around `reserveSendCredit` that, on timeout, emits an
+    /// HTTP/2 `RST_STREAM` frame with `FLOW_CONTROL_ERROR` (0x03) for
+    /// the offending stream and propagates the error. Used by every
+    /// outbound DATA write path. Closes GAP-FU-002.
+    fn reserveSendCreditOrRst(self: *Transport, stream_id: u31, n: u32) error{FlowControlTimeout}!void {
+        self.reserveSendCredit(stream_id, n) catch |err| switch (err) {
+            error.FlowControlTimeout => {
+                std.log.warn(
+                    "flow-control credit timeout on stream {d}; sending RST_STREAM(FLOW_CONTROL_ERROR)",
+                    .{stream_id},
+                );
+                self.writeRstStream(stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                return err;
+            },
+        };
+    }
+
+    /// Best-effort RST_STREAM emit. The 4-byte payload is the HTTP/2
+    /// error code (RFC 7540 §7) in big-endian. Ignores any write
+    /// error: callers reach this on an already-failing path and a
+    /// failed RST simply means the connection is gone, which the next
+    /// read will surface anyway.
+    fn writeRstStream(self: *Transport, stream_id: u31, error_code: u32) void {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, error_code, .big);
+        self.writeFrame(.RST_STREAM, 0, stream_id, &payload) catch {};
     }
 
     /// Send a GOAWAY frame with FRAME_SIZE_ERROR. Best-effort: ignores
@@ -878,15 +1005,15 @@ pub const Transport = struct {
                     const old_initial = self.peer_initial_window_size;
                     if (new_initial != old_initial) {
                         // See processWindowUpdate: hold flow_mutex while
-                        // updating + broadcasting to avoid the lost-wakeup
-                        // race with reserveSendCredit.
+                        // updating + bumping flow_epoch to avoid the
+                        // lost-wakeup race with reserveSendCredit.
                         self.flow_mutex.lockUncancelable(self.io);
                         defer self.flow_mutex.unlock(self.io);
                         for (self.stream_send_windows) |*sw| {
                             applyInitialWindowSizeDelta(sw, old_initial, new_initial);
                         }
                         self.peer_initial_window_size = new_initial;
-                        self.flow_cv.broadcast(self.io);
+                        self.wakeFlowWaiters();
                     }
                 },
                 else => {},
@@ -1633,7 +1760,10 @@ pub const Transport = struct {
 
         // Reserve send-window credit BEFORE acquiring write_mutex so we
         // never block (waiting for peer WINDOW_UPDATE) while holding it.
-        self.reserveSendCredit(sid, @intCast(grpc_frame.len));
+        // On `error.FlowControlTimeout` the wrapper has already emitted
+        // RST_STREAM(FLOW_CONTROL_ERROR); propagate so the caller drops
+        // the stream.
+        try self.reserveSendCreditOrRst(sid, @intCast(grpc_frame.len));
 
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
@@ -1750,7 +1880,8 @@ pub const Transport = struct {
         @memcpy(grpc_frame[5..], message);
 
         // Reserve send-window credit BEFORE acquiring write_mutex.
-        self.reserveSendCredit(stream_id, @intCast(grpc_frame.len));
+        // The wrapper emits RST_STREAM(FLOW_CONTROL_ERROR) on timeout.
+        try self.reserveSendCreditOrRst(stream_id, @intCast(grpc_frame.len));
 
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
@@ -1839,7 +1970,8 @@ pub const Transport = struct {
         @memcpy(grpc_frame[5..], message);
 
         // Reserve send-window credit BEFORE acquiring write_mutex.
-        self.reserveSendCredit(stream_id, @intCast(grpc_frame.len));
+        // The wrapper emits RST_STREAM(FLOW_CONTROL_ERROR) on timeout.
+        try self.reserveSendCreditOrRst(stream_id, @intCast(grpc_frame.len));
 
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);

@@ -75,6 +75,22 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 
 ## Verifier Follow-Up Resolutions
 
+### GAP-FU-002: Per-stream send-credit timeout in flow control [RESOLVED]
+- **Issue:** none filed (filed under `security`, severity::medium / `reliability`)
+- **Category:** Security / Reliability (slow-loris class, Medium)
+- **Source:** Verifier pass on commit `efd9ef6` (2026-04-26).
+- **Resolution summary:** Replaced the unbounded `flow_cv.waitUncancelable` in `Transport.reserveSendCredit` with a futex-based bounded wait. The transport now owns a `flow_epoch: std.atomic.Value(u32)` (incremented under `flow_mutex` whenever credit is granted) plus a configurable `flow_credit_timeout_ns`. The reserve loop computes the deadline once at entry, releases the mutex, and calls `std.Io.futexWaitTimeout(&flow_epoch.raw, snapshot, .{ .deadline = d })`. Because `futexWaitTimeout` surfaces deadline expiry as a successful (spurious-style) wake, the loop checks the deadline manually each iteration; on expiry it returns `error.FlowControlTimeout`. A new wrapper `reserveSendCreditOrRst` emits `RST_STREAM(FLOW_CONTROL_ERROR=0x03)` for the offending stream (best-effort, via a new `writeRstStream` helper) before propagating the error to its caller. Wired into `writeStreamMessage`, `writeMessageOnStream`, and `writeRequestOnStreamWithMetadata`. The timeout is plumbed end-to-end: `GrpcServer.flow_credit_timeout_ns` (default 30 s; `0` disables) is read from `GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS` and copied onto each accepted Transport in `handleConnection`.
+- **Evidence:**
+  - `src/transport.zig` -- `flow_epoch` + `flow_credit_timeout_ns` fields replacing `flow_cv`; new `wakeFlowWaiters`, `reserveSendCredit` (returns `error{FlowControlTimeout}!void`), `reserveSendCreditOrRst`, `writeRstStream`. Broadcast sites in `processWindowUpdate` and `applyPeerSettings` updated.
+  - `src/server.zig` -- `GrpcServer.flow_credit_timeout_ns`, `DEFAULT_FLOW_CREDIT_TIMEOUT_MS`, `flowCreditTimeoutNsFromEnv`, `parseFlowCreditTimeoutMs`; `handleConnection` propagates the timeout onto the new Transport.
+  - `src/flow_control_test.zig` -- 3 new tests:
+      * `reserveSendCredit returns FlowControlTimeout when peer never advertises credit` (slow-loris fault injection: starves both windows, sets a 50 ms timeout, asserts timeout fires within (~30 ms, 1 s)).
+      * `reserveSendCredit succeeds when credit is available within the timeout` (no false positive on funded streams).
+      * `reserveSendCredit with timeout=0 keeps legacy unbounded behaviour for funded streams`.
+  - `src/admission_control_test.zig` -- 3 new tests for `parseFlowCreditTimeoutMs` (accepts `0`, rejects empty / non-numeric / negative; default constant pinned to `30_000`).
+  - `zig build test` -- 45/45 unit tests pass; `zig build loopback-test` ALL SCENARIOS PASSED including the multiplexed 128-calls-on-1-connection scenario which exercises the flow-control fast path on legitimate, funded streams.
+- **Resolved date:** 2026-04-26
+
 ### GAP-FU-001: R1 acceptance text references RST_STREAM; impl emits gRPC-canonical trailer-only HEADERS [RESOLVED]
 - **Issue:** none filed (filed under `quality-finding`, severity::low)
 - **Category:** Docs / api-contract (Low)

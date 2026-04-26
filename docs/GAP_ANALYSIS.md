@@ -10,7 +10,7 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 
 1. **HPACK / codec depth.** Static-table coverage and dynamic-table byte-bounded eviction still incomplete (GAP-0005). Knock-on effects on metadata-heavy traces and conformance fuzzing (GAP-0015).
 2. **Feature surface advertised but not shipped.** Bidi streaming + interop coverage (GAP-0007, GAP-0014), health on the wire (GAP-0008), built-in TLS + ALPN (GAP-0009), gzip/encoding (GAP-0011), generic proto3 codec (GAP-0006), interop matrix breadth (GAP-0012), CI perf gating (GAP-0013), observability surface (GAP-0016).
-3. **Verifier follow-ups from gap-close.** One remaining carry-over from the 2026-04-26 verifier pass (`GAP-FU-002`); the doc-only `GAP-FU-001` has been closed (see `docs/GAP_ANALYSIS_RESOLVED.md`).
+3. **Verifier follow-ups from gap-close.** Both 2026-04-26 verifier carry-overs (`GAP-FU-001`, `GAP-FU-002`) are now closed; resolutions live in `docs/GAP_ANALYSIS_RESOLVED.md`.
 
 ## Blockers for Phase 4 issue creation
 
@@ -19,16 +19,6 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - 15 labels (`gap`, `type::*`, `category::*`) are present.
 
 ## Open Gaps
-
-### GAP-FU-002: Per-stream send-credit timeout in flow control
-- **Issue:** none filed yet (file under `security`, severity::medium / `reliability`)
-- **Category:** Security / Reliability (slow-loris class)
-- **Severity:** Medium
-- **Source:** Verifier pass on commit `efd9ef6` (2026-04-26).
-- **Current state:** `Transport.reserveSendCredit` blocks on `flow_cv.waitUncancelable` until both per-stream and connection send windows admit the payload. A peer that opens streams but never advertises credit can park up to `MAX_CONNS` writer threads. Bounded today by the admission cap (default 1024 conns), but a deliberate slow-loris keeps writer threads stuck without producing wire activity.
-- **Why this is a gap:** Reliability/availability hardening; today the only mitigation is admission control + connection-level idle timeout.
-- **Recommended fix:** Replace `waitUncancelable` with a bounded `timedWait` on `flow_cv`; on timeout return `error.FlowControlTimeout`, log at warn, and emit `RST_STREAM (FLOW_CONTROL_ERROR)` for the offending stream. Default timeout configurable via `GrpcServer.config` (e.g. 30s); 0 disables.
-- **Acceptance criteria:** Configured timeout is honoured under fault injection; long-lived legitimate streams (large unary, server-streaming) are not affected by reasonable timeout values; unit test feeds an artificial peer that never advertises credit and asserts thread is freed within the timeout.
 
 ### GAP-0005: HPACK only parses :path; dynamic-table state shaky
 - **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/6

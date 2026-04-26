@@ -18,6 +18,7 @@ const std = @import("std");
 const testing = std.testing;
 const transport = @import("transport.zig");
 const stream_mod = @import("http2/stream.zig");
+const compat = @import("compat.zig");
 
 test "Stream initializes recv_window and send_window to 65535" {
     var s = try stream_mod.Stream.init(1, std.testing.allocator);
@@ -140,6 +141,108 @@ test "buildSettingsFrame encodes our initial SETTINGS for h2 conformance" {
     try testing.expect(seen_mfs);
     try testing.expect(seen_mcs);
     try testing.expect(seen_mhls);
+}
+
+test "reserveSendCredit returns FlowControlTimeout when peer never advertises credit" {
+    // GAP-FU-002 — a slow-loris peer that opens streams but never
+    // emits WINDOW_UPDATE must not be able to park writer threads
+    // forever. With conn_send_window starved to 0 and a short
+    // configured timeout (50 ms), reserveSendCredit must surface
+    // error.FlowControlTimeout so the caller can emit RST_STREAM
+    // and free the thread.
+    const allocator = std.testing.allocator;
+
+    const send = try allocator.alloc(i32, 8);
+    defer allocator.free(send);
+    @memset(send, 0); // all per-stream send windows starved
+
+    const recv = try allocator.alloc(i32, 8);
+    defer allocator.free(recv);
+    @memset(recv, 65535);
+
+    var t: transport.Transport = undefined;
+    transport.Transport.initFlowControlForTest(&t);
+    t.io = std.testing.io;
+    t.conn_send_window = 0; // connection-level window starved as well
+    t.stream_send_windows = send;
+    t.stream_recv_windows = recv;
+    t.flow_mutex = .init;
+    t.flow_epoch = .init(0);
+    t.flow_credit_timeout_ns = 50 * std.time.ns_per_ms;
+
+    const start_ns = compat.nanoTimestamp();
+    const result = transport.Transport.reserveSendCredit(&t, 1, 100);
+    const elapsed_ns = compat.nanoTimestamp() - start_ns;
+
+    try testing.expectError(error.FlowControlTimeout, result);
+    // Returned within the configured timeout's order of magnitude;
+    // upper bound is generous to absorb scheduler / CI noise.
+    try testing.expect(elapsed_ns >= 30 * std.time.ns_per_ms);
+    try testing.expect(elapsed_ns < 1 * std.time.ns_per_s);
+    // Windows untouched on the timeout path.
+    try testing.expectEqual(@as(i32, 0), t.conn_send_window);
+    try testing.expectEqual(@as(i32, 0), t.stream_send_windows[1]);
+}
+
+test "reserveSendCredit succeeds when credit is available within the timeout" {
+    // Inverse of the slow-loris test: with both windows funded, the
+    // call must return immediately, decrement both windows by `n`,
+    // and not surface any error even with a tight timeout.
+    const allocator = std.testing.allocator;
+
+    const send = try allocator.alloc(i32, 8);
+    defer allocator.free(send);
+    @memset(send, 0);
+    send[1] = 1024;
+
+    const recv = try allocator.alloc(i32, 8);
+    defer allocator.free(recv);
+    @memset(recv, 65535);
+
+    var t: transport.Transport = undefined;
+    transport.Transport.initFlowControlForTest(&t);
+    t.io = std.testing.io;
+    t.conn_send_window = 1024;
+    t.stream_send_windows = send;
+    t.stream_recv_windows = recv;
+    t.flow_mutex = .init;
+    t.flow_epoch = .init(0);
+    t.flow_credit_timeout_ns = 50 * std.time.ns_per_ms;
+
+    try transport.Transport.reserveSendCredit(&t, 1, 200);
+    try testing.expectEqual(@as(i32, 1024 - 200), t.conn_send_window);
+    try testing.expectEqual(@as(i32, 1024 - 200), t.stream_send_windows[1]);
+}
+
+test "reserveSendCredit with timeout=0 keeps legacy unbounded behaviour for funded streams" {
+    // `flow_credit_timeout_ns == 0` disables the timeout. A funded
+    // stream must still succeed without delay; this guards against a
+    // regression where the disabled-timeout branch silently drops
+    // into a tight spin loop.
+    const allocator = std.testing.allocator;
+
+    const send = try allocator.alloc(i32, 8);
+    defer allocator.free(send);
+    @memset(send, 0);
+    send[1] = 4096;
+
+    const recv = try allocator.alloc(i32, 8);
+    defer allocator.free(recv);
+    @memset(recv, 65535);
+
+    var t: transport.Transport = undefined;
+    transport.Transport.initFlowControlForTest(&t);
+    t.io = std.testing.io;
+    t.conn_send_window = 4096;
+    t.stream_send_windows = send;
+    t.stream_recv_windows = recv;
+    t.flow_mutex = .init;
+    t.flow_epoch = .init(0);
+    t.flow_credit_timeout_ns = 0;
+
+    try transport.Transport.reserveSendCredit(&t, 1, 1024);
+    try testing.expectEqual(@as(i32, 4096 - 1024), t.conn_send_window);
+    try testing.expectEqual(@as(i32, 4096 - 1024), t.stream_send_windows[1]);
 }
 
 test "buildWindowUpdateFrame produces a 4-byte u31 increment" {

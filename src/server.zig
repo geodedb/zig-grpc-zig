@@ -41,10 +41,24 @@ pub const GrpcServer = struct {
     /// `post`s on exit. Sized from the `GRPC_ZIG_MAX_CONNS` env var,
     /// falling back to `DEFAULT_MAX_CONNS = 1024`.
     conn_sem: std.Io.Semaphore = .{ .permits = DEFAULT_MAX_CONNS },
+    /// Per-stream send-credit timeout in nanoseconds, applied to every
+    /// accepted connection's Transport. A slow-loris peer that opens
+    /// streams but never advertises send-window credit can otherwise
+    /// pin up to MAX_CONNS writer threads in `reserveSendCredit`. On
+    /// timeout the writer emits `RST_STREAM(FLOW_CONTROL_ERROR)` for
+    /// the offending stream and frees the thread. Sized from the
+    /// `GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS` env var (milliseconds);
+    /// `0` disables the timeout (legacy behaviour: park forever).
+    /// Defaults to `DEFAULT_FLOW_CREDIT_TIMEOUT_MS = 30_000` (30 s).
+    /// Closes GAP-FU-002.
+    flow_credit_timeout_ns: u64 = DEFAULT_FLOW_CREDIT_TIMEOUT_MS * std.time.ns_per_ms,
 
     /// Default cap on concurrent accepted connections when
     /// `GRPC_ZIG_MAX_CONNS` is unset.
     pub const DEFAULT_MAX_CONNS: usize = 1024;
+    /// Default per-stream send-credit timeout (milliseconds) when
+    /// `GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS` is unset.
+    pub const DEFAULT_FLOW_CREDIT_TIMEOUT_MS: u64 = 30_000;
 
     /// Read GRPC_ZIG_MAX_CONNS via libc `getenv`; return
     /// DEFAULT_MAX_CONNS when missing, or propagate
@@ -79,6 +93,28 @@ pub const GrpcServer = struct {
         return n;
     }
 
+    /// Read GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS via libc `getenv`; return
+    /// the default when missing. `0` is a valid value here (disables
+    /// the timeout entirely). Malformed values fall back to the
+    /// default rather than refusing to boot. Closes GAP-FU-002.
+    pub fn flowCreditTimeoutNsFromEnv() u64 {
+        const raw_ptr = std.c.getenv("GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS") orelse
+            return DEFAULT_FLOW_CREDIT_TIMEOUT_MS * std.time.ns_per_ms;
+        const raw = std.mem.span(raw_ptr);
+        const ms = parseFlowCreditTimeoutMs(raw) catch
+            return DEFAULT_FLOW_CREDIT_TIMEOUT_MS * std.time.ns_per_ms;
+        return ms * std.time.ns_per_ms;
+    }
+
+    /// Parse a GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS value. Unlike
+    /// `parseMaxConnsValue`, `0` IS a valid input (disables the
+    /// timeout). Empty or non-digit input is rejected. Public for
+    /// unit tests.
+    pub fn parseFlowCreditTimeoutMs(raw: []const u8) !u64 {
+        if (raw.len == 0) return error.InvalidFlowCreditTimeout;
+        return std.fmt.parseInt(u64, raw, 10) catch error.InvalidFlowCreditTimeout;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
         const address = try net.IpAddress.parseIp4("0.0.0.0", port);
         const server = try address.listen(io, .{ .reuse_address = true });
@@ -95,6 +131,7 @@ pub const GrpcServer = struct {
             .auth = auth.Auth.init(allocator, secret_key),
             .health_check = health.HealthCheck.init(allocator),
             .conn_sem = .{ .permits = max_conns },
+            .flow_credit_timeout_ns = flowCreditTimeoutNsFromEnv(),
         };
     }
 
@@ -168,6 +205,10 @@ pub const GrpcServer = struct {
             return err;
         };
         defer trans.deinit();
+
+        // Propagate the server-level flow-control credit timeout to the
+        // per-connection transport. Closes GAP-FU-002.
+        trans.flow_credit_timeout_ns = self.flow_credit_timeout_ns;
 
         // Setup streaming
         var message_stream = streaming.MessageStream.init(self.allocator, 1024);
