@@ -210,6 +210,25 @@ pub fn build(b: *std.Build) void {
     const interop_codec_test_step = b.step("interop-codec-test", "Run the interop wire-codec unit tests");
     interop_codec_test_step.dependOn(&run_interop_codec_tests.step);
 
+    // Failing reproduction test for the client request HEADERS bug.
+    // See src/transport_request_headers_test.zig — this asserts that
+    // `transport.writeRequestHeaders` emits request-shaped HPACK bytes
+    // (`:method POST` / `:scheme http` / `:path` / `:authority` / etc.)
+    // instead of the response-shaped HEADERS the buggy `writeMessage`
+    // path currently produces.
+    const request_headers_tests = b.addTest(.{
+        .name = "request-headers-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transport_request_headers_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    request_headers_tests.root_module.linkLibrary(zlib_lib);
+    const run_request_headers_tests = b.addRunArtifact(request_headers_tests);
+    const request_headers_test_step = b.step("request-headers-test", "Run the client request-HEADERS reproduction test");
+    request_headers_test_step.dependOn(&run_request_headers_tests.step);
+
     // Zig interop server: uses a named import for grpc-server so src/ files
     // are reachable from interop/zig/ without escaping the module boundary.
     // Transport is accessed via grpc_server.Transport (re-exported by server.zig).
