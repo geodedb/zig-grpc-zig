@@ -327,20 +327,37 @@ pub const Transport = struct {
     /// Per-stream send and receive windows. Tracked here (rather than on
     /// the legacy stream.Stream) so flow-control state is reachable from
     /// the Transport's read/write loops without a parallel hash map per
-    /// connection. Bounded at MAX_TRACKED_STREAMS to keep the table size
-    /// predictable; stream ids beyond that fall back to the connection
-    /// window only (a safe over-estimate for short-lived calls).
-    stream_send_windows: [MAX_TRACKED_STREAMS]i32 = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS,
-    stream_recv_windows: [MAX_TRACKED_STREAMS]i32 = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS,
+    /// connection. Heap-allocated to keep the Transport struct itself
+    /// small enough for a 512 KiB pthread stack (CC-4). Bounded at
+    /// MAX_TRACKED_STREAMS; stream ids beyond that fall back to the
+    /// connection window only (a safe over-estimate for short-lived
+    /// calls).
+    stream_send_windows: []i32 = &[_]i32{},
+    stream_recv_windows: []i32 = &[_]i32{},
     /// Coordinates blocking writers waiting for additional send-window
     /// credit (peer sent WINDOW_UPDATE) without busy-spinning. The
     /// reader thread broadcasts on this whenever it credits any window.
     flow_mutex: std.Io.Mutex = .init,
     flow_cv: std.Io.Condition = .init,
 
+    /// Allocate the per-stream flow-control arrays on the heap. Used by
+    /// every init path so the embedded slices are non-empty and indexable.
+    fn allocStreamWindows(allocator: std.mem.Allocator) !struct { send: []i32, recv: []i32 } {
+        const send = try allocator.alloc(i32, MAX_TRACKED_STREAMS);
+        errdefer allocator.free(send);
+        const recv = try allocator.alloc(i32, MAX_TRACKED_STREAMS);
+        errdefer allocator.free(recv);
+        @memset(send, INITIAL_WINDOW_SIZE_DEFAULT);
+        @memset(recv, INITIAL_WINDOW_SIZE_DEFAULT);
+        return .{ .send = send, .recv = recv };
+    }
+
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
         const authority_owned = try allocator.dupe(u8, authority);
         errdefer allocator.free(authority_owned);
+        const windows = try allocStreamWindows(allocator);
+        errdefer allocator.free(windows.send);
+        errdefer allocator.free(windows.recv);
 
         var trans = Transport{
             .stream = stream_,
@@ -350,6 +367,8 @@ pub const Transport = struct {
             .last_method = .{0} ** 256,
             .last_method_len = 0,
             .authority = authority_owned,
+            .stream_send_windows = windows.send,
+            .stream_recv_windows = windows.recv,
         };
 
         try trans.setupHttp2Client();
@@ -360,6 +379,9 @@ pub const Transport = struct {
     pub fn initServer(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
         const authority_owned = try allocator.dupe(u8, "");
         errdefer allocator.free(authority_owned);
+        const windows = try allocStreamWindows(allocator);
+        errdefer allocator.free(windows.send);
+        errdefer allocator.free(windows.recv);
 
         var trans = Transport{
             .stream = stream_,
@@ -369,6 +391,8 @@ pub const Transport = struct {
             .last_method = .{0} ** 256,
             .last_method_len = 0,
             .authority = authority_owned,
+            .stream_send_windows = windows.send,
+            .stream_recv_windows = windows.recv,
         };
 
         try trans.setupHttp2Server();
@@ -379,6 +403,9 @@ pub const Transport = struct {
     pub fn initServerTls(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, tls_io_: TlsIo) !Transport {
         const authority_owned = try allocator.dupe(u8, "");
         errdefer allocator.free(authority_owned);
+        const windows = try allocStreamWindows(allocator);
+        errdefer allocator.free(windows.send);
+        errdefer allocator.free(windows.recv);
 
         var trans = Transport{
             .stream = stream_,
@@ -389,6 +416,8 @@ pub const Transport = struct {
             .last_method = .{0} ** 256,
             .last_method_len = 0,
             .authority = authority_owned,
+            .stream_send_windows = windows.send,
+            .stream_recv_windows = windows.recv,
         };
         // If setup fails, close the TLS connection to avoid leaking the
         // SSL object and SslConn allocation.
@@ -434,6 +463,8 @@ pub const Transport = struct {
 
     pub fn deinit(self: *Transport) void {
         self.allocator.free(self.authority);
+        if (self.stream_send_windows.len > 0) self.allocator.free(self.stream_send_windows);
+        if (self.stream_recv_windows.len > 0) self.allocator.free(self.stream_recv_windows);
         self.ioClose();
     }
 
@@ -558,8 +589,11 @@ pub const Transport = struct {
         t.conn_recv_window = INITIAL_WINDOW_SIZE_DEFAULT;
         t.our_initial_window_size = ADVERTISED_INITIAL_WINDOW_SIZE;
         t.peer_initial_window_size = INITIAL_WINDOW_SIZE_DEFAULT;
-        t.stream_send_windows = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS;
-        t.stream_recv_windows = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS;
+        // Tests don't allocate the per-stream arrays — leave them empty
+        // and rely on per-stream code paths' MAX_TRACKED_STREAMS bounds
+        // check (idx >= MAX_TRACKED_STREAMS short-circuits).
+        t.stream_send_windows = &[_]i32{};
+        t.stream_recv_windows = &[_]i32{};
     }
 
     /// Apply a WINDOW_UPDATE increment to a flow-control window pointer.
@@ -729,7 +763,7 @@ pub const Transport = struct {
             applyWindowUpdate(&self.conn_send_window, increment) catch return;
         } else {
             const idx: usize = @intCast(stream_id);
-            if (idx >= MAX_TRACKED_STREAMS) return;
+            if (idx >= self.stream_send_windows.len) return;
             applyWindowUpdate(&self.stream_send_windows[idx], increment) catch return;
         }
         // Wake any writers blocked on send credit.
@@ -755,7 +789,7 @@ pub const Transport = struct {
 
         if (stream_id == 0) return;
         const idx: usize = @intCast(stream_id);
-        if (idx >= MAX_TRACKED_STREAMS) return;
+        if (idx >= self.stream_recv_windows.len) return;
         self.stream_recv_windows[idx] -|= @intCast(consumed);
         if (shouldEmitWindowUpdate(self.stream_recv_windows[idx], ADVERTISED_INITIAL_WINDOW_SIZE)) {
             const credit: u32 = @intCast(@as(i64, ADVERTISED_INITIAL_WINDOW_SIZE) - @as(i64, self.stream_recv_windows[idx]));
@@ -776,7 +810,7 @@ pub const Transport = struct {
         const idx: ?usize = blk: {
             if (stream_id == 0) break :blk null;
             const i: usize = @intCast(stream_id);
-            if (i >= MAX_TRACKED_STREAMS) break :blk null;
+            if (i >= self.stream_send_windows.len) break :blk null;
             break :blk i;
         };
 
@@ -848,7 +882,7 @@ pub const Transport = struct {
                         // race with reserveSendCredit.
                         self.flow_mutex.lockUncancelable(self.io);
                         defer self.flow_mutex.unlock(self.io);
-                        for (&self.stream_send_windows) |*sw| {
+                        for (self.stream_send_windows) |*sw| {
                             applyInitialWindowSizeDelta(sw, old_initial, new_initial);
                         }
                         self.peer_initial_window_size = new_initial;

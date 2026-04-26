@@ -68,7 +68,14 @@ pub const GrpcServer = struct {
             // long-lived or streaming RPCs, and a blocked readMessage has no
             // cooperative reschedule. Dedicated OS thread + detach is the
             // correct primitive for this shape.
-            const thread = std.Thread.spawn(.{}, connectionThread, .{ self, stream_ }) catch |err| {
+            //
+            // CC-4 — cap the pthread stack at 512 KiB instead of the
+            // glibc default of 8 MiB. The handler stack frames in this
+            // codebase are small (one allocator, a couple ArrayLists,
+            // and HPACK fixed-size buffers) so 512 KiB is comfortable
+            // headroom; this drops idle-connection memory from ~8 MiB
+            // to ~512 KiB, ~16x reduction at fleet steady state.
+            const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, connectionThread, .{ self, stream_ }) catch |err| {
                 std.log.err("Failed to spawn connection thread: {}", .{err});
                 stream_.close(self.io);
                 continue;
