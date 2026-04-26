@@ -249,15 +249,15 @@ interop-go-go:
     - chmod +x interop/scripts/run-pair.sh
     - interop/scripts/run-pair.sh ./zig-out/bin/grpc-interop-go-server ./zig-out/bin/grpc-interop-go-client 50061 --message ci-hello --tag go-go
 
-# Cross-pair (Zig × Go in either direction) is allowed to fail until
-# the protocol gaps documented in docs/interop/findings.md are fixed.
-# Keeping the job in CI means we'll see the moment it goes green.
+# Cross-pair full matrix (Go × Zig in both directions). Now a required
+# gate: the request-HEADERS fix landed (see commit a9adadd) and all four
+# pairs are expected to pass. If this regresses, treat it as a real
+# protocol break — don't paper over it with `allow_failure`.
 interop-cross:
   stage: interop
   image: "golang:1.22"
   tags: ["company", "linux"]
   needs: ["zig-build-0.16.0"]
-  allow_failure: true
   before_script:
     - apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates xz-utils python3 build-essential
     - bash scripts/install-zig.sh "$ZIG_VERSION"
