@@ -180,7 +180,17 @@ pub const GrpcServer = struct {
             }
             if (matched) |handler| {
                 handler.handler_fn(decompressed, method, &trans, self.allocator) catch |err| {
+                    // R1: surface handler errors to the client as a
+                    // grpc-status: 2 (UNKNOWN) trailer. The legacy code
+                    // logged the error and silently continued; clients
+                    // hung indefinitely waiting for trailers that never
+                    // came. Now we emit a proper trailer-only HEADERS
+                    // frame with the error name so the client sees a
+                    // definite end-of-stream and a meaningful status.
                     std.log.err("Handler error: {}", .{err});
+                    trans.endStreamWithStatus(stream_id, 2, @errorName(err)) catch |trailer_err| {
+                        std.log.err("Failed to emit error trailer: {}", .{trailer_err});
+                    };
                     continue;
                 };
             } else {
