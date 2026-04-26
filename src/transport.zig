@@ -809,30 +809,90 @@ pub const Transport = struct {
         return out_pos;
     }
 
-    /// Decode an HPACK integer with the given prefix size.
-    /// Returns the decoded value and the number of bytes consumed.
-    fn hpackDecodeInt(data: []const u8, comptime prefix_bits: u4) struct { value: usize, consumed: usize } {
+    /// Decode an HPACK integer with the given prefix size (RFC 7541 §5.1).
+    ///
+    /// I1 (closes GitLab #6 / security GAP):
+    ///   The legacy implementation kept a `std.math.Log2Int(usize)` shift
+    ///   counter (u6 on 64-bit targets) and unconditionally added 7 each
+    ///   continuation byte. A peer feeding HEADERS with 10+ continuation
+    ///   bytes (each with the high bit set) drove that counter past 63 and
+    ///   panicked the connection thread on integer overflow. We now:
+    ///     * widen the shift counter to u32 so the addition itself is safe,
+    ///     * reject before-the-shift if `m + 7 > @bitSizeOf(usize)`, and
+    ///     * cap continuation bytes at MAX_HPACK_VARINT_CONTINUATIONS (5),
+    ///       enough for any 32-bit value field RFC 7541 admits.
+    /// On overflow we return `error.HpackIntegerOverflow` instead of
+    /// panicking; the connection thread surfaces this as a protocol error.
+    const MAX_HPACK_VARINT_CONTINUATIONS: u32 = 5;
+
+    /// Result of decoding an HPACK varint. `value` holds the decoded
+    /// integer; `consumed` is the number of input bytes read.
+    pub const HpackVarint = struct { value: usize, consumed: usize };
+
+    fn hpackDecodeInt(
+        data: []const u8,
+        comptime prefix_bits: u4,
+    ) error{HpackIntegerOverflow}!HpackVarint {
         if (data.len == 0) return .{ .value = 0, .consumed = 0 };
         const mask: u8 = (@as(u8, 1) << @as(u3, @intCast(prefix_bits))) - 1;
         var value: usize = data[0] & mask;
         if (value < mask) return .{ .value = value, .consumed = 1 };
-        // Multi-byte integer
+        // Multi-byte integer.
         var pos: usize = 1;
-        var m: std.math.Log2Int(usize) = 0;
+        var m: u32 = 0;
+        var continuations: u32 = 0;
         while (pos < data.len) {
+            // RFC 7541 admits values up to 2^N-1 + 127*2^N for prefix N,
+            // but 32-bit is more than enough for any sane HPACK field; cap
+            // continuations to MAX_HPACK_VARINT_CONTINUATIONS to defang
+            // peers attempting overflow-driven panics.
+            if (continuations >= MAX_HPACK_VARINT_CONTINUATIONS) {
+                return error.HpackIntegerOverflow;
+            }
+            // Pre-check the shift width: the next addend is `(b & 0x7F) << m`,
+            // which Zig will panic on if m >= @bitSizeOf(usize).
+            if (m >= @bitSizeOf(usize)) {
+                return error.HpackIntegerOverflow;
+            }
             const b = data[pos];
-            value += @as(usize, b & 0x7F) << m;
+            value += @as(usize, b & 0x7F) << @as(std.math.Log2Int(usize), @intCast(m));
             pos += 1;
             if (b & 0x80 == 0) break;
+            // Guard the next iteration's shift: m is about to become m+7.
+            if (m + 7 > @bitSizeOf(usize)) {
+                return error.HpackIntegerOverflow;
+            }
             m += 7;
+            continuations += 1;
         }
         return .{ .value = value, .consumed = pos };
     }
 
-    /// Skip an HPACK string (returns bytes consumed).
+    /// Public test entry: returns the same struct as `hpackDecodeInt` but
+    /// panics on overflow (only used for valid-input regression tests).
+    pub fn hpackDecodeIntForTest(
+        data: []const u8,
+        comptime prefix_bits: u4,
+    ) HpackVarint {
+        return hpackDecodeInt(data, prefix_bits) catch unreachable;
+    }
+
+    /// Public test entry: returns the error union directly so overflow
+    /// tests can assert `error.HpackIntegerOverflow`.
+    pub fn hpackDecodeIntChecked(
+        data: []const u8,
+        comptime prefix_bits: u4,
+    ) error{HpackIntegerOverflow}!HpackVarint {
+        return hpackDecodeInt(data, prefix_bits);
+    }
+
+    /// Skip an HPACK string (returns bytes consumed). Returns 0 on overflow
+    /// of the embedded length varint; callers in the bounded-loop parser
+    /// treat 0 as "give up" which is safer than propagating up an error
+    /// path that would still need to discard the rest of the payload.
     fn hpackSkipString(data: []const u8) usize {
         if (data.len == 0) return 0;
-        const int_result = hpackDecodeInt(data, 7);
+        const int_result = hpackDecodeInt(data, 7) catch return 0;
         return int_result.consumed + int_result.value;
     }
 
@@ -841,7 +901,7 @@ pub const Transport = struct {
         if (data.len == 0) return false;
         const is_huffman = (data[0] & 0x80) != 0;
         if (is_huffman) return false; // only match plain-text names
-        const r = hpackDecodeInt(data, 7);
+        const r = hpackDecodeInt(data, 7) catch return false;
         if (r.value != expected.len) return false;
         if (r.consumed + r.value > data.len) return false;
         return std.mem.eql(u8, data[r.consumed .. r.consumed + r.value], expected);
@@ -870,7 +930,7 @@ pub const Transport = struct {
 
             if (byte & 0x80 != 0) {
                 // Indexed header field (1xxxxxxx) — look up in dynamic table
-                const r = hpackDecodeInt(payload[pos..], 7);
+                const r = hpackDecodeInt(payload[pos..], 7) catch return;
                 pos += r.consumed;
                 if (!found_path) {
                     self.hpackLookupIndex(r.value);
@@ -884,7 +944,7 @@ pub const Transport = struct {
                 }
             } else if (byte & 0xC0 == 0x40) {
                 // Literal with incremental indexing (01xxxxxx) — adds to dynamic table
-                const r = hpackDecodeInt(payload[pos..], 6);
+                const r = hpackDecodeInt(payload[pos..], 6) catch return;
                 pos += r.consumed;
                 const name_idx = r.value;
                 var is_path_header = (name_idx == 4 or name_idx == 5);
@@ -922,7 +982,7 @@ pub const Transport = struct {
             } else if (byte & 0xF0 == 0x00 or byte & 0xF0 == 0x10) {
                 // Literal without indexing (0000xxxx) or never indexed (0001xxxx)
                 // Does NOT add to dynamic table
-                const r = hpackDecodeInt(payload[pos..], 4);
+                const r = hpackDecodeInt(payload[pos..], 4) catch return;
                 pos += r.consumed;
                 const name_idx = r.value;
                 var is_path_hdr = (name_idx == 4 or name_idx == 5);
@@ -944,7 +1004,7 @@ pub const Transport = struct {
                 pos += hpackSkipString(payload[pos..]);
             } else if (byte & 0xE0 == 0x20) {
                 // Dynamic table size update (001xxxxx) — skip
-                const r = hpackDecodeInt(payload[pos..], 5);
+                const r = hpackDecodeInt(payload[pos..], 5) catch return;
                 pos += r.consumed;
             } else {
                 pos += 1; // unknown — skip byte
@@ -957,7 +1017,7 @@ pub const Transport = struct {
     fn setPathFromHpackString(self: *Transport, data: []const u8) void {
         if (data.len == 0) return;
         const is_huffman = (data[0] & 0x80) != 0;
-        const r = hpackDecodeInt(data, 7);
+        const r = hpackDecodeInt(data, 7) catch return;
         const str_start = r.consumed;
         const str_len = r.value;
         if (str_start + str_len > data.len) return;
@@ -979,7 +1039,7 @@ pub const Transport = struct {
     fn setAuthorizationFromHpackString(self: *Transport, data: []const u8) void {
         if (data.len == 0) return;
         const is_huffman = (data[0] & 0x80) != 0;
-        const r = hpackDecodeInt(data, 7);
+        const r = hpackDecodeInt(data, 7) catch return;
         const str_start = r.consumed;
         const str_len = r.value;
         if (str_start + str_len > data.len) return;

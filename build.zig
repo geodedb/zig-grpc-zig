@@ -176,6 +176,22 @@ pub fn build(b: *std.Build) void {
     const run_auth_tests = b.addRunArtifact(auth_tests);
     test_step.dependOn(&run_auth_tests.step);
 
+    // HPACK varint overflow regression tests (closes I1 / GitLab security
+    // issue #6). These exercise `Transport.hpackDecodeInt*` directly to
+    // assert that pathological continuation-byte sequences are rejected
+    // with `error.HpackIntegerOverflow` rather than panicking.
+    const hpack_varint_tests = b.addTest(.{
+        .name = "hpack-varint-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hpack_varint_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    hpack_varint_tests.root_module.linkLibrary(zlib_lib);
+    const run_hpack_varint_tests = b.addRunArtifact(hpack_varint_tests);
+    test_step.dependOn(&run_hpack_varint_tests.step);
+
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
     // from the full test execution.
@@ -183,6 +199,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&tests.step);
     check_step.dependOn(&endstream_tests.step);
     check_step.dependOn(&auth_tests.step);
+    check_step.dependOn(&hpack_varint_tests.step);
 
     // Integration test server
     const integration_test_mod = b.createModule(.{
