@@ -10,7 +10,7 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 
 1. **HPACK / codec depth.** Static-table coverage and dynamic-table byte-bounded eviction still incomplete (GAP-0005). Knock-on effects on metadata-heavy traces and conformance fuzzing (GAP-0015).
 2. **Feature surface advertised but not shipped.** Bidi streaming + interop coverage (GAP-0007, GAP-0014), health on the wire (GAP-0008), built-in TLS + ALPN (GAP-0009), gzip/encoding (GAP-0011), generic proto3 codec (GAP-0006), interop matrix breadth (GAP-0012), CI perf gating (GAP-0013), observability surface (GAP-0016).
-3. **Verifier follow-ups from gap-close.** Two carry-overs from the 2026-04-26 verifier pass (`GAP-FU-001`, `GAP-FU-002`).
+3. **Verifier follow-ups from gap-close.** One remaining carry-over from the 2026-04-26 verifier pass (`GAP-FU-002`); the doc-only `GAP-FU-001` has been closed (see `docs/GAP_ANALYSIS_RESOLVED.md`).
 
 ## Blockers for Phase 4 issue creation
 
@@ -19,16 +19,6 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - 15 labels (`gap`, `type::*`, `category::*`) are present.
 
 ## Open Gaps
-
-### GAP-FU-001: R1 acceptance criterion text references RST_STREAM; impl emits gRPC-canonical trailer-only HEADERS
-- **Issue:** none filed yet (file under `quality-finding`, severity::low)
-- **Category:** Docs / api-contract
-- **Severity:** Low
-- **Source:** Verifier pass on commit `0993e5e` (2026-04-26).
-- **Current state:** R1 was closed by emitting a trailer-only `HEADERS|END_STREAM` frame with `grpc-status: 2` -- the gRPC spec-canonical shape. The original criterion in QUALITY_GAP_ANALYSIS.md mentioned `RST_STREAM` as one allowable signal, which is misleading (RST_STREAM aborts the stream without delivering a status; the spec mandates trailers).
-- **Why this is a gap:** Documentation drift. The wire behaviour is correct; only the criterion wording is stale.
-- **Recommended fix:** Update QUALITY_GAP_ANALYSIS.md R1 row + Roadmap entry to remove the "or RST_STREAM" alternative; cross-reference RFC-equivalent text from the gRPC spec.
-- **Acceptance criteria:** Criterion text matches landed implementation; no code change required.
 
 ### GAP-FU-002: Per-stream send-credit timeout in flow control
 - **Issue:** none filed yet (file under `security`, severity::medium / `reliability`)

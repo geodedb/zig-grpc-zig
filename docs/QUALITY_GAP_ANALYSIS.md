@@ -1,6 +1,6 @@
 # Quality Gap Analysis — grpc-zig
 
-Last updated: 2026-04-26 (post gap-close: 2 closed -- R1, A1)
+Last updated: 2026-04-26 (post gap-close: 2 closed -- R1, A1; GAP-FU-001 doc-correction folded in)
 Reviewer pipeline: quality-scanner → quality-reviewer → quality-tracker (this doc)
 Repository: gitlab.com/devnw/zig/grpc-zig
 Branch: main @ ac7f771
@@ -9,8 +9,13 @@ Branch: main @ ac7f771
 > - **R1** (Critical, 200) -- handler error swallowed -- closed by `0993e5e` + `19fcf38`
 > - **A1** (High, 112.5) -- no `endStreamWithStatus(code, message)` -- closed by `19fcf38`
 >
-> **Verifier follow-up filed against this file (see `GAP-FU-001` in `docs/GAP_ANALYSIS.md`):**
-> R1 acceptance text mentions `RST_STREAM` as one allowable signal; landed implementation emits the gRPC-canonical trailer-only HEADERS|END_STREAM. Wording will be updated in a follow-up doc edit.
+> **GAP-FU-001 (Doc, Low) -- closed:** R1 acceptance text below has been corrected.
+> The gRPC core spec mandates a trailer-only HEADERS|END_STREAM frame carrying
+> `grpc-status` (and optionally `grpc-message`) on every server-terminated stream.
+> `RST_STREAM` aborts the stream WITHOUT delivering a status and is not a
+> substitute for trailers. The earlier wording listing `RST_STREAM` as an
+> allowable signal was misleading; landed implementation emits the canonical
+> trailer-only HEADERS|END_STREAM and is correct.
 
 ---
 
@@ -76,18 +81,23 @@ Branch: main @ ac7f771
 
 - File: `src/server.zig:134-137`
 - After a handler returns an error the server logs and `continue`s the
-  read loop. **No `grpc-status` trailer, no `RST_STREAM`, no
-  `endStream`** is emitted. Clients block until their own deadline
-  elapses or read EOF and treat the call as success-with-no-trailers.
-- Wire-contract: violates RFC-equivalent gRPC spec
-  (`grpc-status` trailer is mandatory on every server-terminated
-  stream).
+  read loop. **No `grpc-status` trailer is emitted.** Clients block
+  until their own deadline elapses or read EOF and treat the call as
+  success-with-no-trailers.
+- Wire-contract: violates the gRPC core spec
+  ([gRPC over HTTP/2](https://grpc.io/docs/guides/wire-format/)) --
+  `grpc-status` carried in a trailer-only HEADERS|END_STREAM frame is
+  the mandatory close-out for every server-terminated stream.
+  `RST_STREAM` aborts the stream WITHOUT delivering a status code and
+  is therefore NOT an acceptable alternative.
 - Fix: introduce `Transport.endStreamWithStatus(stream_id, code,
   message)` (see A1) and call it from the catch block with code derived
   from the handler error (default `INTERNAL`).
 - Verification: integration test that returns
   `error.Unimplemented` from a handler must observe `grpc-status: 12`
-  on a Go/Zig client without timeout.
+  carried in a trailer-only HEADERS frame on a Go/Zig client without
+  timeout. (No `RST_STREAM` is required and none should be emitted on
+  the success-of-error-mapping path.)
 
 ### #2 — R2 Client mux drops OOM silently (PriorityScore = 160)
 
@@ -126,7 +136,7 @@ Branch: main @ ac7f771
 
 | Rank | ID | Sev | Score | Category | Finding | Component | Evidence | Fix Summary | Confidence | Effort | Status |
 |-----:|----|-----|------:|----------|---------|-----------|----------|-------------|------------|--------|--------|
-| 1  | R1  | Critical | 200   | reliability,api-contract | Handler error logged then continue, no trailer/RST emitted | server | `src/server.zig:134-137` | Emit synthetic grpc-status trailers via `Transport.endStreamWithStatus`; depends on A1 | confirmed | M | **closed (0993e5e, 2026-04-26)** |
+| 1  | R1  | Critical | 200   | reliability,api-contract | Handler error logged then continue, no `grpc-status` trailer emitted | server | `src/server.zig:134-137` | Emit synthetic grpc-status trailers via `Transport.endStreamWithStatus`; depends on A1 | confirmed | M | **closed (0993e5e, 2026-04-26)** |
 | 2  | R2  | Critical | 160   | reliability | `client_mux.readerLoop` swallows allocator OOM into `slot.err`; never broadcasts | client_mux | `src/client_mux.zig:220-228` | Always `cond.broadcast()` and set `end_stream=true` in error branch | confirmed | S | open |
 | 3  | A1  | High     | 112.5 | api-contract | gRPC error contract not modelled — no `endStreamWithStatus(code, message)` | transport | `src/transport.zig:875-882` | Add helper; precondition for R1 | confirmed | S | **closed (19fcf38, 2026-04-26)** |
 | 4  | R5  | High     | 90    | maintainability | Connection-level frame handling duplicated 3× | transport, client_mux | `src/transport.zig:443-491,546-583`, `src/client_mux.zig:244-287` | Extract `handleConnFrame` into shared module | confirmed | M | open |

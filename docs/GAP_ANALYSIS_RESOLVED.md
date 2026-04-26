@@ -73,6 +73,20 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 
 ---
 
+## Verifier Follow-Up Resolutions
+
+### GAP-FU-001: R1 acceptance text references RST_STREAM; impl emits gRPC-canonical trailer-only HEADERS [RESOLVED]
+- **Issue:** none filed (filed under `quality-finding`, severity::low)
+- **Category:** Docs / api-contract (Low)
+- **Source:** Verifier pass on commit `0993e5e` (2026-04-26).
+- **Resolution summary:** Updated `docs/QUALITY_GAP_ANALYSIS.md` R1 narrative + stack-ranked-row text to remove the misleading "or `RST_STREAM`" alternative and cross-reference the gRPC core spec ([gRPC over HTTP/2](https://grpc.io/docs/guides/wire-format/)) which mandates a trailer-only HEADERS|END_STREAM frame carrying `grpc-status` (and optionally `grpc-message`). `RST_STREAM` aborts a stream WITHOUT delivering a status and is therefore not a substitute. Landed implementation is correct; only the criterion wording was stale.
+- **Evidence:**
+  - `docs/QUALITY_GAP_ANALYSIS.md` -- header banner, R1 narrative (#1), and stack-ranked-row finding text now reference only the trailer-only HEADERS|END_STREAM close-out.
+  - `docs/GAP_ANALYSIS_RESOLVED.md:Q-R1` -- note clarifies that the canonical close-out shape is mandatory and `RST_STREAM` is NOT a substitute.
+- **Resolved date:** 2026-04-26
+
+---
+
 ## Quality Domain Resolutions
 
 ### Q-R1: Server swallows handler errors -- wire-contract breach [RESOLVED]
@@ -80,7 +94,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Category:** Reliability / api-contract (Critical, PriorityScore 200)
 - **Resolution commits:** `19fcf38` (precursor: `endStreamWithStatus` helper) + `0993e5e` (R1 fix)
 - **Resolution summary:** Handler-error path in `src/server.zig` now calls `endStreamWithStatus(stream_id, 2, @errorName(err))`, emitting a trailer-only HEADERS frame with `grpc-status: 2` (UNKNOWN) and `grpc-message=<err>`. Failing client no longer hangs until deadline.
-- **Note:** Implementation chose gRPC-canonical trailer-only HEADERS|END_STREAM rather than RST_STREAM (the original criterion text mentioned RST_STREAM); see follow-up `GAP-FU-001` to update the criterion wording.
+- **Note:** Implementation emits the gRPC-canonical trailer-only HEADERS|END_STREAM frame carrying `grpc-status` (and optionally `grpc-message`) -- the only spec-compliant way to terminate a stream with a status. `RST_STREAM` aborts the stream without delivering a status and is therefore NOT a substitute. The earlier wording listing `RST_STREAM` as an allowable signal has been corrected in `docs/QUALITY_GAP_ANALYSIS.md` (closes follow-up `GAP-FU-001`).
 - **Evidence:**
   - `src/server.zig` -- handler-error catch arm.
   - `src/transport.zig:875-882` -- `endStreamWithStatus` helper (also closes Q-A1).
