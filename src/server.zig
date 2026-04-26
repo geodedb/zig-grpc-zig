@@ -27,6 +27,14 @@ pub const GrpcServer = struct {
     auth: auth.Auth,
     health_check: health.HealthCheck,
     on_tls_accept: ?*const fn (net.Stream) anyerror!transport.TlsIo = null,
+    /// When true, every incoming request must carry a valid `authorization`
+    /// header that `Auth.verifyToken` accepts. Closes GAP-0001:
+    ///   * Missing or empty header        -> grpc-status 16 (UNAUTHENTICATED)
+    ///   * Token rejected by verifyToken  -> grpc-status 16 with @errorName
+    /// When false (default), the server is unauthenticated and dispatches
+    /// every request directly — the legacy behaviour, kept for tests and
+    /// for endpoints that don't need an auth gate.
+    require_auth: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
         const address = try net.IpAddress.parseIp4("0.0.0.0", port);
@@ -135,6 +143,34 @@ pub const GrpcServer = struct {
             // so the client gets a definitive answer instead of hanging.
             const method = trans.lastMethod();
             const stream_id = trans.last_stream_id;
+
+            // Auth gate (closes GAP-0001 / #2). When `require_auth` is set
+            // we must verify the `authorization` header before dispatching;
+            // any failure produces a `grpc-status: 16` (UNAUTHENTICATED)
+            // trailer with `@errorName(err)` as the message and we skip
+            // dispatch entirely.
+            if (self.require_auth) {
+                const auth_value = trans.lastAuthorization();
+                if (auth_value.len == 0) {
+                    std.log.warn("auth gate: missing 'authorization' for {s}", .{method});
+                    trans.endStreamWithStatus(stream_id, 16, "missing authorization") catch |err| {
+                        std.log.err("auth gate: failed to emit UNAUTHENTICATED trailer: {}", .{err});
+                    };
+                    continue;
+                }
+                const claims = self.auth.verifyToken(auth_value) catch |err| {
+                    std.log.warn("auth gate: rejected {s}: {s}", .{ method, @errorName(err) });
+                    trans.endStreamWithStatus(stream_id, 16, @errorName(err)) catch |trailer_err| {
+                        std.log.err("auth gate: failed to emit UNAUTHENTICATED trailer: {}", .{trailer_err});
+                    };
+                    continue;
+                };
+                // Free the duped subject — we don't surface it to handlers
+                // yet (future work). The successful auth implies the token
+                // claims are valid; tearing the slice down here is safe.
+                self.allocator.free(claims.sub);
+            }
+
             var matched: ?Handler = null;
             for (self.handlers.items) |h| {
                 if (std.mem.eql(u8, h.name, method)) {

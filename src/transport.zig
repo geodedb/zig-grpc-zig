@@ -38,6 +38,39 @@ pub fn writeRequestHeaders(
     return writeRequestHeadersWithMetadata(allocator, method_path, authority, null);
 }
 
+/// Number of bytes needed to encode `value` as an HPACK 7-bit-prefix
+/// integer (RFC 7541 §5.1) starting at the prefix byte. Used to size
+/// length fields for HPACK string literals (the prefix is the H-bit +
+/// 7-bit length form).
+fn hpackInt7Len(value: usize) usize {
+    if (value < 127) return 1;
+    var n = value - 127;
+    var bytes: usize = 2; // prefix byte + at least one continuation
+    while (n >= 128) : (n >>= 7) bytes += 1;
+    return bytes;
+}
+
+/// Encode `value` as an HPACK 7-bit-prefix integer into `out`. Returns
+/// the number of bytes written. Caller must pass `prefix_high_bits`
+/// (the bits ORed into the first byte's top, e.g. 0x00 for plain string
+/// length, since the H-bit-clear form is the only one we emit).
+fn hpackInt7Encode(out: []u8, prefix_high_bits: u8, value: usize) usize {
+    if (value < 127) {
+        out[0] = prefix_high_bits | @as(u8, @intCast(value));
+        return 1;
+    }
+    out[0] = prefix_high_bits | 0x7F; // 7-bit prefix saturated
+    var n = value - 127;
+    var i: usize = 1;
+    while (n >= 128) : (n >>= 7) {
+        out[i] = @as(u8, @intCast((n & 0x7F) | 0x80));
+        i += 1;
+    }
+    out[i] = @as(u8, @intCast(n));
+    i += 1;
+    return i;
+}
+
 /// Like `writeRequestHeaders` but also encodes per-RPC metadata after the
 /// canonical request headers. Each metadata entry is emitted as an HPACK
 /// Literal-with-Incremental-Indexing header with a literal name (0x40
@@ -46,6 +79,10 @@ pub fn writeRequestHeaders(
 /// Closes GAP-0002: prior to this helper the legacy `GrpcClient.call`
 /// constructed a `headers` map but threw it away — `authorization` and
 /// any other client-supplied metadata never reached the wire.
+///
+/// Names and values longer than 126 bytes are encoded with multi-byte
+/// HPACK 7-bit-prefix varints (RFC 7541 §5.1). This is required for JWT
+/// authorization values, which are typically ~150+ bytes.
 ///
 /// Caller owns the returned slice.
 pub fn writeRequestHeadersWithMetadata(
@@ -69,11 +106,8 @@ pub fn writeRequestHeadersWithMetadata(
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             const value = entry.value_ptr.*;
-            // Each metadata entry: 1 (0x40) + 1 (name_len varint, names <128)
-            //   + name + 1 (value_len varint, values <128) + value.
-            // Reject overlong names/values rather than silently mis-encoding.
-            if (name.len > 127 or value.len > 127) return TransportError.InvalidHeader;
-            total += 1 + 1 + name.len + 1 + value.len;
+            total += 1 // 0x40 prefix
+                + hpackInt7Len(name.len) + name.len + hpackInt7Len(value.len) + value.len;
         }
     }
 
@@ -134,12 +168,10 @@ pub fn writeRequestHeadersWithMetadata(
             const value = entry.value_ptr.*;
             out[i] = 0x40; // LIE, literal name (name index 0)
             i += 1;
-            out[i] = @intCast(name.len);
-            i += 1;
+            i += hpackInt7Encode(out[i..], 0x00, name.len);
             @memcpy(out[i .. i + name.len], name);
             i += name.len;
-            out[i] = @intCast(value.len);
-            i += 1;
+            i += hpackInt7Encode(out[i..], 0x00, value.len);
             @memcpy(out[i .. i + value.len], value);
             i += value.len;
         }
@@ -214,6 +246,13 @@ pub const Transport = struct {
     /// The gRPC method path extracted from the last HEADERS frame (e.g. "/geode.GeodeService/Handshake")
     last_method: [256]u8 = .{0} ** 256,
     last_method_len: usize = 0,
+    /// The `authorization` header value extracted from the last HEADERS
+    /// frame. Empty when absent. Bounded buffer — values longer than
+    /// `last_authorization.len` are truncated; the auth gate then rejects
+    /// the truncated form on signature mismatch (still safe). Closes
+    /// GAP-0001 when consumed by the server's auth gate.
+    last_authorization: [1024]u8 = .{0} ** 1024,
+    last_authorization_len: usize = 0,
     /// HPACK dynamic table (ring buffer, newest entry at hpack_dyn_head)
     hpack_dyn: [HPACK_DYN_MAX]HpackDynEntry = [_]HpackDynEntry{.{}} ** HPACK_DYN_MAX,
     hpack_dyn_count: usize = 0,
@@ -808,10 +847,22 @@ pub const Transport = struct {
         return std.mem.eql(u8, data[r.consumed .. r.consumed + r.value], expected);
     }
 
-    /// Extract the :path header from HPACK-encoded payload.
-    /// Stores the result in last_method/last_method_len.
-    /// Tracks the HPACK dynamic table so indexed references to :path work.
+    /// Extract the :path and `authorization` headers from an HPACK-encoded
+    /// HEADERS payload.
+    ///
+    /// `:path` is stored in `last_method` / `last_method_len`.
+    /// `authorization` is stored in `last_authorization` / `last_authorization_len`.
+    /// `last_authorization_len` is reset to 0 every time a new HEADERS
+    /// frame is parsed, so a request without `authorization` produces an
+    /// empty value (the auth gate then rejects it as MalformedToken).
+    ///
+    /// Tracks the HPACK dynamic table so indexed references to :path work
+    /// across requests on the same connection.
     fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
+        // Reset authorization on every request so a previous request's
+        // value can't leak into a new one on the same connection.
+        self.last_authorization_len = 0;
+
         var pos: usize = 0;
         var found_path = false;
         while (pos < payload.len) {
@@ -837,10 +888,14 @@ pub const Transport = struct {
                 pos += r.consumed;
                 const name_idx = r.value;
                 var is_path_header = (name_idx == 4 or name_idx == 5);
+                // HPACK static table index 23 is `authorization` (RFC 7541
+                // Appendix A). We also recognise the LIE-literal-name form.
+                var is_auth_header = (name_idx == 23);
                 if (name_idx == 0) {
-                    // Literal name — check if it's ":path" before skipping
-                    if (!is_path_header) {
+                    // Literal name — check if it's ":path" or "authorization" before skipping
+                    if (!is_path_header and !is_auth_header) {
                         is_path_header = hpackStringIs(payload[pos..], ":path");
+                        is_auth_header = hpackStringIs(payload[pos..], "authorization");
                     }
                     pos += hpackSkipString(payload[pos..]);
                 }
@@ -856,6 +911,10 @@ pub const Transport = struct {
                     pos += hpackSkipString(payload[pos..]);
                     self.hpackDynPush(true);
                     found_path = true;
+                } else if (is_auth_header) {
+                    self.setAuthorizationFromHpackString(payload[pos..]);
+                    pos += hpackSkipString(payload[pos..]);
+                    self.hpackDynPush(false);
                 } else {
                     pos += hpackSkipString(payload[pos..]);
                     self.hpackDynPush(false);
@@ -867,9 +926,11 @@ pub const Transport = struct {
                 pos += r.consumed;
                 const name_idx = r.value;
                 var is_path_hdr = (name_idx == 4 or name_idx == 5);
+                var is_auth_hdr = (name_idx == 23);
                 if (name_idx == 0) {
-                    if (!is_path_hdr) {
+                    if (!is_path_hdr and !is_auth_hdr) {
                         is_path_hdr = hpackStringIs(payload[pos..], ":path");
+                        is_auth_hdr = hpackStringIs(payload[pos..], "authorization");
                     }
                     pos += hpackSkipString(payload[pos..]);
                 }
@@ -877,6 +938,8 @@ pub const Transport = struct {
                 if (is_path_hdr) {
                     self.setPathFromHpackString(payload[pos..]);
                     found_path = true;
+                } else if (is_auth_hdr) {
+                    self.setAuthorizationFromHpackString(payload[pos..]);
                 }
                 pos += hpackSkipString(payload[pos..]);
             } else if (byte & 0xE0 == 0x20) {
@@ -909,6 +972,32 @@ pub const Transport = struct {
             // Huffman encoded — decode using RFC 7541 table
             self.last_method_len = huffmanDecode(str_bytes, &self.last_method);
         }
+    }
+
+    /// Read an HPACK string at position and copy it into `last_authorization`.
+    /// Mirror of setPathFromHpackString — used by the GAP-0001 auth gate.
+    fn setAuthorizationFromHpackString(self: *Transport, data: []const u8) void {
+        if (data.len == 0) return;
+        const is_huffman = (data[0] & 0x80) != 0;
+        const r = hpackDecodeInt(data, 7);
+        const str_start = r.consumed;
+        const str_len = r.value;
+        if (str_start + str_len > data.len) return;
+        const str_bytes = data[str_start .. str_start + str_len];
+
+        if (!is_huffman) {
+            const copy_len = @min(str_len, self.last_authorization.len);
+            @memcpy(self.last_authorization[0..copy_len], str_bytes[0..copy_len]);
+            self.last_authorization_len = copy_len;
+        } else {
+            self.last_authorization_len = huffmanDecode(str_bytes, &self.last_authorization);
+        }
+    }
+
+    /// Return the `authorization` header value extracted from the last
+    /// HEADERS frame, or an empty slice if none was present.
+    pub fn lastAuthorization(self: *Transport) []const u8 {
+        return self.last_authorization[0..self.last_authorization_len];
     }
 
     /// Write a single gRPC response message in a server stream.

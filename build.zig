@@ -244,6 +244,22 @@ pub fn build(b: *std.Build) void {
     const dispatch_test_step = b.step("dispatch-test", "Build the path-based dispatch test");
     dispatch_test_step.dependOn(&install_dispatch_test.step);
 
+    // Server-side auth-gate test (closes GAP-0001 / #2). Uses
+    // `requireAuth = true` and verifies that valid tokens pass, missing
+    // tokens get UNAUTHENTICATED (16), and tampered tokens get the same.
+    const auth_gate_test = b.addExecutable(.{
+        .name = "grpc-auth-gate-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/auth_gate_test_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    auth_gate_test.root_module.linkLibrary(zlib_lib);
+    const install_auth_gate_test = b.addInstallArtifact(auth_gate_test, .{});
+    const auth_gate_test_step = b.step("auth-gate-test", "Build the server-side auth gate test");
+    auth_gate_test_step.dependOn(&install_auth_gate_test.step);
+
     // Interop wire-codec unit tests.
     const interop_codec_tests = b.addTest(.{
         .name = "interop-codec-tests",
