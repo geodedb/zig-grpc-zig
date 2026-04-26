@@ -273,10 +273,7 @@ pub const Transport = struct {
     stream: net.Stream,
     io: std.Io,
     tls_io: ?TlsIo = null,
-    read_buf: []u8,
-    write_buf: []u8,
     allocator: std.mem.Allocator,
-    http2_conn: ?http2.connection.Connection,
     /// Track the stream ID from the client's HEADERS frame for responses
     last_stream_id: u31,
     /// HTTP/2 `:authority` header value used by client write paths.
@@ -342,68 +339,44 @@ pub const Transport = struct {
     flow_cv: std.Io.Condition = .init,
 
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
-        const read_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(read_buf);
-        const write_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(write_buf);
         const authority_owned = try allocator.dupe(u8, authority);
         errdefer allocator.free(authority_owned);
 
         var trans = Transport{
             .stream = stream_,
             .io = io,
-            .read_buf = read_buf,
-            .write_buf = write_buf,
             .allocator = allocator,
-            .http2_conn = null,
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
             .authority = authority_owned,
         };
 
-        // Initialize HTTP/2 connection
-        trans.http2_conn = try http2.connection.Connection.init(allocator);
-        errdefer trans.http2_conn.?.deinit();
         try trans.setupHttp2Client();
 
         return trans;
     }
 
     pub fn initServer(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream) !Transport {
-        const read_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(read_buf);
-        const write_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(write_buf);
         const authority_owned = try allocator.dupe(u8, "");
         errdefer allocator.free(authority_owned);
 
         var trans = Transport{
             .stream = stream_,
             .io = io,
-            .read_buf = read_buf,
-            .write_buf = write_buf,
             .allocator = allocator,
-            .http2_conn = null,
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
             .authority = authority_owned,
         };
 
-        // Initialize HTTP/2 connection
-        trans.http2_conn = try http2.connection.Connection.init(allocator);
-        errdefer trans.http2_conn.?.deinit();
         try trans.setupHttp2Server();
 
         return trans;
     }
 
     pub fn initServerTls(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, tls_io_: TlsIo) !Transport {
-        const read_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(read_buf);
-        const write_buf = try allocator.alloc(u8, 1024 * 64);
-        errdefer allocator.free(write_buf);
         const authority_owned = try allocator.dupe(u8, "");
         errdefer allocator.free(authority_owned);
 
@@ -411,10 +384,7 @@ pub const Transport = struct {
             .stream = stream_,
             .io = io,
             .tls_io = tls_io_,
-            .read_buf = read_buf,
-            .write_buf = write_buf,
             .allocator = allocator,
-            .http2_conn = null,
             .last_stream_id = 1,
             .last_method = .{0} ** 256,
             .last_method_len = 0,
@@ -424,9 +394,6 @@ pub const Transport = struct {
         // SSL object and SslConn allocation.
         errdefer tls_io_.close_fn(tls_io_.ctx);
 
-        // Initialize HTTP/2 connection
-        trans.http2_conn = try http2.connection.Connection.init(allocator);
-        errdefer trans.http2_conn.?.deinit();
         try trans.setupHttp2Server();
 
         return trans;
@@ -466,11 +433,6 @@ pub const Transport = struct {
     }
 
     pub fn deinit(self: *Transport) void {
-        if (self.http2_conn) |*conn| {
-            conn.deinit();
-        }
-        self.allocator.free(self.read_buf);
-        self.allocator.free(self.write_buf);
         self.allocator.free(self.authority);
         self.ioClose();
     }

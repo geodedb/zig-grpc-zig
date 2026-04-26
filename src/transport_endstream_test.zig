@@ -48,10 +48,6 @@ const Capture = struct {
 /// assertion we only need the write path, so we skip `initServer`/`initClient`
 /// and assemble the struct directly.
 fn buildCapturingTransport(allocator: std.mem.Allocator, capture: *Capture) !transport.Transport {
-    const read_buf = try allocator.alloc(u8, 64);
-    errdefer allocator.free(read_buf);
-    const write_buf = try allocator.alloc(u8, 64);
-    errdefer allocator.free(write_buf);
     const authority_owned = try allocator.dupe(u8, "");
     errdefer allocator.free(authority_owned);
 
@@ -64,10 +60,7 @@ fn buildCapturingTransport(allocator: std.mem.Allocator, capture: *Capture) !tra
             .write_fn = Capture.writeFn,
             .close_fn = Capture.closeFn,
         },
-        .read_buf = read_buf,
-        .write_buf = write_buf,
         .allocator = allocator,
-        .http2_conn = null,
         .last_stream_id = 1,
         .last_method = .{0} ** 256,
         .last_method_len = 0,
@@ -76,8 +69,6 @@ fn buildCapturingTransport(allocator: std.mem.Allocator, capture: *Capture) !tra
 }
 
 fn freeTransport(t: *transport.Transport) void {
-    t.allocator.free(t.read_buf);
-    t.allocator.free(t.write_buf);
     t.allocator.free(t.authority);
 }
 

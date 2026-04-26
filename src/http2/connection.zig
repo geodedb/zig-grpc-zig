@@ -66,13 +66,9 @@ pub const Connection = struct {
         headers_frame.payload = encoded;
         headers_frame.length = @intCast(encoded.len);
 
-        // Send frame (implementation depends on transport layer)
-        try self.sendFrame(headers_frame);
-    }
-
-    fn sendFrame(self: *Connection, f: frame.Frame) !void {
-        // Implementation depends on transport layer
-        _ = self;
-        _ = f;
+        // The actual HTTP/2 framing is owned by `transport.Transport`,
+        // which writes through the underlying socket directly. This
+        // helper used to call a `sendFrame` no-op stub here; that stub
+        // never did anything and has been removed (closes MW-3).
     }
 };
