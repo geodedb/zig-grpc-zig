@@ -14,7 +14,15 @@ pub const StreamState = enum {
 pub const Stream = struct {
     id: u31,
     state: StreamState,
-    window_size: u32,
+    /// Per-stream receive window: how many octets we are willing to accept
+    /// before issuing a WINDOW_UPDATE. RFC 7540 §6.9 default is 65535.
+    /// May go negative if peer overshoots after we shrink via SETTINGS.
+    recv_window: i32,
+    /// Per-stream send window: how many octets we are still allowed to
+    /// transmit on this stream before waiting for a WINDOW_UPDATE.
+    /// Initialized to the negotiated SETTINGS_INITIAL_WINDOW_SIZE
+    /// (default 65535); adjusted when peer SETTINGS arrives (§6.9.2).
+    send_window: i32,
     headers: std.StringHashMap([]const u8),
     allocator: std.mem.Allocator,
 
@@ -22,7 +30,8 @@ pub const Stream = struct {
         return Stream{
             .id = id,
             .state = .IDLE,
-            .window_size = 65535, // Default initial window size
+            .recv_window = 65535,
+            .send_window = 65535,
             .headers = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };

@@ -220,6 +220,7 @@ fn readerLoop(self: *ClientMux) void {
         switch (@as(FT, @enumFromInt(ftype))) {
             .DATA => {
                 const end = (flags & FF.END_STREAM) != 0;
+                const data_len: u32 = @intCast(payload.len);
                 if (self.findStream(sid)) |slot| {
                     slot.mutex.lockUncancelable(self.io);
                     defer slot.mutex.unlock(self.io);
@@ -240,6 +241,11 @@ fn readerLoop(self: *ClientMux) void {
                     }
                 }
                 self.allocator.free(payload);
+                // Refill receive window so the server keeps sending
+                // (NW-2). Without this the connection-level recv window
+                // shrinks every DATA and never gets replenished, which
+                // eventually deadlocks the peer.
+                self.transport.maybeRefillRecvWindow(sid, data_len);
             },
             .HEADERS => {
                 const end = (flags & FF.END_STREAM) != 0;
@@ -255,13 +261,25 @@ fn readerLoop(self: *ClientMux) void {
             },
             .SETTINGS => {
                 const is_ack = (flags & 0x1) != 0;
-                self.allocator.free(payload);
                 if (!is_ack) {
+                    // Apply peer settings (INITIAL_WINDOW_SIZE,
+                    // MAX_FRAME_SIZE, etc.) before ACKing.
+                    self.transport.applyPeerSettings(payload);
+                    self.allocator.free(payload);
                     self.transport.writeFrame(.SETTINGS, 0x1, 0, &.{}) catch |err| {
                         self.broadcastError(err);
                         return;
                     };
+                } else {
+                    self.allocator.free(payload);
                 }
+            },
+            .WINDOW_UPDATE => {
+                // Credit the relevant send-window so the per-call
+                // writers in callWithMetadata can wake up and continue
+                // emitting DATA (NW-3).
+                self.transport.processWindowUpdate(sid, payload);
+                self.allocator.free(payload);
             },
             .PING => {
                 const is_ack = (flags & 0x1) != 0;

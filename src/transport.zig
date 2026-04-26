@@ -40,6 +40,22 @@ pub const HTTP2_ERROR_PROTOCOL_ERROR: u32 = 0x01;
 pub const HTTP2_ERROR_FRAME_SIZE_ERROR: u32 = 0x06;
 pub const HTTP2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x03;
 
+/// RFC 7540 §6.9.2 default initial window size for both connection and
+/// new streams. Until the peer sends SETTINGS we assume this value.
+pub const INITIAL_WINDOW_SIZE_DEFAULT: i32 = 65535;
+
+/// What we ourselves advertise as SETTINGS_INITIAL_WINDOW_SIZE on
+/// startup — gives streams a 1 MiB receive credit by default so a
+/// well-behaved peer doesn't have to wait every 64 KiB for a
+/// WINDOW_UPDATE round-trip.
+pub const ADVERTISED_INITIAL_WINDOW_SIZE: i32 = 1024 * 1024;
+
+/// Cap on the per-Transport flow-control table size. Stream ids above
+/// this fall through to connection-window-only accounting; in practice
+/// no real gRPC client opens >1024 concurrent streams on one TCP
+/// connection.
+pub const MAX_TRACKED_STREAMS: usize = 1024;
+
 /// Build the HPACK-encoded HEADERS payload for a CLIENT request. The
 /// caller owns the returned slice and must free it with `allocator`.
 ///
@@ -296,6 +312,34 @@ pub const Transport = struct {
     /// default 16384 and updated when the peer sends a SETTINGS frame
     /// with parameter id 0x05. Closes I3.
     max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
+    /// Connection-level send window. Decremented when we transmit DATA;
+    /// incremented when peer sends WINDOW_UPDATE on stream 0 (§6.9).
+    conn_send_window: i32 = INITIAL_WINDOW_SIZE_DEFAULT,
+    /// Connection-level receive window. Decremented as we consume
+    /// inbound DATA; we restore credit by emitting WINDOW_UPDATE on
+    /// stream 0 once it falls below threshold.
+    conn_recv_window: i32 = INITIAL_WINDOW_SIZE_DEFAULT,
+    /// Currently advertised initial window size for new streams. We
+    /// announce ADVERTISED_INITIAL_WINDOW_SIZE in our SETTINGS so peers
+    /// know they can send us up to that many octets per stream before a
+    /// WINDOW_UPDATE.
+    our_initial_window_size: i32 = ADVERTISED_INITIAL_WINDOW_SIZE,
+    /// The peer-advertised SETTINGS_INITIAL_WINDOW_SIZE value last seen.
+    /// Used to compute the §6.9.2 delta when peer sends a fresh SETTINGS.
+    peer_initial_window_size: i32 = INITIAL_WINDOW_SIZE_DEFAULT,
+    /// Per-stream send and receive windows. Tracked here (rather than on
+    /// the legacy stream.Stream) so flow-control state is reachable from
+    /// the Transport's read/write loops without a parallel hash map per
+    /// connection. Bounded at MAX_TRACKED_STREAMS to keep the table size
+    /// predictable; stream ids beyond that fall back to the connection
+    /// window only (a safe over-estimate for short-lived calls).
+    stream_send_windows: [MAX_TRACKED_STREAMS]i32 = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS,
+    stream_recv_windows: [MAX_TRACKED_STREAMS]i32 = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS,
+    /// Coordinates blocking writers waiting for additional send-window
+    /// credit (peer sent WINDOW_UPDATE) without busy-spinning. The
+    /// reader thread broadcasts on this whenever it credits any window.
+    flow_mutex: std.Io.Mutex = .init,
+    flow_cv: std.Io.Condition = .init,
 
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
@@ -435,14 +479,84 @@ pub const Transport = struct {
         // Client sends HTTP/2 connection preface
         _ = try self.ioWrite(http2.connection.Connection.PREFACE);
 
-        // Send initial SETTINGS frame
-        const settings_header: [9]u8 = .{
-            0,                                            0, 0, // length: 0 (no settings parameters)
-            @intFromEnum(http2.frame.FrameType.SETTINGS),
-            0, // flags: none
-            0, 0, 0, 0, // stream_id: 0
-        };
-        _ = try self.ioWrite(&settings_header);
+        // Send initial SETTINGS frame advertising our non-default values
+        // (INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_CONCURRENT_STREAMS,
+        // MAX_HEADER_LIST_SIZE) — closes GAP-0004 / NW-1.
+        const body = try buildInitialSettingsBody(self.allocator);
+        defer self.allocator.free(body);
+        try self.writeFrame(.SETTINGS, 0, 0, body);
+
+        // Immediately credit the connection-level recv window from the
+        // RFC default (65535) up to ADVERTISED_INITIAL_WINDOW_SIZE so a
+        // single big request doesn't have to interleave WINDOW_UPDATE
+        // round-trips with the application's write→read pattern. This
+        // is what mainline implementations (grpc-go, h2load, nghttp2)
+        // do at startup.
+        try self.bumpConnectionRecvWindow();
+
+        // Drain server's initial control frames (SETTINGS, ACK,
+        // WINDOW_UPDATE) before returning. The single-threaded
+        // GrpcClient writes the entire request before reading any
+        // response, so we MUST seed conn_send_window from the server's
+        // bump WINDOW_UPDATE before the first DATA write blocks. The
+        // legacy multiplexed ClientMux already runs a reader thread
+        // and would have processed these asynchronously.
+        try self.consumeInitialServerFrames();
+    }
+
+    /// Best-effort drain of the server's initial control frames after
+    /// the SETTINGS exchange. We need to consume:
+    ///   * server SETTINGS (non-ACK)  — applies INITIAL_WINDOW_SIZE etc.
+    ///   * SETTINGS ACK                — for our SETTINGS
+    ///   * server WINDOW_UPDATE        — credits our conn_send_window
+    ///
+    /// The relative ordering of ACK vs. the server's own non-ACK
+    /// SETTINGS / WINDOW_UPDATE isn't guaranteed: a server might emit
+    /// its SETTINGS, then ACK ours, then send WINDOW_UPDATE — so we
+    /// can't stop on the ACK or we lose the credit. Track all three
+    /// expected frames and exit when all have been observed (or when
+    /// our small budget is exhausted, leaving any remaining work for
+    /// the application's read loop).
+    fn consumeInitialServerFrames(self: *Transport) !void {
+        var got_ack = false;
+        var got_settings = false;
+        var got_window_update = false;
+        var max_frames: u8 = 16;
+        while (max_frames > 0 and !(got_ack and got_settings and got_window_update)) : (max_frames -= 1) {
+            const frame = try self.readFrame();
+            defer self.allocator.free(frame.payload);
+            switch (frame.frame_type) {
+                @intFromEnum(http2.frame.FrameType.SETTINGS) => {
+                    const is_ack = (frame.flags & 0x1) != 0;
+                    if (is_ack) {
+                        got_ack = true;
+                    } else {
+                        got_settings = true;
+                        self.applyPeerSettings(frame.payload);
+                        // ACK the server's SETTINGS.
+                        try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
+                    }
+                },
+                @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
+                    got_window_update = true;
+                    self.processWindowUpdate(frame.stream_id, frame.payload);
+                },
+                @intFromEnum(http2.frame.FrameType.PING) => {
+                    const is_ack = (frame.flags & 0x1) != 0;
+                    if (!is_ack) {
+                        var ping_data: [8]u8 = .{0} ** 8;
+                        const copy_len = @min(frame.payload.len, 8);
+                        @memcpy(ping_data[0..copy_len], frame.payload[0..copy_len]);
+                        try self.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]);
+                    }
+                },
+                else => {
+                    // Unexpected frame this early; let the application
+                    // handle it on the next read.
+                    break;
+                },
+            }
+        }
     }
 
     /// Read exactly `buf.len` bytes from the stream, handling partial reads.
@@ -471,6 +585,129 @@ pub const Transport = struct {
     /// the negotiated max — closes I3.
     pub fn checkFrameSize(length: u32, max: u32) TransportError!void {
         if (length > max) return TransportError.FrameSizeError;
+    }
+
+    /// Initialize the flow-control fields of an arbitrary Transport
+    /// pointer in-place. Used only by unit tests that don't want to
+    /// stand up a full Transport (no socket / allocator). Sets exactly
+    /// the fields the flow-control unit tests inspect.
+    pub fn initFlowControlForTest(t: *Transport) void {
+        t.conn_send_window = INITIAL_WINDOW_SIZE_DEFAULT;
+        t.conn_recv_window = INITIAL_WINDOW_SIZE_DEFAULT;
+        t.our_initial_window_size = ADVERTISED_INITIAL_WINDOW_SIZE;
+        t.peer_initial_window_size = INITIAL_WINDOW_SIZE_DEFAULT;
+        t.stream_send_windows = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS;
+        t.stream_recv_windows = [_]i32{INITIAL_WINDOW_SIZE_DEFAULT} ** MAX_TRACKED_STREAMS;
+    }
+
+    /// Apply a WINDOW_UPDATE increment to a flow-control window pointer.
+    /// RFC 7540 §6.9.1:
+    ///   * Increment of 0 is a PROTOCOL_ERROR.
+    ///   * Resulting window must not exceed 2^31-1; otherwise
+    ///     FLOW_CONTROL_ERROR.
+    pub fn applyWindowUpdate(window: *i32, increment: u32) error{ ProtocolError, FlowControlError }!void {
+        if (increment == 0) return error.ProtocolError;
+        // The increment is a 31-bit unsigned per spec (top bit reserved),
+        // so it fits in i64 without truncation.
+        const new_val: i64 = @as(i64, window.*) + @as(i64, @intCast(increment));
+        if (new_val > std.math.maxInt(i32)) return error.FlowControlError;
+        window.* = @intCast(new_val);
+    }
+
+    /// Should we proactively emit a WINDOW_UPDATE for this side? We do
+    /// so once `current` falls below half of the advertised initial
+    /// window — strikes a balance between credit-restore round-trips
+    /// and giving the peer enough headroom to keep streaming.
+    pub fn shouldEmitWindowUpdate(current: i32, initial: i32) bool {
+        return current < @divFloor(initial, 2);
+    }
+
+    /// §6.9.2 stream window adjustment when peer changes
+    /// SETTINGS_INITIAL_WINDOW_SIZE: each existing stream's send window
+    /// is shifted by `new - old`. May leave the window negative.
+    pub fn applyInitialWindowSizeDelta(send_window: *i32, old_initial: i32, new_initial: i32) void {
+        const delta: i64 = @as(i64, new_initial) - @as(i64, old_initial);
+        const new_val: i64 = @as(i64, send_window.*) + delta;
+        // Clamp at i32 bounds (callers that need to reject overflow use
+        // applyInitialWindowSizeDeltaChecked instead).
+        if (new_val > std.math.maxInt(i32)) {
+            send_window.* = std.math.maxInt(i32);
+        } else if (new_val < std.math.minInt(i32)) {
+            send_window.* = std.math.minInt(i32);
+        } else {
+            send_window.* = @intCast(new_val);
+        }
+    }
+
+    /// Same as `applyInitialWindowSizeDelta` but rejects overflow with
+    /// FLOW_CONTROL_ERROR per §6.9.2.
+    pub fn applyInitialWindowSizeDeltaChecked(
+        send_window: *i32,
+        old_initial: i32,
+        new_initial: u32,
+    ) error{FlowControlError}!void {
+        if (new_initial > @as(u32, std.math.maxInt(i32))) return error.FlowControlError;
+        const new_signed: i32 = @intCast(new_initial);
+        const delta: i64 = @as(i64, new_signed) - @as(i64, old_initial);
+        const new_val: i64 = @as(i64, send_window.*) + delta;
+        if (new_val > std.math.maxInt(i32)) return error.FlowControlError;
+        if (new_val < std.math.minInt(i32)) return error.FlowControlError;
+        send_window.* = @intCast(new_val);
+    }
+
+    /// Build the body (no frame header) of our initial SETTINGS frame.
+    /// We advertise four non-default values:
+    ///   INITIAL_WINDOW_SIZE        = 1 MiB
+    ///   MAX_FRAME_SIZE             = 16384  (RFC default; explicit for
+    ///                                        peers that don't assume
+    ///                                        the default)
+    ///   MAX_CONCURRENT_STREAMS     = 100
+    ///   MAX_HEADER_LIST_SIZE       = 8192
+    pub fn buildInitialSettingsBody(allocator: std.mem.Allocator) ![]u8 {
+        const entries = [_]struct { id: u16, value: u32 }{
+            .{ .id = SETTINGS_INITIAL_WINDOW_SIZE, .value = @intCast(ADVERTISED_INITIAL_WINDOW_SIZE) },
+            .{ .id = SETTINGS_MAX_FRAME_SIZE, .value = DEFAULT_MAX_FRAME_SIZE },
+            .{ .id = SETTINGS_MAX_CONCURRENT_STREAMS, .value = 100 },
+            .{ .id = SETTINGS_MAX_HEADER_LIST_SIZE, .value = 8192 },
+        };
+        var bytes = try allocator.alloc(u8, entries.len * 6);
+        errdefer allocator.free(bytes);
+        var i: usize = 0;
+        for (entries) |e| {
+            bytes[i] = @intCast((e.id >> 8) & 0xFF);
+            bytes[i + 1] = @intCast(e.id & 0xFF);
+            bytes[i + 2] = @intCast((e.value >> 24) & 0xFF);
+            bytes[i + 3] = @intCast((e.value >> 16) & 0xFF);
+            bytes[i + 4] = @intCast((e.value >> 8) & 0xFF);
+            bytes[i + 5] = @intCast(e.value & 0xFF);
+            i += 6;
+        }
+        return bytes;
+    }
+
+    /// Build a complete WINDOW_UPDATE frame (header + 4-byte payload).
+    /// `stream_id` of 0 credits the connection-level window; non-zero
+    /// credits a specific stream.
+    pub fn buildWindowUpdateFrame(allocator: std.mem.Allocator, stream_id: u31, increment: u32) ![]u8 {
+        var bytes = try allocator.alloc(u8, 13);
+        errdefer allocator.free(bytes);
+        // Header
+        bytes[0] = 0;
+        bytes[1] = 0;
+        bytes[2] = 4; // payload length
+        bytes[3] = @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE);
+        bytes[4] = 0; // flags
+        const sid: u32 = @intCast(stream_id);
+        bytes[5] = @intCast((sid >> 24) & 0x7F);
+        bytes[6] = @intCast((sid >> 16) & 0xFF);
+        bytes[7] = @intCast((sid >> 8) & 0xFF);
+        bytes[8] = @intCast(sid & 0xFF);
+        // Payload: 31-bit increment, top bit reserved (R) = 0
+        bytes[9] = @intCast((increment >> 24) & 0x7F);
+        bytes[10] = @intCast((increment >> 16) & 0xFF);
+        bytes[11] = @intCast((increment >> 8) & 0xFF);
+        bytes[12] = @intCast(increment & 0xFF);
+        return bytes;
     }
 
     /// Build the bytes for a connection-level GOAWAY frame announcing
@@ -507,6 +744,96 @@ pub const Transport = struct {
         return bytes;
     }
 
+    /// Process a peer WINDOW_UPDATE frame. The 4-byte payload is a
+    /// 31-bit increment (top bit reserved). Stream id 0 credits the
+    /// connection-level send window; non-zero credits a specific stream.
+    /// On any decoding / overflow error we log and drop the increment
+    /// rather than tearing the connection down — strict-mode peers can
+    /// always observe the missing credit and recover.
+    pub fn processWindowUpdate(self: *Transport, stream_id: u31, payload: []const u8) void {
+        if (payload.len != 4) return;
+        const increment: u32 = ((@as(u32, payload[0]) & 0x7F) << 24) |
+            (@as(u32, payload[1]) << 16) |
+            (@as(u32, payload[2]) << 8) |
+            @as(u32, payload[3]);
+        // Hold flow_mutex while updating the window AND broadcasting:
+        // std.Io.Condition.broadcast() is a no-op if no waiters are
+        // registered (the lost-wakeup race), so the writer side must
+        // observe the update under the same lock that protects its
+        // predicate check.
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        if (stream_id == 0) {
+            applyWindowUpdate(&self.conn_send_window, increment) catch return;
+        } else {
+            const idx: usize = @intCast(stream_id);
+            if (idx >= MAX_TRACKED_STREAMS) return;
+            applyWindowUpdate(&self.stream_send_windows[idx], increment) catch return;
+        }
+        // Wake any writers blocked on send credit.
+        self.flow_cv.broadcast(self.io);
+    }
+
+    /// Credit our connection-level receive window (and optionally a
+    /// stream's window) by emitting WINDOW_UPDATE frame(s) when below
+    /// threshold. Used after we consume an inbound DATA frame.
+    pub fn maybeRefillRecvWindow(self: *Transport, stream_id: u31, consumed: u32) void {
+        // Always shrink first, even if we don't end up emitting credit
+        // (so the cumulative consumed == cumulative credit eventually).
+        self.conn_recv_window -|= @intCast(consumed);
+        if (shouldEmitWindowUpdate(self.conn_recv_window, ADVERTISED_INITIAL_WINDOW_SIZE)) {
+            const credit: u32 = @intCast(@as(i64, ADVERTISED_INITIAL_WINDOW_SIZE) - @as(i64, self.conn_recv_window));
+            if (credit > 0) {
+                const bytes = buildWindowUpdateFrame(self.allocator, 0, credit) catch return;
+                defer self.allocator.free(bytes);
+                _ = self.ioWrite(bytes) catch return;
+                self.conn_recv_window = ADVERTISED_INITIAL_WINDOW_SIZE;
+            }
+        }
+
+        if (stream_id == 0) return;
+        const idx: usize = @intCast(stream_id);
+        if (idx >= MAX_TRACKED_STREAMS) return;
+        self.stream_recv_windows[idx] -|= @intCast(consumed);
+        if (shouldEmitWindowUpdate(self.stream_recv_windows[idx], ADVERTISED_INITIAL_WINDOW_SIZE)) {
+            const credit: u32 = @intCast(@as(i64, ADVERTISED_INITIAL_WINDOW_SIZE) - @as(i64, self.stream_recv_windows[idx]));
+            if (credit > 0) {
+                const bytes = buildWindowUpdateFrame(self.allocator, stream_id, credit) catch return;
+                defer self.allocator.free(bytes);
+                _ = self.ioWrite(bytes) catch return;
+                self.stream_recv_windows[idx] = ADVERTISED_INITIAL_WINDOW_SIZE;
+            }
+        }
+    }
+
+    /// Reserve `n` octets of send-window credit, blocking until both
+    /// the connection and per-stream send windows have enough headroom.
+    /// Decrements both windows by `n`. Caller must NOT hold flow_mutex.
+    fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) void {
+        if (n == 0) return;
+        const idx: ?usize = blk: {
+            if (stream_id == 0) break :blk null;
+            const i: usize = @intCast(stream_id);
+            if (i >= MAX_TRACKED_STREAMS) break :blk null;
+            break :blk i;
+        };
+
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+
+        while (true) {
+            const conn_avail = self.conn_send_window;
+            const stream_avail: i32 = if (idx) |i| self.stream_send_windows[i] else std.math.maxInt(i32);
+            const avail = @min(conn_avail, stream_avail);
+            if (avail >= @as(i32, @intCast(n))) {
+                self.conn_send_window -= @as(i32, @intCast(n));
+                if (idx) |i| self.stream_send_windows[i] -= @as(i32, @intCast(n));
+                return;
+            }
+            self.flow_cv.waitUncancelable(self.io, &self.flow_mutex);
+        }
+    }
+
     /// Send a GOAWAY frame with FRAME_SIZE_ERROR. Best-effort: ignores
     /// any write failure since we are about to tear the connection down.
     fn emitGoawayFrameSizeError(self: *Transport) void {
@@ -517,12 +844,14 @@ pub const Transport = struct {
 
     /// Apply the parameters in a peer SETTINGS frame payload. Each entry
     /// is a 6-byte big-endian (id:u16, value:u32) tuple per RFC 7540
-    /// §6.5.1. Unknown ids are ignored. We track:
-    ///   * SETTINGS_MAX_FRAME_SIZE (0x05) - clamp to the spec maximum
-    ///     (2^24-1) so a peer can't push us back below the default.
-    /// Order 8 (flow control) extends this to handle INITIAL_WINDOW_SIZE
-    /// adjustments. Other ids are accepted silently for now.
-    fn applyPeerSettings(self: *Transport, payload: []const u8) void {
+    /// §6.5.1. Unknown ids are ignored. We honour:
+    ///   * SETTINGS_MAX_FRAME_SIZE (0x05): clamp to spec range and apply
+    ///     to inbound enforcement.
+    ///   * SETTINGS_INITIAL_WINDOW_SIZE (0x04): §6.9.2 — adjust every
+    ///     existing stream's send window by `new - old`, clamping at
+    ///     i32 bounds (a strict implementation would emit
+    ///     FLOW_CONTROL_ERROR on overflow; we clamp for resilience).
+    pub fn applyPeerSettings(self: *Transport, payload: []const u8) void {
         var i: usize = 0;
         while (i + 6 <= payload.len) : (i += 6) {
             const id: u16 = (@as(u16, payload[i]) << 8) | @as(u16, payload[i + 1]);
@@ -541,6 +870,27 @@ pub const Transport = struct {
                         self.max_frame_size = 0xFFFFFF;
                     } else {
                         self.max_frame_size = value;
+                    }
+                },
+                SETTINGS_INITIAL_WINDOW_SIZE => {
+                    // §6.9.2: clamp to i32 range (top bit reserved). Apply
+                    // delta to every existing stream's send window.
+                    const new_initial: i32 = if (value > @as(u32, std.math.maxInt(i32)))
+                        std.math.maxInt(i32)
+                    else
+                        @intCast(value);
+                    const old_initial = self.peer_initial_window_size;
+                    if (new_initial != old_initial) {
+                        // See processWindowUpdate: hold flow_mutex while
+                        // updating + broadcasting to avoid the lost-wakeup
+                        // race with reserveSendCredit.
+                        self.flow_mutex.lockUncancelable(self.io);
+                        defer self.flow_mutex.unlock(self.io);
+                        for (&self.stream_send_windows) |*sw| {
+                            applyInitialWindowSizeDelta(sw, old_initial, new_initial);
+                        }
+                        self.peer_initial_window_size = new_initial;
+                        self.flow_cv.broadcast(self.io);
                     }
                 },
                 else => {},
@@ -619,15 +969,11 @@ pub const Transport = struct {
     }
 
     /// Write a DATA frame, fragmenting across multiple HTTP/2 DATA frames
-    /// when `payload` exceeds `max_frame_size`. The caller-supplied flags
-    /// are applied to the LAST fragment; intermediate fragments carry no
-    /// flags. Caller MUST hold `write_mutex`.
-    ///
-    /// I3 — required so writes don't violate the peer-advertised
-    /// SETTINGS_MAX_FRAME_SIZE on outbound. We use our own
-    /// `max_frame_size` as the cap because for now we apply a single
-    /// shared limit in both directions; Order 8 separates inbound /
-    /// outbound limits properly.
+    /// when `payload` exceeds `max_frame_size`. The caller-supplied
+    /// flags are applied to the LAST fragment; intermediate fragments
+    /// carry no flags. Caller MUST hold `write_mutex` AND have already
+    /// reserved enough send-window credit via `reserveSendCredit` (or
+    /// equivalent) for the entire payload — this fn does NOT block.
     fn writeDataFragmentedLocked(
         self: *Transport,
         stream_id: u31,
@@ -635,7 +981,7 @@ pub const Transport = struct {
         payload: []const u8,
     ) !void {
         const max: usize = @intCast(self.max_frame_size);
-        if (payload.len <= max) {
+        if (payload.len == 0) {
             try self.writeFrameLocked(.DATA, flags, stream_id, payload);
             return;
         }
@@ -672,11 +1018,33 @@ pub const Transport = struct {
         // readFrame() calls honour the negotiated cap.
         self.applyPeerSettings(frame.payload);
 
-        // Send server's SETTINGS frame (empty = use defaults)
-        try self.writeFrame(.SETTINGS, 0, 0, &.{});
+        // Send server's SETTINGS frame advertising our non-default values
+        // (INITIAL_WINDOW_SIZE = 1 MiB, MAX_FRAME_SIZE = 16384, etc.) —
+        // closes GAP-0004 / NW-1.
+        const body = try buildInitialSettingsBody(self.allocator);
+        defer self.allocator.free(body);
+        try self.writeFrame(.SETTINGS, 0, 0, body);
 
         // Send SETTINGS ACK for client's settings
         try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
+
+        // Immediately credit our connection-level recv window from the
+        // RFC default (65535) up to ADVERTISED_INITIAL_WINDOW_SIZE — see
+        // setupHttp2Client comment.
+        try self.bumpConnectionRecvWindow();
+    }
+
+    /// Emit a WINDOW_UPDATE on stream 0 to credit our connection-level
+    /// receive window from the RFC default (65535) up to
+    /// ADVERTISED_INITIAL_WINDOW_SIZE. Called once during HTTP/2 setup.
+    fn bumpConnectionRecvWindow(self: *Transport) !void {
+        const credit_i64: i64 = @as(i64, ADVERTISED_INITIAL_WINDOW_SIZE) - @as(i64, INITIAL_WINDOW_SIZE_DEFAULT);
+        if (credit_i64 <= 0) return;
+        const credit: u32 = @intCast(credit_i64);
+        const bytes = try buildWindowUpdateFrame(self.allocator, 0, credit);
+        defer self.allocator.free(bytes);
+        _ = try self.ioWrite(bytes);
+        self.conn_recv_window = ADVERTISED_INITIAL_WINDOW_SIZE;
     }
 
     /// Read the next gRPC message from the connection.
@@ -701,11 +1069,16 @@ pub const Transport = struct {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
                     // Append this fragment; the gRPC message may have
                     // been split across multiple HTTP/2 DATA frames.
+                    const data_len: u32 = @intCast(payload.len);
                     grpc_buf.appendSlice(self.allocator, payload) catch {
                         self.allocator.free(payload);
                         return error.OutOfMemory;
                     };
                     self.allocator.free(payload);
+                    // Refill receive windows now that the bytes have
+                    // been consumed (NW-2: emit WINDOW_UPDATE when
+                    // either window dips below half its initial size).
+                    self.maybeRefillRecvWindow(frame.stream_id, data_len);
 
                     // Try to parse a complete gRPC message from the
                     // accumulated bytes.
@@ -749,7 +1122,9 @@ pub const Transport = struct {
                     continue;
                 },
                 @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
-                    // Flow control — acknowledge and continue
+                    // Credit the relevant send-window so blocked writers
+                    // can wake up and emit DATA (NW-3).
+                    self.processWindowUpdate(frame.stream_id, payload);
                     self.allocator.free(payload);
                     continue;
                 },
@@ -817,11 +1192,13 @@ pub const Transport = struct {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
                     if (end) saw_end = true;
+                    const data_len: u32 = @intCast(payload.len);
                     grpc_buf.appendSlice(self.allocator, payload) catch {
                         self.allocator.free(payload);
                         return error.OutOfMemory;
                     };
                     self.allocator.free(payload);
+                    self.maybeRefillRecvWindow(frame.stream_id, data_len);
                     if (grpc_buf.items.len < 5) {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;
@@ -859,6 +1236,7 @@ pub const Transport = struct {
                     continue;
                 },
                 @intFromEnum(http2.frame.FrameType.WINDOW_UPDATE) => {
+                    self.processWindowUpdate(frame.stream_id, payload);
                     self.allocator.free(payload);
                     continue;
                 },
@@ -1247,13 +1625,6 @@ pub const Transport = struct {
     pub fn writeStreamMessage(self: *Transport, message: []const u8, is_first: bool) !void {
         const sid = self.last_stream_id;
 
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-
-        if (is_first) {
-            try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &RESPONSE_HEADERS_BYTES);
-        }
-
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
@@ -1263,6 +1634,17 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
+
+        // Reserve send-window credit BEFORE acquiring write_mutex so we
+        // never block (waiting for peer WINDOW_UPDATE) while holding it.
+        self.reserveSendCredit(sid, @intCast(grpc_frame.len));
+
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
+        if (is_first) {
+            try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &RESPONSE_HEADERS_BYTES);
+        }
         try self.writeDataFragmentedLocked(sid, 0, grpc_frame);
     }
 
@@ -1361,11 +1743,6 @@ pub const Transport = struct {
     /// concurrent writers (multiple in-flight client calls) can't
     /// interleave their frames on the wire.
     pub fn writeMessageOnStream(self: *Transport, stream_id: u31, message: []const u8) !void {
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-
-        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &RESPONSE_HEADERS_BYTES);
-
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
@@ -1375,6 +1752,14 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
+
+        // Reserve send-window credit BEFORE acquiring write_mutex.
+        self.reserveSendCredit(stream_id, @intCast(grpc_frame.len));
+
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &RESPONSE_HEADERS_BYTES);
         try self.writeDataFragmentedLocked(stream_id, 0, grpc_frame);
 
         const trailers = [_]u8{
@@ -1447,11 +1832,6 @@ pub const Transport = struct {
         );
         defer self.allocator.free(headers_bytes);
 
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-
-        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, headers_bytes);
-
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
@@ -1461,6 +1841,14 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
+
+        // Reserve send-window credit BEFORE acquiring write_mutex.
+        self.reserveSendCredit(stream_id, @intCast(grpc_frame.len));
+
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, headers_bytes);
         try self.writeDataFragmentedLocked(stream_id, http2.frame.FrameFlags.END_STREAM, grpc_frame);
     }
 };

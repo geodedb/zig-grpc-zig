@@ -269,3 +269,42 @@ interop-cross:
   script:
     - chmod +x interop/scripts/run-pair.sh interop/scripts/run-matrix.sh
     - interop/scripts/run-matrix.sh
+
+# h2spec conformance test (closes part of GAP-0004 / NW-1+NW-2+NW-3 +
+# GitLab #5). h2spec is a Go binary — we install the upstream
+# v2.6.0 release tarball, start a Zig interop server in the background,
+# and run the generic + http2 test suites against it. A real protocol
+# regression here breaks the build on the default branch; for
+# cross-OS / preview pipelines the cross-os-rules guard keeps it
+# tolerant. If the SaaS runner image lacks curl/tar at this stage the
+# job will fail in `before_script`; that's logged as a blocker rather
+# than allowed to silently pass.
+interop-h2spec:
+  stage: interop
+  image: "ubuntu:24.04"
+  tags: ["company", "linux"]
+  needs: ["zig-build-0.16.0"]
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils python3 build-essential tar
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
+    - mkdir -p zig-out/bin
+    - zig build interop-server
+    # Fetch h2spec v2.6.0 (latest release as of Apr 2026).
+    - curl -fsSL https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz -o h2spec.tar.gz
+    - tar xzf h2spec.tar.gz
+    - chmod +x ./h2spec
+    - ./h2spec --version
+  script:
+    - ./zig-out/bin/grpc-interop-zig-server --port 50062 &
+    - ZIG_SERVER_PID=$!
+    - sleep 1
+    # Run h2spec generic + http2 sections against the Zig server. Any
+    # non-zero exit code fails the job. The skip list below records
+    # known-acceptable shortcomings; today the list is empty.
+    - ./h2spec --host 127.0.0.1 --port 50062 generic http2 -v
+    - SPEC_RC=$?
+    - kill $ZIG_SERVER_PID || true
+    - exit $SPEC_RC
