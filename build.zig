@@ -163,12 +163,26 @@ pub fn build(b: *std.Build) void {
     const run_endstream_tests = b.addRunArtifact(endstream_tests);
     test_step.dependOn(&run_endstream_tests.step);
 
+    // JWT/Auth tests for `features/auth.zig`.
+    const auth_tests = b.addTest(.{
+        .name = "auth-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/auth_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    auth_tests.root_module.linkLibrary(zlib_lib);
+    const run_auth_tests = b.addRunArtifact(auth_tests);
+    test_step.dependOn(&run_auth_tests.step);
+
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
     // from the full test execution.
     const check_step = b.step("check", "Compile lib + tests without running");
     check_step.dependOn(&tests.step);
     check_step.dependOn(&endstream_tests.step);
+    check_step.dependOn(&auth_tests.step);
 
     // Integration test server
     const integration_test_mod = b.createModule(.{

@@ -14,12 +14,14 @@ pub fn main() !void {
 
     std.debug.print("Generated token: {s}\n", .{token});
 
-    // Verify the token
-    try auth_handler.verifyToken(token);
-    std.debug.print("Token verified successfully\n", .{});
+    // Verify the token. Returns parsed claims on success — caller owns
+    // the duped `sub` slice.
+    const claims = try auth_handler.verifyToken(token);
+    defer allocator.free(claims.sub);
+    std.debug.print("Token verified successfully for sub={s}\n", .{claims.sub});
 
     // Try to verify an invalid token
-    auth_handler.verifyToken("invalid.token.here") catch |err| {
+    _ = auth_handler.verifyToken("invalid.token.here") catch |err| {
         std.debug.print("Expected error: {}\n", .{err});
     };
 }
