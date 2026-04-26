@@ -113,6 +113,36 @@ pub const TlsIo = struct {
     close_fn: *const fn (*anyopaque) void,
 };
 
+/// Pre-encoded HPACK payload for the gRPC server response HEADERS:
+///   :status: 200                           (static index 8 -> 0x88)
+///   content-type: application/grpc         (LIE name index 31 -> 0x5f, len 16)
+///
+/// Hoisted out of the duplicated literals previously embedded in
+/// `writeStreamMessage` and `writeMessageOnStream` (closes M1 partially —
+/// see GAP_ANALYSIS.md). Both call sites now reference this constant so a
+/// future change to the response header set has exactly one site to update.
+pub const RESPONSE_HEADERS_BYTES = [_]u8{
+    0x88, // :status: 200
+    0x40 | 31, // content-type LIE name index 31
+    16, // value length
+    'a',
+    'p',
+    'p',
+    'l',
+    'i',
+    'c',
+    'a',
+    't',
+    'i',
+    'o',
+    'n',
+    '/',
+    'g',
+    'r',
+    'p',
+    'c',
+};
+
 pub const Transport = struct {
     stream: net.Stream,
     io: std.Io,
@@ -836,28 +866,7 @@ pub const Transport = struct {
         defer self.write_mutex.unlock(self.io);
 
         if (is_first) {
-            const response_headers = [_]u8{
-                0x88, // :status: 200
-                0x40 | 31,
-                16,
-                'a',
-                'p',
-                'p',
-                'l',
-                'i',
-                'c',
-                'a',
-                't',
-                'i',
-                'o',
-                'n',
-                '/',
-                'g',
-                'r',
-                'p',
-                'c',
-            };
-            try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &response_headers);
+            try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, sid, &RESPONSE_HEADERS_BYTES);
         }
 
         const grpc_msg_len: u32 = @intCast(message.len);
@@ -881,6 +890,80 @@ pub const Transport = struct {
         try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &trailers);
     }
 
+    /// End a gRPC stream with a non-zero (or zero) status code and an
+    /// optional `grpc-message`. Emits a single trailer-only HEADERS frame
+    /// with END_STREAM | END_HEADERS, encoding `grpc-status` as decimal-ASCII
+    /// and (if provided) `grpc-message` as a literal value.
+    ///
+    /// Status codes per the gRPC core spec
+    /// (https://grpc.io/docs/guides/status-codes/):
+    ///   0  OK              2  UNKNOWN          12 UNIMPLEMENTED
+    ///   16 UNAUTHENTICATED 7  PERMISSION_DENIED ...
+    ///
+    /// Used by error paths (handler errors, missing/invalid auth, unknown
+    /// method) to give the client a definitive trailer instead of a closed
+    /// connection. `message` MUST fit in a 7-bit-prefix HPACK length (<128
+    /// bytes after any necessary truncation by the caller); longer messages
+    /// are truncated to 127 bytes to stay within that prefix.
+    pub fn endStreamWithStatus(self: *Transport, stream_id: u31, code: u8, message: ?[]const u8) !void {
+        // grpc-status decimal-ASCII (max 3 chars: 0..255).
+        var code_buf: [3]u8 = undefined;
+        const code_str = std.fmt.bufPrint(&code_buf, "{d}", .{code}) catch unreachable;
+
+        // Compute payload size up-front so we can allocate a single buffer
+        // and emit one frame.
+        // Layout:
+        //   0x40, 11, "grpc-status",  <code_len>, <code_bytes>
+        //   [optional] 0x40, 12, "grpc-message", <msg_len>, <msg_bytes>
+        const status_overhead: usize = 1 + 1 + 11 + 1; // type + name_len + name + value_len
+        var msg_slice: ?[]const u8 = null;
+        if (message) |m| {
+            // Truncate to 127 to fit a 7-bit varint length prefix.
+            msg_slice = if (m.len > 127) m[0..127] else m;
+        }
+        var total: usize = status_overhead + code_str.len;
+        if (msg_slice) |m| {
+            total += 1 + 1 + 12 + 1 + m.len; // type + name_len + name + value_len + value
+        }
+
+        const payload = try self.allocator.alloc(u8, total);
+        defer self.allocator.free(payload);
+
+        var i: usize = 0;
+        payload[i] = 0x40; // LIE literal-name
+        i += 1;
+        payload[i] = 11; // "grpc-status".len
+        i += 1;
+        @memcpy(payload[i .. i + 11], "grpc-status");
+        i += 11;
+        payload[i] = @intCast(code_str.len);
+        i += 1;
+        @memcpy(payload[i .. i + code_str.len], code_str);
+        i += code_str.len;
+
+        if (msg_slice) |m| {
+            payload[i] = 0x40;
+            i += 1;
+            payload[i] = 12; // "grpc-message".len
+            i += 1;
+            @memcpy(payload[i .. i + 12], "grpc-message");
+            i += 12;
+            payload[i] = @intCast(m.len);
+            i += 1;
+            @memcpy(payload[i .. i + m.len], m);
+            i += m.len;
+        }
+
+        std.debug.assert(i == total);
+
+        try self.writeFrame(
+            .HEADERS,
+            http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS,
+            stream_id,
+            payload,
+        );
+    }
+
     /// Write a gRPC response message.
     /// Sends proper gRPC framing: HEADERS frame, then DATA frame with
     /// 5-byte gRPC prefix, then TRAILERS with grpc-status: 0.
@@ -896,28 +979,7 @@ pub const Transport = struct {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
 
-        const response_headers = [_]u8{
-            0x88,
-            0x40 | 31,
-            16,
-            'a',
-            'p',
-            'p',
-            'l',
-            'i',
-            'c',
-            'a',
-            't',
-            'i',
-            'o',
-            'n',
-            '/',
-            'g',
-            'r',
-            'p',
-            'c',
-        };
-        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &response_headers);
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &RESPONSE_HEADERS_BYTES);
 
         const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
