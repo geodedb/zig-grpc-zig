@@ -79,21 +79,31 @@ pub const GrpcClient = struct {
     }
 
     pub fn call(self: *GrpcClient, method_path: []const u8, request: []const u8, compression_alg: compression.Compression.Algorithm) ![]u8 {
-        // Add auth token if available
-        var headers = std.StringHashMap([]const u8).init(self.allocator);
-        defer headers.deinit();
+        // Add auth token if available. Closes GAP-0002: the headers map
+        // is now passed through to the transport instead of being thrown
+        // away after construction. Token bytes are owned by `headers`
+        // until after writeRequestWithMetadata returns.
+        var headers: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer headers.deinit(self.allocator);
+
+        var token_owned: ?[]u8 = null;
+        defer if (token_owned) |t| self.allocator.free(t);
 
         if (self.auth) |*auth_client| {
             const token = try auth_client.generateToken("client", 3600);
-            defer self.allocator.free(token);
-            try headers.put("authorization", token);
+            token_owned = token;
+            try headers.put(self.allocator, "authorization", token);
         }
 
         // Compress request
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        try self.transport.writeRequest(compressed, method_path);
+        try self.transport.writeRequestWithMetadata(
+            compressed,
+            method_path,
+            if (headers.count() == 0) null else &headers,
+        );
         const response_bytes = try self.transport.readMessage();
         defer self.allocator.free(response_bytes);
 

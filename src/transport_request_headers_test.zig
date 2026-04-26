@@ -132,3 +132,56 @@ test "writeRequestHeaders does not emit response-shaped :status or response cont
     try testing.expect(bytes.len > 0);
     try testing.expect(bytes[0] != 0x88);
 }
+
+test "writeRequestHeadersWithMetadata appends authorization metadata to HPACK output" {
+    // GAP-0002: per-RPC metadata supplied by the client (e.g. an
+    // `authorization: <jwt>` header) must reach the wire. The encoder
+    // gains a metadata-aware variant that emits each entry as an HPACK
+    // Literal-with-Incremental-Indexing header (0x40 prefix, length-prefixed
+    // name, length-prefixed value) AFTER the canonical request headers.
+    const allocator = testing.allocator;
+
+    var meta: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer meta.deinit(allocator);
+    try meta.put(allocator, "authorization", "Bearer xyz123");
+
+    const bytes = try transport.writeRequestHeadersWithMetadata(
+        allocator,
+        "/interop.Interop/Echo",
+        "127.0.0.1:50064",
+        &meta,
+    );
+    defer allocator.free(bytes);
+
+    // The canonical headers plus a single LIE-literal-name entry for
+    // `authorization: Bearer xyz123` must appear. Search for the entry
+    // signature: 0x40, len("authorization") = 13, then "authorization",
+    // then len("Bearer xyz123") = 13, then "Bearer xyz123".
+    const sig_prefix = [_]u8{ 0x40, 13 } ++ "authorization".* ++ [_]u8{13} ++ "Bearer xyz123".*;
+    const found = std.mem.indexOf(u8, bytes, &sig_prefix);
+    try testing.expect(found != null);
+
+    // Must still start with the request-shaped first byte (0x83 for
+    // :method POST), i.e. metadata is appended, not prepended.
+    try testing.expect(bytes.len > 0);
+    try testing.expectEqual(@as(u8, 0x83), bytes[0]);
+}
+
+test "writeRequestHeadersWithMetadata with null metadata equals legacy output" {
+    const allocator = testing.allocator;
+    const a = try transport.writeRequestHeaders(
+        allocator,
+        "/svc/M",
+        "host:80",
+    );
+    defer allocator.free(a);
+    const b = try transport.writeRequestHeadersWithMetadata(
+        allocator,
+        "/svc/M",
+        "host:80",
+        null,
+    );
+    defer allocator.free(b);
+
+    try testing.expectEqualSlices(u8, a, b);
+}

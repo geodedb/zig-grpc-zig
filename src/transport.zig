@@ -35,13 +35,48 @@ pub fn writeRequestHeaders(
     method_path: []const u8,
     authority: []const u8,
 ) ![]u8 {
+    return writeRequestHeadersWithMetadata(allocator, method_path, authority, null);
+}
+
+/// Like `writeRequestHeaders` but also encodes per-RPC metadata after the
+/// canonical request headers. Each metadata entry is emitted as an HPACK
+/// Literal-with-Incremental-Indexing header with a literal name (0x40
+/// prefix, length-prefixed name, length-prefixed value).
+///
+/// Closes GAP-0002: prior to this helper the legacy `GrpcClient.call`
+/// constructed a `headers` map but threw it away — `authorization` and
+/// any other client-supplied metadata never reached the wire.
+///
+/// Caller owns the returned slice.
+pub fn writeRequestHeadersWithMetadata(
+    allocator: std.mem.Allocator,
+    method_path: []const u8,
+    authority: []const u8,
+    metadata: ?*const std.StringHashMapUnmanaged([]const u8),
+) ![]u8 {
     if (method_path.len > 126) return TransportError.MethodPathTooLong;
     if (authority.len > 126) return TransportError.AuthorityTooLong;
 
     const ctype_value = "application/grpc";
 
-    // 2 (indexed) + 2 + path + 2 + authority + 2 + ctype + (1 + 1 + 2 + 1 + 8)
-    const total = 2 + (2 + method_path.len) + (2 + authority.len) + (2 + ctype_value.len) + 13;
+    // Compute final size up-front to allocate exactly once.
+    //   2 (indexed :method, :scheme) + 2 (LIE :path header byte + len) + path
+    //   + 2 (:authority) + authority + 2 (content-type) + ctype
+    //   + 13 (te trailers fixed bytes)
+    var total: usize = 2 + (2 + method_path.len) + (2 + authority.len) + (2 + ctype_value.len) + 13;
+    if (metadata) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            // Each metadata entry: 1 (0x40) + 1 (name_len varint, names <128)
+            //   + name + 1 (value_len varint, values <128) + value.
+            // Reject overlong names/values rather than silently mis-encoding.
+            if (name.len > 127 or value.len > 127) return TransportError.InvalidHeader;
+            total += 1 + 1 + name.len + 1 + value.len;
+        }
+    }
+
     var out = try allocator.alloc(u8, total);
     errdefer allocator.free(out);
 
@@ -90,6 +125,25 @@ pub fn writeRequestHeaders(
     i += 1;
     @memcpy(out[i .. i + 8], "trailers");
     i += 8;
+
+    // Append per-RPC metadata as LIE literal-name headers.
+    if (metadata) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            out[i] = 0x40; // LIE, literal name (name index 0)
+            i += 1;
+            out[i] = @intCast(name.len);
+            i += 1;
+            @memcpy(out[i .. i + name.len], name);
+            i += name.len;
+            out[i] = @intCast(value.len);
+            i += 1;
+            @memcpy(out[i .. i + value.len], value);
+            i += value.len;
+        }
+    }
 
     std.debug.assert(i == total);
     return out;
@@ -1019,13 +1073,47 @@ pub const Transport = struct {
         return self.writeRequestOnStream(self.last_stream_id, message, method_path);
     }
 
+    /// Variant of `writeRequest` that includes per-RPC metadata in the
+    /// HPACK HEADERS payload (e.g. `authorization: Bearer ...`).
+    /// Closes GAP-0002.
+    pub fn writeRequestWithMetadata(
+        self: *Transport,
+        message: []const u8,
+        method_path: []const u8,
+        metadata: ?*const std.StringHashMapUnmanaged([]const u8),
+    ) !void {
+        return self.writeRequestOnStreamWithMetadata(
+            self.last_stream_id,
+            message,
+            method_path,
+            metadata,
+        );
+    }
+
     /// Write a CLIENT request on the given stream id. Emits request-shaped
     /// HPACK HEADERS (`:method POST`, `:scheme http`, `:path`, `:authority`,
     /// `content-type`, `te trailers`) followed by a single gRPC-framed DATA
     /// frame with END_STREAM. Holds `write_mutex` for the whole sequence so
     /// HEADERS+DATA cannot interleave with another writer.
     pub fn writeRequestOnStream(self: *Transport, stream_id: u31, message: []const u8, method_path: []const u8) !void {
-        const headers_bytes = try writeRequestHeaders(self.allocator, method_path, self.authority);
+        return self.writeRequestOnStreamWithMetadata(stream_id, message, method_path, null);
+    }
+
+    /// Variant of `writeRequestOnStream` that emits per-RPC metadata as
+    /// trailing HPACK headers in the HEADERS frame. Closes GAP-0002.
+    pub fn writeRequestOnStreamWithMetadata(
+        self: *Transport,
+        stream_id: u31,
+        message: []const u8,
+        method_path: []const u8,
+        metadata: ?*const std.StringHashMapUnmanaged([]const u8),
+    ) !void {
+        const headers_bytes = try writeRequestHeadersWithMetadata(
+            self.allocator,
+            method_path,
+            self.authority,
+            metadata,
+        );
         defer self.allocator.free(headers_bytes);
 
         self.write_mutex.lockUncancelable(self.io);

@@ -165,6 +165,18 @@ pub const ClientMux = struct {
         request: []const u8,
         compression_alg: compression.Compression.Algorithm,
     ) ![]u8 {
+        return self.callWithMetadata(method_path, request, compression_alg, null);
+    }
+
+    /// Variant of `call` that emits per-RPC metadata (e.g. `authorization`)
+    /// in the HEADERS frame. Closes GAP-0002 for the multiplexed path.
+    pub fn callWithMetadata(
+        self: *ClientMux,
+        method_path: []const u8,
+        request: []const u8,
+        compression_alg: compression.Compression.Algorithm,
+        metadata: ?*const std.StringHashMapUnmanaged([]const u8),
+    ) ![]u8 {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
@@ -176,7 +188,7 @@ pub const ClientMux = struct {
         try self.registerStream(sid, &slot);
         defer self.unregisterStream(sid);
 
-        try self.transport.writeRequestOnStream(sid, compressed, method_path);
+        try self.transport.writeRequestOnStreamWithMetadata(sid, compressed, method_path, metadata);
 
         // Block until the reader thread signals end-of-stream or an error.
         slot.mutex.lockUncancelable(self.io);
