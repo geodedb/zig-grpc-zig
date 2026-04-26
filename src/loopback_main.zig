@@ -265,7 +265,15 @@ pub fn main(init: std.process.Init) !void {
     var server = try GrpcServer.init(allocator, io, PORT, "loopback-key");
     defer server.deinit();
 
-    try server.handlers.append(allocator, .{ .name = "Dispatch", .handler_fn = dispatchHandler });
+    // Register one handler per `:path` used by the scenarios. The server
+    // now dispatches by exact `:path == handler.name` (closes GAP-0003).
+    // The dispatch logic in `dispatchHandler` is path-agnostic — request
+    // body shape selects unary vs server-streaming — so we register the
+    // same function under each name we exercise below.
+    try server.handlers.append(allocator, .{ .name = "/Echo", .handler_fn = dispatchHandler });
+    try server.handlers.append(allocator, .{ .name = "/Passthrough", .handler_fn = dispatchHandler });
+    try server.handlers.append(allocator, .{ .name = "/Stream", .handler_fn = dispatchHandler });
+    try server.handlers.append(allocator, .{ .name = "/loopback.Mux/Echo", .handler_fn = dispatchHandler });
 
     const thread = try std.Thread.spawn(.{}, serverThread, .{ServerArgs{ .server = &server }});
     thread.detach();

@@ -213,6 +213,23 @@ pub fn build(b: *std.Build) void {
     const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
     loopback_test_step.dependOn(&install_loopback_test.step);
 
+    // Path-based handler dispatch test (closes GAP-0003 / #4). Two
+    // handlers registered with distinct names; the test verifies each is
+    // routed correctly by `:path` and that an unregistered path returns a
+    // gRPC trailer with status 12 (UNIMPLEMENTED).
+    const dispatch_test = b.addExecutable(.{
+        .name = "grpc-dispatch-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dispatch_test_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    dispatch_test.root_module.linkLibrary(zlib_lib);
+    const install_dispatch_test = b.addInstallArtifact(dispatch_test, .{});
+    const dispatch_test_step = b.step("dispatch-test", "Build the path-based dispatch test");
+    dispatch_test_step.dependOn(&install_dispatch_test.step);
+
     // Interop wire-codec unit tests.
     const interop_codec_tests = b.addTest(.{
         .name = "interop-codec-tests",

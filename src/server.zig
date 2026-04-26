@@ -127,14 +127,32 @@ pub const GrpcServer = struct {
             const decompressed = try self.compression.decompress(message, compression_alg);
             defer self.allocator.free(decompressed);
 
-            // Route to handler, passing the method path and transport
+            // Route to handler by matching the request `:path` against the
+            // registered handler's `name`. Closes GAP-0003 (#4): the legacy
+            // path unconditionally invoked `handlers.items[0]`, which made
+            // multi-method services impossible (every method got the first
+            // handler). On no match we send an UNIMPLEMENTED (12) trailer
+            // so the client gets a definitive answer instead of hanging.
             const method = trans.lastMethod();
-            if (self.handlers.items.len > 0) {
-                const handler = self.handlers.items[0];
+            const stream_id = trans.last_stream_id;
+            var matched: ?Handler = null;
+            for (self.handlers.items) |h| {
+                if (std.mem.eql(u8, h.name, method)) {
+                    matched = h;
+                    break;
+                }
+            }
+            if (matched) |handler| {
                 handler.handler_fn(decompressed, method, &trans, self.allocator) catch |err| {
                     std.log.err("Handler error: {}", .{err});
                     continue;
                 };
+            } else {
+                std.log.warn("No handler for method '{s}' (stream {d})", .{ method, stream_id });
+                trans.endStreamWithStatus(stream_id, 12, "method not found") catch |err| {
+                    std.log.err("Failed to emit UNIMPLEMENTED trailer: {}", .{err});
+                };
+                continue;
             }
         }
     }
