@@ -192,6 +192,22 @@ pub fn build(b: *std.Build) void {
     const run_hpack_varint_tests = b.addRunArtifact(hpack_varint_tests);
     test_step.dependOn(&run_hpack_varint_tests.step);
 
+    // SETTINGS_MAX_FRAME_SIZE enforcement tests (closes I3 / GitLab security
+    // issue #8). Verifies oversize peer-declared frame lengths are rejected
+    // before allocation and that the GOAWAY response carries
+    // FRAME_SIZE_ERROR (0x06).
+    const max_frame_size_tests = b.addTest(.{
+        .name = "transport-max-frame-size-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transport_max_frame_size_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    max_frame_size_tests.root_module.linkLibrary(zlib_lib);
+    const run_max_frame_size_tests = b.addRunArtifact(max_frame_size_tests);
+    test_step.dependOn(&run_max_frame_size_tests.step);
+
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
     // from the full test execution.
@@ -200,6 +216,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&endstream_tests.step);
     check_step.dependOn(&auth_tests.step);
     check_step.dependOn(&hpack_varint_tests.step);
+    check_step.dependOn(&max_frame_size_tests.step);
 
     // Integration test server
     const integration_test_mod = b.createModule(.{

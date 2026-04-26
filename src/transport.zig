@@ -14,7 +14,31 @@ pub const TransportError = error{
     Http2Error,
     MethodPathTooLong,
     AuthorityTooLong,
+    /// Peer announced a DATA/HEADERS/etc. frame whose length exceeds the
+    /// negotiated SETTINGS_MAX_FRAME_SIZE (RFC 7540 §6.5.2 / §4.2). The
+    /// reader rejects the frame BEFORE allocating its payload buffer to
+    /// avoid an unauthenticated memory amplification (closes I3).
+    FrameSizeError,
 };
+
+/// Default SETTINGS_MAX_FRAME_SIZE per RFC 7540 §6.5.2 — every HTTP/2
+/// implementation MUST accept frames at least this large; we apply it as
+/// the inbound cap until the peer negotiates a larger value via SETTINGS.
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16384;
+
+/// HTTP/2 SETTINGS parameter ids (RFC 7540 §6.5.2).
+pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
+pub const SETTINGS_ENABLE_PUSH: u16 = 0x02;
+pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x03;
+pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x04;
+pub const SETTINGS_MAX_FRAME_SIZE: u16 = 0x05;
+pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x06;
+
+/// HTTP/2 connection error codes (RFC 7540 §7).
+pub const HTTP2_ERROR_NO_ERROR: u32 = 0x00;
+pub const HTTP2_ERROR_PROTOCOL_ERROR: u32 = 0x01;
+pub const HTTP2_ERROR_FRAME_SIZE_ERROR: u32 = 0x06;
+pub const HTTP2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x03;
 
 /// Build the HPACK-encoded HEADERS payload for a CLIENT request. The
 /// caller owns the returned slice and must free it with `allocator`.
@@ -267,6 +291,11 @@ pub const Transport = struct {
     /// `*Uncancelable` variants because cancelling a half-written frame on
     /// the wire would desynchronize the peer.
     write_mutex: std.Io.Mutex = .init,
+    /// Largest frame length we will accept from the peer, per
+    /// SETTINGS_MAX_FRAME_SIZE (RFC 7540 §6.5.2). Initialized to the
+    /// default 16384 and updated when the peer sends a SETTINGS frame
+    /// with parameter id 0x05. Closes I3.
+    max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
 
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
         const read_buf = try allocator.alloc(u8, 1024 * 64);
@@ -436,8 +465,96 @@ pub const Transport = struct {
         payload: []u8,
     };
 
+    /// Pure size-check used by `readFrame` before allocating the payload
+    /// buffer. Public for unit tests (`transport_max_frame_size_test.zig`).
+    /// Returns `error.FrameSizeError` when the peer-declared length exceeds
+    /// the negotiated max — closes I3.
+    pub fn checkFrameSize(length: u32, max: u32) TransportError!void {
+        if (length > max) return TransportError.FrameSizeError;
+    }
+
+    /// Build the bytes for a connection-level GOAWAY frame announcing
+    /// FRAME_SIZE_ERROR. Caller owns the returned slice. Used by
+    /// `readFrame` after rejecting an oversize peer frame so the peer
+    /// learns why the connection is closing.
+    pub fn buildGoawayFrameSizeError(allocator: std.mem.Allocator, last_stream_id: u31) ![]u8 {
+        // Layout: 9-byte frame header + 8-byte payload.
+        //   header: length(3) | type(1=GOAWAY=0x07) | flags(1=0) | stream_id(4=0)
+        //   payload: R + last-stream-id (4 bytes) | error code (4 bytes)
+        const payload_len: u32 = 8;
+        var bytes = try allocator.alloc(u8, 9 + payload_len);
+        errdefer allocator.free(bytes);
+        // Header
+        bytes[0] = @intCast((payload_len >> 16) & 0xFF);
+        bytes[1] = @intCast((payload_len >> 8) & 0xFF);
+        bytes[2] = @intCast(payload_len & 0xFF);
+        bytes[3] = @intFromEnum(http2.frame.FrameType.GOAWAY);
+        bytes[4] = 0; // flags
+        bytes[5] = 0;
+        bytes[6] = 0;
+        bytes[7] = 0;
+        bytes[8] = 0; // stream id 0
+        // Payload
+        const lsid: u32 = @intCast(last_stream_id);
+        bytes[9] = @intCast((lsid >> 24) & 0x7F); // R bit clear
+        bytes[10] = @intCast((lsid >> 16) & 0xFF);
+        bytes[11] = @intCast((lsid >> 8) & 0xFF);
+        bytes[12] = @intCast(lsid & 0xFF);
+        bytes[13] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 24) & 0xFF);
+        bytes[14] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 16) & 0xFF);
+        bytes[15] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 8) & 0xFF);
+        bytes[16] = @intCast(HTTP2_ERROR_FRAME_SIZE_ERROR & 0xFF);
+        return bytes;
+    }
+
+    /// Send a GOAWAY frame with FRAME_SIZE_ERROR. Best-effort: ignores
+    /// any write failure since we are about to tear the connection down.
+    fn emitGoawayFrameSizeError(self: *Transport) void {
+        const bytes = buildGoawayFrameSizeError(self.allocator, self.last_stream_id) catch return;
+        defer self.allocator.free(bytes);
+        _ = self.ioWrite(bytes) catch {};
+    }
+
+    /// Apply the parameters in a peer SETTINGS frame payload. Each entry
+    /// is a 6-byte big-endian (id:u16, value:u32) tuple per RFC 7540
+    /// §6.5.1. Unknown ids are ignored. We track:
+    ///   * SETTINGS_MAX_FRAME_SIZE (0x05) - clamp to the spec maximum
+    ///     (2^24-1) so a peer can't push us back below the default.
+    /// Order 8 (flow control) extends this to handle INITIAL_WINDOW_SIZE
+    /// adjustments. Other ids are accepted silently for now.
+    fn applyPeerSettings(self: *Transport, payload: []const u8) void {
+        var i: usize = 0;
+        while (i + 6 <= payload.len) : (i += 6) {
+            const id: u16 = (@as(u16, payload[i]) << 8) | @as(u16, payload[i + 1]);
+            const value: u32 = (@as(u32, payload[i + 2]) << 24) |
+                (@as(u32, payload[i + 3]) << 16) |
+                (@as(u32, payload[i + 4]) << 8) |
+                @as(u32, payload[i + 5]);
+            switch (id) {
+                SETTINGS_MAX_FRAME_SIZE => {
+                    // RFC 7540 §6.5.2: peer values <16384 are invalid; we
+                    // clamp to the default (which we always accept). The
+                    // spec maximum is 2^24-1 = 16,777,215.
+                    if (value < DEFAULT_MAX_FRAME_SIZE) {
+                        self.max_frame_size = DEFAULT_MAX_FRAME_SIZE;
+                    } else if (value > 0xFFFFFF) {
+                        self.max_frame_size = 0xFFFFFF;
+                    } else {
+                        self.max_frame_size = value;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     /// Read a single HTTP/2 frame header and payload. Public so a
     /// multiplexing reader (`ClientMux`) can drive its own dispatch loop.
+    ///
+    /// I3 — closes the SETTINGS_MAX_FRAME_SIZE enforcement gap: we now
+    /// reject frames whose declared length exceeds `max_frame_size` BEFORE
+    /// allocating the payload buffer, and emit a GOAWAY with
+    /// FRAME_SIZE_ERROR (0x06) so the peer learns why we are closing.
     pub fn readFrame(self: *Transport) !RawFrame {
         var header: [9]u8 = undefined;
         try self.readExact(&header);
@@ -451,6 +568,14 @@ pub const Transport = struct {
                 (@as(u32, header[7]) << 8) |
                 @as(u32, header[8]),
         );
+
+        // I3: enforce SETTINGS_MAX_FRAME_SIZE before allocating. A
+        // malicious or buggy peer must never be able to force the server
+        // to allocate up to 16 MiB based on a 24-bit length field.
+        checkFrameSize(@intCast(length), self.max_frame_size) catch |err| {
+            self.emitGoawayFrameSizeError();
+            return err;
+        };
 
         const payload = try self.allocator.alloc(u8, length);
         errdefer self.allocator.free(payload);
@@ -493,6 +618,38 @@ pub const Transport = struct {
         }
     }
 
+    /// Write a DATA frame, fragmenting across multiple HTTP/2 DATA frames
+    /// when `payload` exceeds `max_frame_size`. The caller-supplied flags
+    /// are applied to the LAST fragment; intermediate fragments carry no
+    /// flags. Caller MUST hold `write_mutex`.
+    ///
+    /// I3 — required so writes don't violate the peer-advertised
+    /// SETTINGS_MAX_FRAME_SIZE on outbound. We use our own
+    /// `max_frame_size` as the cap because for now we apply a single
+    /// shared limit in both directions; Order 8 separates inbound /
+    /// outbound limits properly.
+    fn writeDataFragmentedLocked(
+        self: *Transport,
+        stream_id: u31,
+        flags: u8,
+        payload: []const u8,
+    ) !void {
+        const max: usize = @intCast(self.max_frame_size);
+        if (payload.len <= max) {
+            try self.writeFrameLocked(.DATA, flags, stream_id, payload);
+            return;
+        }
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const remaining = payload.len - offset;
+            const chunk_len = @min(remaining, max);
+            const is_last = (offset + chunk_len == payload.len);
+            const chunk_flags: u8 = if (is_last) flags else 0;
+            try self.writeFrameLocked(.DATA, chunk_flags, stream_id, payload[offset .. offset + chunk_len]);
+            offset += chunk_len;
+        }
+    }
+
     fn setupHttp2Server(self: *Transport) !void {
         // Server receives and validates HTTP/2 connection preface
         var preface_buf: [24]u8 = undefined;
@@ -511,6 +668,10 @@ pub const Transport = struct {
             return TransportError.Http2Error;
         }
 
+        // Apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE) so subsequent
+        // readFrame() calls honour the negotiated cap.
+        self.applyPeerSettings(frame.payload);
+
         // Send server's SETTINGS frame (empty = use defaults)
         try self.writeFrame(.SETTINGS, 0, 0, &.{});
 
@@ -522,7 +683,15 @@ pub const Transport = struct {
     /// Handles standard gRPC framing: skips HEADERS, SETTINGS, WINDOW_UPDATE,
     /// PING frames, and extracts the protobuf payload from DATA frames by
     /// stripping the 5-byte gRPC length-prefixed message header.
+    ///
+    /// I3 — a single gRPC message may span multiple HTTP/2 DATA frames
+    /// because we honour SETTINGS_MAX_FRAME_SIZE on outbound (and so do
+    /// well-behaved peers). We accumulate DATA frames into a per-call
+    /// buffer until we have the full gRPC message indicated by the
+    /// length-prefix in the first 5 bytes.
     pub fn readMessage(self: *Transport) ![]const u8 {
+        var grpc_buf: std.ArrayList(u8) = .empty;
+        defer grpc_buf.deinit(self.allocator);
         while (true) {
             const frame = try self.readFrame();
             const frame_type = frame.frame_type;
@@ -530,28 +699,27 @@ pub const Transport = struct {
 
             switch (frame_type) {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
-                    // gRPC DATA frame: [1 byte compressed flag][4 bytes msg length][protobuf...]
-                    if (payload.len >= 5) {
-                        // Strip 5-byte gRPC header, return just the protobuf message
-                        const msg_len = (@as(u32, payload[1]) << 24) |
-                            (@as(u32, payload[2]) << 16) |
-                            (@as(u32, payload[3]) << 8) |
-                            @as(u32, payload[4]);
+                    // Append this fragment; the gRPC message may have
+                    // been split across multiple HTTP/2 DATA frames.
+                    grpc_buf.appendSlice(self.allocator, payload) catch {
+                        self.allocator.free(payload);
+                        return error.OutOfMemory;
+                    };
+                    self.allocator.free(payload);
 
-                        if (payload.len >= 5 + msg_len) {
-                            const result = self.allocator.alloc(u8, msg_len) catch {
-                                self.allocator.free(payload);
-                                return error.OutOfMemory;
-                            };
-                            @memcpy(result, payload[5 .. 5 + msg_len]);
-                            self.allocator.free(payload);
-                            return result;
-                        }
-                    }
+                    // Try to parse a complete gRPC message from the
+                    // accumulated bytes.
+                    if (grpc_buf.items.len < 5) continue;
+                    const msg_len = (@as(u32, grpc_buf.items[1]) << 24) |
+                        (@as(u32, grpc_buf.items[2]) << 16) |
+                        (@as(u32, grpc_buf.items[3]) << 8) |
+                        @as(u32, grpc_buf.items[4]);
+                    if (grpc_buf.items.len < 5 + msg_len) continue;
 
-                    // Fallback: if no gRPC header or too short, return payload as-is
-                    // (for backward compat with custom clients)
-                    return payload;
+                    const result = self.allocator.alloc(u8, msg_len) catch
+                        return error.OutOfMemory;
+                    @memcpy(result, grpc_buf.items[5 .. 5 + msg_len]);
+                    return result;
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
                     // Standard gRPC sends HEADERS before DATA. Remember the
@@ -567,6 +735,10 @@ pub const Transport = struct {
                     // Could be client's SETTINGS ACK or new SETTINGS
                     const is_ack = (frame.flags & 0x1) != 0;
                     if (!is_ack) {
+                        // Apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE)
+                        // before ACKing so subsequent reads honour the
+                        // negotiated cap.
+                        self.applyPeerSettings(payload);
                         // ACK the client's settings -- free payload before try
                         // to avoid leak if writeFrame fails
                         self.allocator.free(payload);
@@ -632,6 +804,9 @@ pub const Transport = struct {
     /// done sending. Returns `{ data: null, end_stream: true }` for the
     /// trailers frame that ends a streaming response with no payload.
     pub fn readStreamFrame(self: *Transport) !StreamFrame {
+        var grpc_buf: std.ArrayList(u8) = .empty;
+        defer grpc_buf.deinit(self.allocator);
+        var saw_end: bool = false;
         while (true) {
             const frame = try self.readFrame();
             const frame_type = frame.frame_type;
@@ -641,22 +816,28 @@ pub const Transport = struct {
             switch (frame_type) {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
-                    if (payload.len >= 5) {
-                        const msg_len = (@as(u32, payload[1]) << 24) |
-                            (@as(u32, payload[2]) << 16) |
-                            (@as(u32, payload[3]) << 8) |
-                            @as(u32, payload[4]);
-                        if (payload.len >= 5 + msg_len) {
-                            const result = self.allocator.alloc(u8, msg_len) catch {
-                                self.allocator.free(payload);
-                                return error.OutOfMemory;
-                            };
-                            @memcpy(result, payload[5 .. 5 + msg_len]);
-                            self.allocator.free(payload);
-                            return .{ .data = result, .end_stream = end };
-                        }
+                    if (end) saw_end = true;
+                    grpc_buf.appendSlice(self.allocator, payload) catch {
+                        self.allocator.free(payload);
+                        return error.OutOfMemory;
+                    };
+                    self.allocator.free(payload);
+                    if (grpc_buf.items.len < 5) {
+                        if (saw_end) return .{ .data = null, .end_stream = true };
+                        continue;
                     }
-                    return .{ .data = payload, .end_stream = end };
+                    const msg_len = (@as(u32, grpc_buf.items[1]) << 24) |
+                        (@as(u32, grpc_buf.items[2]) << 16) |
+                        (@as(u32, grpc_buf.items[3]) << 8) |
+                        @as(u32, grpc_buf.items[4]);
+                    if (grpc_buf.items.len < 5 + msg_len) {
+                        if (saw_end) return .{ .data = null, .end_stream = true };
+                        continue;
+                    }
+                    const result = self.allocator.alloc(u8, msg_len) catch
+                        return error.OutOfMemory;
+                    @memcpy(result, grpc_buf.items[5 .. 5 + msg_len]);
+                    return .{ .data = result, .end_stream = saw_end };
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
@@ -669,6 +850,7 @@ pub const Transport = struct {
                 @intFromEnum(http2.frame.FrameType.SETTINGS) => {
                     const is_ack = (flags & 0x1) != 0;
                     if (!is_ack) {
+                        self.applyPeerSettings(payload);
                         self.allocator.free(payload);
                         try self.writeFrame(.SETTINGS, 0x1, 0, &.{});
                     } else {
@@ -1081,7 +1263,7 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
-        try self.writeFrameLocked(.DATA, 0, sid, grpc_frame);
+        try self.writeDataFragmentedLocked(sid, 0, grpc_frame);
     }
 
     /// End a gRPC server stream by sending TRAILERS with grpc-status: 0.
@@ -1193,7 +1375,7 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
-        try self.writeFrameLocked(.DATA, 0, stream_id, grpc_frame);
+        try self.writeDataFragmentedLocked(stream_id, 0, grpc_frame);
 
         const trailers = [_]u8{
             0x40,
@@ -1279,6 +1461,6 @@ pub const Transport = struct {
         grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
         grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
         @memcpy(grpc_frame[5..], message);
-        try self.writeFrameLocked(.DATA, http2.frame.FrameFlags.END_STREAM, stream_id, grpc_frame);
+        try self.writeDataFragmentedLocked(stream_id, http2.frame.FrameFlags.END_STREAM, grpc_frame);
     }
 };
