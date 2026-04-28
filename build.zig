@@ -4,6 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -Dwith_otel: compile in otel instrumentation. OFF by default;
+    // when off the otel dependency is never resolved and the seam
+    // collapses to a comptime-known no-op (verified by
+    // otel/scripts/verify-consumer-noop.sh).
+    const with_otel = b.option(
+        bool,
+        "with_otel",
+        "Compile in otel instrumentation (off by default; zero overhead when off)",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "with_otel", with_otel);
+
     // Build zlib from upstream source
     const zlib_dep = b.dependency("zlib", .{});
     const zlib_lib = b.addLibrary(.{
@@ -62,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_mod.linkLibrary(zlib_lib);
+    server_mod.addOptions("build_options", build_options);
 
     // Client module (for internal use and library export)
     const client_mod = b.addModule("grpc-client", .{
@@ -70,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_mod.linkLibrary(zlib_lib);
+    client_mod.addOptions("build_options", build_options);
 
     // Benchmark executable
     const benchmark = b.addExecutable(.{
@@ -237,6 +252,25 @@ pub fn build(b: *std.Build) void {
     admission_tests.root_module.linkLibrary(zlib_lib);
     const run_admission_tests = b.addRunArtifact(admission_tests);
     test_step.dependOn(&run_admission_tests.step);
+
+    // Observability seam — disabled-mode no-op tests.
+    // Verifies `build_options.with_otel == false` and that the seam's
+    // public surface returns a comptime-known no-op when otel is off.
+    // Exercised via the public "grpc-server" module since the
+    // observability surface is published from server.zig.
+    const observability_disabled_tests = b.addTest(.{
+        .name = "observability-disabled-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/observability_disabled_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    observability_disabled_tests.root_module.addImport("grpc-server", server_mod);
+    observability_disabled_tests.root_module.addOptions("build_options", build_options);
+    observability_disabled_tests.root_module.linkLibrary(zlib_lib);
+    const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
+    test_step.dependOn(&run_observability_disabled_tests.step);
 
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
