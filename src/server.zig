@@ -285,6 +285,12 @@ pub const GrpcServer = struct {
             // attach the gRPC status via `endServerSpan` BEFORE the defer
             // — when the seam is enabled the second `end` is idempotent.
             defer __obs_span.end(null);
+            // I-1 fix: make lifecycle symmetric with the client. If any
+            // `try` between here and the explicit grpc-status sites below
+            // (lines for OK/UNKNOWN/UNIMPLEMENTED/UNAUTHENTICATED) bails
+            // out, the span ends with status 13 (gRPC INTERNAL) instead
+            // of silently with no status attached.
+            errdefer observability.endServerSpan(__obs_span, 13);
 
             // Auth gate (closes GAP-0001 / #2). When `require_auth` is set
             // we must verify the `authorization` header before dispatching;

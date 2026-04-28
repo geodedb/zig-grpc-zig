@@ -12,6 +12,7 @@
 const std = @import("std");
 const transport = @import("transport.zig");
 const compression = @import("features/compression.zig");
+const observability = @import("observability.zig");
 const net = std.Io.net;
 const http2 = struct {
     pub const frame = @import("http2/frame.zig");
@@ -159,6 +160,12 @@ pub const ClientMux = struct {
     /// Issue a unary RPC. Thread-safe — multiple threads can call this
     /// concurrently on the same `ClientMux`. Each call gets a fresh stream
     /// id and waits on its own completion slot.
+    ///
+    /// NOTE: deviation from template — instrumentation lives only in the
+    /// inner `callWithMetadata` implementation. `call` is a one-line
+    /// forwarder, so adding a second `__obs_span` here would emit TWO
+    /// spans for one logical RPC. Both entry points still emit exactly
+    /// one client span via the forwarded call.
     pub fn call(
         self: *ClientMux,
         method_path: []const u8,
@@ -177,6 +184,28 @@ pub const ClientMux = struct {
         compression_alg: compression.Compression.Algorithm,
         metadata: ?*const std.StringHashMapUnmanaged([]const u8),
     ) ![]u8 {
+        // Observability seam (C-1 fix). Mirrors the established pattern
+        // from `client.zig:117-155`: synthesize a `grpc://authority/path`
+        // url, open a client span, close it with gRPC OK on the success
+        // path, gRPC INTERNAL (13) via `errdefer` on any propagated
+        // error. `defer span.end(null)` is the lifecycle close; the
+        // explicit `endClientSpan` calls attach the gRPC status before
+        // the defer fires (idempotent under enabled builds, comptime
+        // no-op under `-Dwith_otel=false`).
+        var __obs_url_buf: [256]u8 = undefined;
+        const __obs_url = std.fmt.bufPrint(
+            __obs_url_buf[0..],
+            "grpc://{s}/{s}",
+            .{ self.transport.authority, method_path },
+        ) catch method_path;
+        var __obs_span = observability.startClientSpan(.{
+            .method = "POST",
+            .route = method_path,
+            .url = __obs_url,
+        });
+        defer __obs_span.end(null);
+        errdefer observability.endClientSpan(__obs_span, 13); // gRPC INTERNAL
+
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
@@ -199,7 +228,9 @@ pub const ClientMux = struct {
         if (slot.err) |e| return e;
 
         // Decompress and hand back to caller as an owned slice.
-        return try self.compression.decompress(slot.data.items, compression_alg);
+        const result = try self.compression.decompress(slot.data.items, compression_alg);
+        observability.endClientSpan(__obs_span, 0); // gRPC OK
+        return result;
     }
 };
 
