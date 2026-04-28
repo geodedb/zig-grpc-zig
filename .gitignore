@@ -3,3 +3,6 @@ zig-out/
 
 # Local git worktrees (per-feature isolated checkouts)
 .worktrees/
+
+# Per-feature observability rollout artifacts (untracked baseline captures)
+.observability/

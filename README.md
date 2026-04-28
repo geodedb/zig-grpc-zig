@@ -247,6 +247,51 @@ The integration tests validate:
 
 📖 **[Integration Test Documentation](integration_test/README.md)**
 
+## 🔭 Observability
+
+`grpc-zig` ships with an opt-in [OpenTelemetry](https://opentelemetry.io/)
+seam. The seam is **off by default**: when `-Dwith_otel=false` (the default),
+the otel dependency is never resolved, every span call collapses to a
+comptime-known no-op, and the produced artifacts contain zero otel symbols
+(verified by [`otel/scripts/verify-consumer-noop.sh`](https://gitlab.com/devnw/zig/otel/-/blob/main/scripts/verify-consumer-noop.sh)).
+
+### Enable
+
+```bash
+zig build -Dwith_otel=true
+```
+
+In your `main()`, hold an `Otel` value at a stable address and publish
+its tracer/meter handles to the seam:
+
+```zig
+const grpc = @import("grpc");
+
+pub fn main() !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+
+    var otel = try grpc.observability_init.Otel.init(gpa.allocator(), "my-service");
+    defer otel.deinit();
+    otel.installGlobals();
+
+    // ... your gRPC server / client code; spans are emitted automatically
+}
+```
+
+The seam emits one HTTP-shaped span per `GrpcClient.call` and per inbound
+server dispatch, keyed by gRPC method path. gRPC status flows into the
+span's `http.response.status_code` (0 → 200, non-zero → 500, marking the
+span `error`). Exporter defaults follow the
+[OTEL spec](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/):
+OTLP/HTTP to `http://localhost:4318`, parent-based 5% trace sampler. Override
+via `OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`,
+etc. Every emit is `catch {}`-discarded — a failing exporter never breaks
+gRPC traffic.
+
+For the full integration recipe and rollout invariants, see the
+[otel integration guide](https://gitlab.com/devnw/zig/otel/-/blob/main/docs/integration/RECIPE.md).
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
