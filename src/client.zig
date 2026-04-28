@@ -13,6 +13,16 @@ const net = std.Io.net;
 /// providers via `observability_init.Otel`.
 pub const observability = @import("observability.zig");
 
+/// Otel bootstrap helper, only present when `-Dwith_otel=true`. End
+/// consumers parking a real `Otel` value in their `main()` call
+/// `observability_init.Otel.init` then `installGlobals()` to publish
+/// Tracer/Meter handles to the seam. Under the disabled build this is
+/// an empty struct so the import never resolves the otel namespace.
+pub const observability_init = if (observability.enabled)
+    @import("observability_init.zig")
+else
+    struct {};
+
 pub const GrpcClient = struct {
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -298,6 +298,40 @@ pub fn build(b: *std.Build) void {
     const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
     test_step.dependOn(&run_observability_disabled_tests.step);
 
+    // Observability seam — enabled-mode smoke test. Skips when
+    // `-Dwith_otel=false`; under `-Dwith_otel=true` the test installs
+    // an in-memory recorder, drives one client span through the seam,
+    // and asserts `recorder.spans.items.len == 1`. Compilation is
+    // gated behind the otel import being available — when otel isn't
+    // wired (flag off), the test still compiles because every otel
+    // identifier sits behind the `if (!enabled) return SkipZigTest`
+    // short-circuit and Zig resolves imports lazily within unreached
+    // branches; the test step just runs as a SKIP.
+    const observability_enabled_tests = b.addTest(.{
+        .name = "observability-enabled-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/observability_enabled_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    observability_enabled_tests.root_module.addImport("grpc-server", server_mod);
+    observability_enabled_tests.root_module.addImport("build_options", build_options_mod);
+    observability_enabled_tests.root_module.linkLibrary(zlib_lib);
+    if (with_otel) {
+        // Re-resolve the otel module under the same `with_otel` guard
+        // so the smoke test reaches `@import("otel")`. The earlier
+        // `lazyDependency` call handles `server_mod` / `client_mod`;
+        // the test root needs its own import wire.
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        observability_enabled_tests.root_module.addImport("otel", otel_dep.module("otel"));
+    }
+    const run_observability_enabled_tests = b.addRunArtifact(observability_enabled_tests);
+    test_step.dependOn(&run_observability_enabled_tests.step);
+
     // `check` step: compile everything (lib modules + test binary) without
     // running the tests. CI uses this for fast type/compile checks separate
     // from the full test execution.
