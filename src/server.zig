@@ -10,6 +10,12 @@ const net = std.Io.net;
 pub const Transport = transport.Transport;
 pub const TlsIo = transport.TlsIo;
 
+/// Public otel seam re-export. When `-Dwith_otel=false` (default),
+/// `observability.enabled` is `false` and every span call is a
+/// comptime-known no-op. When `-Dwith_otel=true`, callers can install
+/// providers via `observability_init.Otel`.
+pub const observability = @import("observability.zig");
+
 pub const Handler = struct {
     name: []const u8,
     /// Handler receives: request bytes, method path, transport (for streaming writes), allocator.

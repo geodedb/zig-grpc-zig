@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "with_otel", with_otel);
+    // Materialize ONE shared `build_options` module. Each consumer
+    // module imports the SAME module instance via `addImport` to avoid
+    // Zig's "file exists in modules X and X0" error when two
+    // independent `addOptions` modules end up sharing a transitive
+    // file path.
+    const build_options_mod = build_options.createModule();
 
     // Build zlib from upstream source
     const zlib_dep = b.dependency("zlib", .{});
@@ -75,7 +81,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_mod.linkLibrary(zlib_lib);
-    server_mod.addOptions("build_options", build_options);
+    server_mod.addImport("build_options", build_options_mod);
 
     // Client module (for internal use and library export)
     const client_mod = b.addModule("grpc-client", .{
@@ -84,7 +90,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_mod.linkLibrary(zlib_lib);
-    client_mod.addOptions("build_options", build_options);
+    client_mod.addImport("build_options", build_options_mod);
 
     // Gated otel dependency. The `lazy = true` entry in build.zig.zon
     // means Zig only fetches the package when this branch executes;
@@ -282,7 +288,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     observability_disabled_tests.root_module.addImport("grpc-server", server_mod);
-    observability_disabled_tests.root_module.addOptions("build_options", build_options);
+    observability_disabled_tests.root_module.addImport("build_options", build_options_mod);
     observability_disabled_tests.root_module.linkLibrary(zlib_lib);
     const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
     test_step.dependOn(&run_observability_disabled_tests.step);

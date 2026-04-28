@@ -7,6 +7,12 @@ const streaming = @import("features/streaming.zig");
 const health = @import("features/health.zig");
 const net = std.Io.net;
 
+/// Public otel seam re-export. When `-Dwith_otel=false` (default),
+/// `observability.enabled` is `false` and every span call is a
+/// comptime-known no-op. When `-Dwith_otel=true`, callers can install
+/// providers via `observability_init.Otel`.
+pub const observability = @import("observability.zig");
+
 pub const GrpcClient = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
