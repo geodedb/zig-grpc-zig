@@ -14,5 +14,9 @@ const std = @import("std");
 test "build_options.with_otel exists and defaults to false" {
     const build_options = @import("build_options");
     try std.testing.expect(@hasDecl(build_options, "with_otel"));
+    // The "default" assertion only holds for the disabled build. When
+    // the operator forces -Dwith_otel=true, this test runs against the
+    // enabled module and must skip rather than misreport the default.
+    if (build_options.with_otel) return error.SkipZigTest;
     try std.testing.expectEqual(false, build_options.with_otel);
 }

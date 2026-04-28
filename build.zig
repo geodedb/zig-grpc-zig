@@ -86,6 +86,21 @@ pub fn build(b: *std.Build) void {
     client_mod.linkLibrary(zlib_lib);
     client_mod.addOptions("build_options", build_options);
 
+    // Gated otel dependency. The `lazy = true` entry in build.zig.zon
+    // means Zig only fetches the package when this branch executes;
+    // with the flag off the dependency is never resolved and the
+    // produced artifacts contain zero otel symbols (verified by
+    // otel/scripts/verify-consumer-noop.sh).
+    if (with_otel) {
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        const otel_module = otel_dep.module("otel");
+        server_mod.addImport("otel", otel_module);
+        client_mod.addImport("otel", otel_module);
+    }
+
     // Benchmark executable
     const benchmark = b.addExecutable(.{
         .name = "grpc-benchmark",
