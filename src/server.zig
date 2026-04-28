@@ -258,6 +258,24 @@ pub const GrpcServer = struct {
             const method = trans.lastMethod();
             const stream_id = trans.last_stream_id;
 
+            // Observability seam (Task 1.5). One server span per inbound
+            // request iteration. Status updates flow from the dispatch
+            // outcome below: 0 (OK) on handler success, gRPC UNKNOWN (2)
+            // on handler error, UNAUTHENTICATED (16) on auth failure,
+            // UNIMPLEMENTED (12) on no-match. Comptime no-op when
+            // `-Dwith_otel=false`.
+            var __obs_span = observability.startServerSpan(.{
+                .method = "POST",
+                .route = method,
+                .url = method,
+            });
+            // Default to gRPC INTERNAL (13); the success/error sites below
+            // overwrite via `endServerSpan` before the defer fires.
+            // `defer span.end(null)` is the lifecycle close; callers may
+            // attach the gRPC status via `endServerSpan` BEFORE the defer
+            // — when the seam is enabled the second `end` is idempotent.
+            defer __obs_span.end(null);
+
             // Auth gate (closes GAP-0001 / #2). When `require_auth` is set
             // we must verify the `authorization` header before dispatching;
             // any failure produces a `grpc-status: 16` (UNAUTHENTICATED)
@@ -270,6 +288,7 @@ pub const GrpcServer = struct {
                     trans.endStreamWithStatus(stream_id, 16, "missing authorization") catch |err| {
                         std.log.err("auth gate: failed to emit UNAUTHENTICATED trailer: {}", .{err});
                     };
+                    observability.endServerSpan(__obs_span, 16); // gRPC UNAUTHENTICATED
                     continue;
                 }
                 const claims = self.auth.verifyToken(auth_value) catch |err| {
@@ -277,6 +296,7 @@ pub const GrpcServer = struct {
                     trans.endStreamWithStatus(stream_id, 16, @errorName(err)) catch |trailer_err| {
                         std.log.err("auth gate: failed to emit UNAUTHENTICATED trailer: {}", .{trailer_err});
                     };
+                    observability.endServerSpan(__obs_span, 16); // gRPC UNAUTHENTICATED
                     continue;
                 };
                 // Free the duped subject — we don't surface it to handlers
@@ -305,13 +325,16 @@ pub const GrpcServer = struct {
                     trans.endStreamWithStatus(stream_id, 2, @errorName(err)) catch |trailer_err| {
                         std.log.err("Failed to emit error trailer: {}", .{trailer_err});
                     };
+                    observability.endServerSpan(__obs_span, 2); // gRPC UNKNOWN
                     continue;
                 };
+                observability.endServerSpan(__obs_span, 0); // gRPC OK
             } else {
                 std.log.warn("No handler for method '{s}' (stream {d})", .{ method, stream_id });
                 trans.endStreamWithStatus(stream_id, 12, "method not found") catch |err| {
                     std.log.err("Failed to emit UNIMPLEMENTED trailer: {}", .{err});
                 };
+                observability.endServerSpan(__obs_span, 12); // gRPC UNIMPLEMENTED
                 continue;
             }
         }

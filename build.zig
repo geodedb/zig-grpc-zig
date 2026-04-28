@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     benchmark.root_module.linkLibrary(zlib_lib);
+    benchmark.root_module.addImport("build_options", build_options_mod);
     b.installArtifact(benchmark);
 
     // Benchmark step with automatic server management
@@ -155,6 +156,7 @@ pub fn build(b: *std.Build) void {
     });
     server_example.root_module.addImport("grpc", server_mod);
     server_example.root_module.linkLibrary(zlib_lib);
+    server_example.root_module.addImport("build_options", build_options_mod);
     b.installArtifact(server_example);
 
     const client_example = b.addExecutable(.{
@@ -167,6 +169,7 @@ pub fn build(b: *std.Build) void {
     });
     client_example.root_module.addImport("grpcclient", client_mod);
     client_example.root_module.linkLibrary(zlib_lib);
+    client_example.root_module.addImport("build_options", build_options_mod);
     b.installArtifact(client_example);
 
     // Tests
@@ -179,6 +182,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.linkLibrary(zlib_lib);
+    tests.root_module.addImport("build_options", build_options_mod);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
@@ -271,6 +275,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     admission_tests.root_module.linkLibrary(zlib_lib);
+    admission_tests.root_module.addImport("build_options", build_options_mod);
     const run_admission_tests = b.addRunArtifact(admission_tests);
     test_step.dependOn(&run_admission_tests.step);
 
@@ -322,6 +327,7 @@ pub fn build(b: *std.Build) void {
     integration_test_server.root_module.addImport("grpc", server_mod);
     integration_test_server.root_module.addImport("proto", integration_test_mod);
     integration_test_server.root_module.linkLibrary(zlib_lib);
+    integration_test_server.root_module.addImport("build_options", build_options_mod);
 
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
     const integration_test_step = b.step("integration_test", "Build integration test server");
@@ -343,6 +349,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     loopback_test.root_module.linkLibrary(zlib_lib);
+    loopback_test.root_module.addImport("build_options", build_options_mod);
 
     const install_loopback_test = b.addInstallArtifact(loopback_test, .{});
     const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
@@ -361,6 +368,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     dispatch_test.root_module.linkLibrary(zlib_lib);
+    dispatch_test.root_module.addImport("build_options", build_options_mod);
     const install_dispatch_test = b.addInstallArtifact(dispatch_test, .{});
     const dispatch_test_step = b.step("dispatch-test", "Build the path-based dispatch test");
     dispatch_test_step.dependOn(&install_dispatch_test.step);
@@ -377,6 +385,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     auth_gate_test.root_module.linkLibrary(zlib_lib);
+    auth_gate_test.root_module.addImport("build_options", build_options_mod);
     const install_auth_gate_test = b.addInstallArtifact(auth_gate_test, .{});
     const auth_gate_test_step = b.step("auth-gate-test", "Build the server-side auth gate test");
     auth_gate_test_step.dependOn(&install_auth_gate_test.step);
@@ -394,6 +403,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     handler_error_test.root_module.linkLibrary(zlib_lib);
+    handler_error_test.root_module.addImport("build_options", build_options_mod);
     const install_handler_error_test = b.addInstallArtifact(handler_error_test, .{});
     const handler_error_test_step = b.step("handler-error-test", "Build the handler-error trailer test");
     handler_error_test_step.dependOn(&install_handler_error_test.step);
@@ -443,6 +453,7 @@ pub fn build(b: *std.Build) void {
     });
     interop_server.root_module.linkLibrary(zlib_lib);
     interop_server.root_module.addImport("grpc-server", server_mod);
+    interop_server.root_module.addImport("build_options", build_options_mod);
     const install_interop_server = b.addInstallArtifact(interop_server, .{});
     const interop_server_step = b.step("interop-server", "Build the Zig interop server binary");
     interop_server_step.dependOn(&install_interop_server.step);
@@ -457,6 +468,7 @@ pub fn build(b: *std.Build) void {
     });
     interop_client.root_module.linkLibrary(zlib_lib);
     interop_client.root_module.addImport("grpc-client", client_mod);
+    interop_client.root_module.addImport("build_options", build_options_mod);
     const install_interop_client = b.addInstallArtifact(interop_client, .{});
     const interop_client_step = b.step("interop-client", "Build the Zig interop client binary");
     interop_client_step.dependOn(&install_interop_client.step);

@@ -85,6 +85,33 @@ pub const GrpcClient = struct {
     }
 
     pub fn call(self: *GrpcClient, method_path: []const u8, request: []const u8, compression_alg: compression.Compression.Algorithm) ![]u8 {
+        // Observability seam (Task 1.5). gRPC IS HTTP/2, so we use the
+        // otel HTTP helper directly with a synthesized URL. The seam is
+        // a comptime-known no-op when `-Dwith_otel=false`.
+        //
+        // Lifecycle: `startClientSpan` returns a `Span` value owned by
+        // the caller. We close it explicitly on the success path with
+        // gRPC status 0 and via `errdefer` with gRPC INTERNAL (13) on
+        // any error. The defer span.end(null) below is the
+        // belt-and-suspenders fallback the recipe requires — when the
+        // seam is enabled, both `endClientSpan` and `span.end` are
+        // idempotent for status reporting (only the first attribute
+        // write wins; the second `end` is a redundant no-op). When the
+        // seam is disabled the entire block compiles out.
+        var __obs_url_buf: [256]u8 = undefined;
+        const __obs_url = std.fmt.bufPrint(
+            __obs_url_buf[0..],
+            "grpc://{s}/{s}",
+            .{ self.transport.authority, method_path },
+        ) catch method_path;
+        var __obs_span = observability.startClientSpan(.{
+            .method = "POST",
+            .route = method_path,
+            .url = __obs_url,
+        });
+        defer __obs_span.end(null);
+        errdefer observability.endClientSpan(__obs_span, 13); // gRPC INTERNAL
+
         // Add auth token if available. Closes GAP-0002: the headers map
         // is now passed through to the transport instead of being thrown
         // away after construction. Token bytes are owned by `headers`
@@ -114,6 +141,8 @@ pub const GrpcClient = struct {
         defer self.allocator.free(response_bytes);
 
         // Decompress response
-        return self.compression.decompress(response_bytes, compression_alg);
+        const result = try self.compression.decompress(response_bytes, compression_alg);
+        observability.endClientSpan(__obs_span, 0); // gRPC OK
+        return result;
     }
 };
