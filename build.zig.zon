@@ -13,8 +13,8 @@
         // builds hermetic and free of otel symbols. Pin tracked in
         // otel/docs/plan/otel-rollout.md Task 0.3.
         .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel#20078af231c069d88eaeb79dcf950b94366be624",
-            .hash = "otel-0.1.0-B0v3lsl9MwCHrG8GDrxdFebugqjybfr4KAiplOJKCRG7",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git#e7a0fca548524061bb89aa1e0956709d412438d1",
+            .hash = "otel-0.1.0-B0v3lpwNNAAeClYawUg8O3BtgOdMPhevogg0BkyAaGM2",
             .lazy = true,
         },
     },
