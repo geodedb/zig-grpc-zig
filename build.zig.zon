@@ -1,6 +1,6 @@
 .{
     .name = .grpc_zig,
-    .version = "0.1.3",
+    .version = "0.1.4",
     .fingerprint = 0xbcaa61f2a4ef59ec,
     .dependencies = .{
         .zlib = .{
