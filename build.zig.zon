@@ -7,16 +7,6 @@
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
             .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",
         },
-        // otel — only fetched when -Dwith_otel=true reaches the
-        // `b.lazyDependency("otel", ...)` call in build.zig. With the
-        // flag off, Zig never resolves this entry, keeping disabled
-        // builds hermetic and free of otel symbols. Pin tracked in
-        // otel/docs/plan/otel-rollout.md Task 0.3.
-        .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#7deab7fa53ff47f3e01b934ea01a139bcfed0c72",
-            .hash = "otel-0.1.0-B0v3lrgNNABguHBo8K_wuApcbbDJzyV0iUu2U0E4tLao",
-            .lazy = true,
-        },
     },
     .paths = .{
         "build.zig",
