@@ -11,7 +11,7 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 1. **HPACK / codec depth.** Static-table coverage and dynamic-table byte-bounded eviction still incomplete (GAP-0005). Knock-on effects on metadata-heavy traces and conformance fuzzing (GAP-0015).
 2. **Feature surface advertised but not shipped.** Bidi streaming + interop coverage (GAP-0007, GAP-0014), health on the wire (GAP-0008), built-in TLS + ALPN (GAP-0009), gzip/encoding (GAP-0011), generic proto3 codec (GAP-0006), interop matrix breadth (GAP-0012), CI perf gating (GAP-0013), observability surface (GAP-0016).
 3. **Verifier follow-ups from gap-close.** Both 2026-04-26 verifier carry-overs (`GAP-FU-001`, `GAP-FU-002`) are now closed; resolutions live in `docs/GAP_ANALYSIS_RESOLVED.md`.
-4. **New finding from the 2026-06-11 audit-fix pass.** The benchmark single-call `GrpcClient` path fails 100% with `error.ParseFailed` (GAP-0018) -- pre-existing, client-side, untriaged; the loopback/mux path is unaffected.
+4. **GAP-0018 RESOLVED (2026-06-12).** The benchmark single-call path failure was triaged and fixed as a cluster: a connection-thread stack overflow (segfault / remote DoS), a `readMessage` hang on trailer-only responses, single-call stream-id reuse, a `streamCall` stale-trailer bug, example handler-path mismatches, and a `--host localhost` DNS-parse failure. See `docs/GAP_ANALYSIS_RESOLVED.md`. A residual hostname-resolution limitation is now tracked as GAP-0019.
 
 ## Blockers for Phase 4 issue creation
 
@@ -190,20 +190,15 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Recommended fix:** Define `Logger` interface (vtable); minimal metrics surface (counter/histogram); optional tracing span API; default impl backed by `std.log` and counters.
 - **Acceptance criteria:** Custom logger injectable; per-RPC metrics emitted; documented in README.
 
-### GAP-0018: Benchmark single-call GrpcClient path returns error.ParseFailed (100% failure) [NEW finding 2026-06-11]
+### GAP-0019: Client cannot connect by hostname (no DNS resolution) [NEW finding 2026-06-12]
 
-- **Issue:** _not yet filed_ (recorded here for the next audit iteration to triage)
-- **Category:** Correctness (client / transport)
-- **Severity:** High (until triaged)
-- **Requirement source:** New finding observed during the 2026-06-11 audit-fix pass while running `zig build benchmark`.
-- **Note on Gap-ID:** `GAP-0017` is already taken (`docs/GAP_ANALYSIS_RESOLVED.md`, "Zero dependencies claim verified"); this new finding is assigned `GAP-0018` to avoid collision.
-- **Pre-existing, NOT caused by this pass:** The benchmark touched in this pass only removed the hardcoded secret and parallelized workers; the transport/parse path was untouched. Removing the hardcoded secret did not change the symptom. The failure reproduces independently of the audit-fix changes.
-- **Symptom (evidence):**
-  - `zig build benchmark` against the example server reports a 100% error rate; every single-call attempt fails with `error.ParseFailed`.
-  - The example server log is empty, so the failure is client-side and occurs before any auth/dispatch on the server.
-- **Scope:**
-  - Confined to the single-call path: `GrpcClient.call` -> `readMessage`.
-  - The loopback / multiplexed `ClientMux` path works (loopback ALL SCENARIOS PASSED at HEAD), so this is specific to the single-call response-parse path, not the shared framing.
-- **Why this is a gap:** A documented, shipped benchmark entrypoint fails 100% of the time on its primary single-call path, masking real throughput/latency numbers and indicating a likely response-parse defect in `GrpcClient.call`/`readMessage`.
-- **Recommended fix:** Triage in the next iteration -- capture the raw bytes the client receives before `readMessage` parses them, compare against the loopback/mux path that succeeds, and determine whether the defect is in frame reassembly, the gRPC length-prefix decode, or HEADERS handling on the single-call path.
-- **Acceptance criteria:** `zig build benchmark` against the example server completes with a 0% `error.ParseFailed` rate; a regression test exercises the single-call `GrpcClient.call` response-parse path directly.
+- **Issue:** _not yet filed_ (recorded here for the next audit iteration)
+- **Category:** Feature gap (client / transport)
+- **Severity:** Medium
+- **Requirement source:** Observed during GAP-0018 triage: `zig build benchmark --host localhost` failed in `GrpcClient.init` with `error.ParseFailed` before any request.
+- **Current state (evidence):**
+  - `GrpcClient.init`/`ClientMux.init` resolve the target via `std.Io.net.IpAddress.resolve`, which parses literal IPv4/IPv6 addresses only -- it does NOT perform DNS resolution. Passing a hostname (e.g. `localhost`, `example.com`) returns `error.ParseFailed`.
+  - Verified: `--host 127.0.0.1` succeeds (5/5), `--host localhost` fails (5/5 ParseFailed). The `zig build benchmark` invocation was changed to `127.0.0.1` as a workaround (commit db78b15).
+- **Why this is a gap:** The README and examples imply hostname connectivity ("localhost"); clients can currently only dial literal IPs. Real deployments target DNS names.
+- **Recommended fix:** Add a resolver step (getaddrinfo / `std.net` name resolution) in the client connect path, or document the literal-IP-only limitation explicitly and provide a helper. Decide whether DNS belongs in the library or is the embedder's responsibility.
+- **Acceptance criteria:** `GrpcClient.init(allocator, io, "localhost", port)` connects successfully, OR the limitation is explicitly documented with a sanctioned resolution helper; a test covers the chosen behavior.

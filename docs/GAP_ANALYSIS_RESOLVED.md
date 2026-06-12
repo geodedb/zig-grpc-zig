@@ -15,6 +15,21 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 
 ## Functional / Feature Gap Resolutions
 
+### GAP-0018: Benchmark/example single-call path -- segfault + 100% failure cluster [RESOLVED 2026-06-12]
+
+- **Category:** Correctness / security (server + single-call client)
+- **Discovered:** 2026-06-11 audit-fix pass (running `zig build benchmark`); deep-triaged 2026-06-12.
+- **Root cause was a CLUSTER of six distinct defects, all pre-existing:**
+  1. **Connection-thread stack overflow (HIGH / remote DoS).** The 512 KiB per-connection thread stack (CC-4) overflowed in Zig 0.16's `DebugAllocator` DWARF self-unwinder during `Transport.initServer` -> `allocStreamWindows` -- SIGSEGV on the FIRST accepted connection, pre-auth. Fixed `77ed8d4`: stack size configurable via `GRPC_ZIG_CONN_STACK_SIZE` (64 KiB floor), safe 8 MiB default; regression-gated by `zig build conn-stack-test`.
+  2. **`readMessage` hang on trailer-only responses.** A trailer-only `HEADERS(END_STREAM)` (UNIMPLEMENTED / auth-fail / handler-error) made the single-call client loop forever. Fixed via `StreamEndedWithoutMessage` + the stream-id-filtered read below (`6ef4497`).
+  3. **Single-call stream-id reuse (protocol violation).** `GrpcClient.call`/`streamCall` reused stream id 1 on every call. Fixed `6ef4497`: `Transport.nextClientStreamId` allocates fresh odd ids.
+  4. **Stale-trailer interleaving.** Because each unary response leaves its trailer unread, the next reused-stream read misread it. Fixed `6ef4497`: `readMessageOnStream(expected_sid)` skips frames from completed streams; server `readMessage` path unchanged (`readMessageCore(null)`).
+  5. **`streamCall` stale-trailer (latent).** `readStreamFrame` was not stream-id filtered. Fixed `db78b15`: `readStreamFrameOnStream(expected_sid)`; `readStreamFrame` preserved as `readStreamFrameCore(null)`.
+  6. **Example handler-path mismatch + `--host localhost`.** The example server registered bare handler names not matching the full gRPC `:path`, and the benchmark used `--host localhost` which `IpAddress.resolve` (literal-IP-only) rejects with `error.ParseFailed`. Fixed `db78b15`: full `:path` handler names + `--host 127.0.0.1`. (The hostname/DNS limitation itself is now tracked separately as GAP-0019.)
+- **Resolution commits:** `77ed8d4`, `6ef4497`, `db78b15` (+ docs `c5891ef`).
+- **Verification:** `zig build benchmark` now reports 10/10 successful, 0% error rate, no segfault; `zig build conn-stack-test`, `loopback-test`, `dispatch-test`, and `zig build test` all green; new FakeStream unit tests cover the trailer-only, stale-trailer-skip, stream-id-allocation, and stream-filtered streaming paths under a leak-detecting allocator.
+- **Resolved date:** 2026-06-12
+
 ### GAP-0017: "Zero dependencies" claim verified [RESOLVED]
 
 - **Issue:** none (resolved at gap-detection time; no platform issue created)
