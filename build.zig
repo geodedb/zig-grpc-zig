@@ -278,6 +278,22 @@ pub fn build(b: *std.Build) void {
     const run_transport_continuation_tests = b.addRunArtifact(transport_continuation_tests);
     test_step.dependOn(&run_transport_continuation_tests.step);
 
+    // HPACK Huffman decode + dynamic-table unit tests (closes I2 / #47 and
+    // T1 / #63). Exercises `Transport.huffmanDecodeChecked` against the
+    // RFC 7541 §C vectors and asserts fail-closed behavior on EOS/unmapped/
+    // overflow, plus the HPACK dynamic-table push/get roundtrip.
+    const hpack_decode_tests = b.addTest(.{
+        .name = "hpack-decode-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hpack_decode_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    hpack_decode_tests.root_module.linkLibrary(zlib_lib);
+    const run_hpack_decode_tests = b.addRunArtifact(hpack_decode_tests);
+    test_step.dependOn(&run_hpack_decode_tests.step);
+
     // Client-side DATA delivery unit tests (closes quality R2 / #57 +
     // NEW-1 client side). Exercises the extracted `client_mux.deliverData`
     // core directly to assert the err-implies-end_stream invariant on all
@@ -403,6 +419,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&endstream_tests.step);
     check_step.dependOn(&auth_tests.step);
     check_step.dependOn(&hpack_varint_tests.step);
+    check_step.dependOn(&hpack_decode_tests.step);
     check_step.dependOn(&max_frame_size_tests.step);
     check_step.dependOn(&flow_control_tests.step);
     check_step.dependOn(&admission_tests.step);

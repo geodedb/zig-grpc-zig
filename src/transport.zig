@@ -29,6 +29,10 @@ pub const TransportError = error{
     /// MAX_HEADER_BLOCK_BYTES, or CONTINUATION sequencing violated
     /// RFC 7540 §6.10. Closes I5 (#48).
     HeaderBlockTooLarge,
+    /// Huffman-coded HPACK string contained the EOS symbol, an unmapped
+    /// code, invalid trailing padding, or overflowed the output buffer
+    /// (RFC 7541 §5.2). Decoding fails closed. Closes I2 (#47).
+    HuffmanDecodeError,
     ProtocolError,
 };
 
@@ -665,6 +669,16 @@ pub const Transport = struct {
     /// the negotiated max — closes I3.
     pub fn checkFrameSize(length: u32, max: u32) TransportError!void {
         if (length > max) return TransportError.FrameSizeError;
+    }
+
+    /// Test-only aliases for the private HPACK dynamic-table internals
+    /// (T1 / #63). Not for production use.
+    pub const HpackDynEntryForTest = HpackDynEntry;
+    pub fn hpackDynPushForTest(self: *Transport, is_path: bool) void {
+        self.hpackDynPush(is_path);
+    }
+    pub fn hpackDynGetForTest(self: *Transport, dyn_idx: usize) ?*const HpackDynEntry {
+        return self.hpackDynGet(dyn_idx);
     }
 
     /// Pure check: declared gRPC message length vs the configured cap.
@@ -1648,41 +1662,49 @@ pub const Transport = struct {
         .{ .bits = 19, .first_code = 0x7fff0, .syms = &[_]u8{ '\\', '{' } },
     };
 
-    /// Decode an RFC 7541 HPACK Huffman-encoded byte string into plaintext.
-    /// Returns the number of decoded bytes written to `out`.
-    fn huffmanDecode(encoded: []const u8, out: []u8) usize {
+    /// Decode an RFC 7541 Huffman-coded byte string. Returns the number
+    /// of decoded bytes written to `out`. Fails closed with
+    /// HuffmanDecodeError on: an unmapped code (incl. all non-printable /
+    /// high-byte symbols this table doesn't carry — gRPC metadata is
+    /// ASCII, so this is safe), the EOS symbol in the body, invalid
+    /// trailing padding, or output-buffer overflow. Public for tests.
+    /// Closes I2 (#47).
+    pub fn huffmanDecodeChecked(encoded: []const u8, out: []u8) TransportError!usize {
         var out_pos: usize = 0;
-        var acc: u32 = 0; // bit accumulator
-        var acc_bits: u8 = 0; // number of valid bits in acc
-
+        var acc: u32 = 0;
+        var acc_bits: u8 = 0;
         for (encoded) |byte| {
-            // Process each bit from MSB to LSB
             var b: u8 = byte;
             var bit_i: u4 = 0;
             while (bit_i < 8) : (bit_i += 1) {
                 acc = (acc << 1) | ((b >> 7) & 1);
                 acc_bits += 1;
                 b <<= 1;
-
-                // Try to match accumulated bits against each group
                 for (huff_groups) |grp| {
-                    if (acc_bits == grp.bits) {
-                        if (acc >= grp.first_code and acc < grp.first_code + grp.syms.len) {
-                            if (out_pos < out.len) {
-                                out[out_pos] = grp.syms[acc - grp.first_code];
-                                out_pos += 1;
-                            }
-                            acc = 0;
-                            acc_bits = 0;
-                            break;
-                        }
+                    if (acc_bits == grp.bits and acc >= grp.first_code and acc < grp.first_code + grp.syms.len) {
+                        if (out_pos >= out.len) return TransportError.HuffmanDecodeError;
+                        out[out_pos] = grp.syms[acc - grp.first_code];
+                        out_pos += 1;
+                        acc = 0;
+                        acc_bits = 0;
+                        break;
                     }
                 }
-
-                // If we've accumulated too many bits without a match, stop
-                // (would only happen for control chars / high bytes not in table)
-                if (acc_bits > 19) return out_pos;
+                // No symbol in this table exceeds 19 bits; once we pass
+                // the longest code length without a match the remaining
+                // bits cannot be a code we carry (or are the EOS run).
+                // Treat as a decode error rather than silently dropping.
+                if (acc_bits > 19) return TransportError.HuffmanDecodeError;
             }
+        }
+        // RFC 7541 §5.2: any leftover bits must be fewer than 8 and must
+        // be the most-significant bits of the EOS code (all ones). A
+        // full all-ones run that reached here (acc_bits would have
+        // tripped the >19 guard) is already rejected above.
+        if (acc_bits >= 8) return TransportError.HuffmanDecodeError;
+        if (acc_bits > 0) {
+            const ones: u32 = (@as(u32, 1) << @as(u5, @intCast(acc_bits))) - 1;
+            if (acc != ones) return TransportError.HuffmanDecodeError;
         }
         return out_pos;
     }
@@ -1907,8 +1929,10 @@ pub const Transport = struct {
             @memcpy(self.last_method[0..copy_len], str_bytes[0..copy_len]);
             self.last_method_len = copy_len;
         } else {
-            // Huffman encoded — decode using RFC 7541 table
-            self.last_method_len = huffmanDecode(str_bytes, &self.last_method);
+            // Huffman-encoded. On any decode error leave the method empty
+            // (fail closed): the dispatcher then returns UNIMPLEMENTED
+            // rather than routing on a truncated path. Closes I2.
+            self.last_method_len = huffmanDecodeChecked(str_bytes, &self.last_method) catch 0;
         }
     }
 
@@ -1928,7 +1952,9 @@ pub const Transport = struct {
             @memcpy(self.last_authorization[0..copy_len], str_bytes[0..copy_len]);
             self.last_authorization_len = copy_len;
         } else {
-            self.last_authorization_len = huffmanDecode(str_bytes, &self.last_authorization);
+            // Fail closed: an undecodable authorization is treated as
+            // absent and rejected by the auth gate. Closes I2.
+            self.last_authorization_len = huffmanDecodeChecked(str_bytes, &self.last_authorization) catch 0;
         }
     }
 
