@@ -15,6 +15,15 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 
 ## Functional / Feature Gap Resolutions
 
+### CM-UAF: ClientMux stack-slot use-after-free race [RESOLVED 2026-06-12]
+
+- **Category:** Concurrency / memory safety (client multiplexer)
+- **Discovered:** 2026-06-12 convergence security review (pre-existing; not introduced by the audit-fix pass).
+- **Defect:** `readerLoop`'s `findStream` released `streams_mutex` before re-acquiring the per-call `slot.mutex`. In that TOCTOU window the owning `callWithMetadata` (whose `StreamSlot` is stack-allocated) could `unregisterStream` + `slot.deinit` and return, freeing the slot while the reader thread still held/used the pointer -- a use-after-free under concurrent multiplexed load.
+- **Resolution commit:** `bcbc73a` -- hold `streams_mutex` across the entire `slot.mutex` critical section in the `.DATA`/`.HEADERS`/`.RST_STREAM` arms, so `unregisterStream` (which needs `streams_mutex`) cannot free the slot mid-use. Global lock order is now uniformly `streams_mutex -> slot.mutex` (matching `broadcastError`); `findStream` removed. Socket I/O (`free`/`maybeRefillRecvWindow`/WINDOW_UPDATE writes) kept strictly outside `streams_mutex`, so no `streams_mutex -> write_mutex` nesting is introduced.
+- **Verification:** lock-order enumeration confirms no inverse ordering (deadlock-free, validated against Zig 0.16 `waitUncancelable` semantics + the `callWithMetadata` defer LIFO order); `zig build test` green; loopback `[6/6]` concurrent scenario (128 calls multiplexed on one connection) passed 13/13 runs with no crash/hang/leak.
+- **Resolved date:** 2026-06-12
+
 ### GAP-0018: Benchmark/example single-call path -- segfault + 100% failure cluster [RESOLVED 2026-06-12]
 
 - **Category:** Correctness / security (server + single-call client)

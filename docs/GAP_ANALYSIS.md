@@ -202,3 +202,17 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Why this is a gap:** The README and examples imply hostname connectivity ("localhost"); clients can currently only dial literal IPs. Real deployments target DNS names.
 - **Recommended fix:** Add a resolver step (getaddrinfo / `std.net` name resolution) in the client connect path, or document the literal-IP-only limitation explicitly and provide a helper. Decide whether DNS belongs in the library or is the embedder's responsibility.
 - **Acceptance criteria:** `GrpcClient.init(allocator, io, "localhost", port)` connects successfully, OR the limitation is explicitly documented with a sanctioned resolution helper; a test covers the chosen behavior.
+
+### GAP-0020: No PING/control-frame flood resistance (no per-connection frame budget or idle/read timeout) [NEW finding 2026-06-12]
+
+- **Issue:** _not yet filed_ (recorded here)
+- **Category:** Resilience / DoS (transport, client + server)
+- **Severity:** Medium
+- **Requirement source:** Surfaced by the 2026-06-12 convergence security review (HTTP/2 PING-flood class, cf. CVE-2019-9512 / CWE-835).
+- **Current state (evidence):**
+  - The read loops (`readMessageCore`/`readStreamFrameCore` in `src/transport.zig`, and the server's `handleConnection` read loop) handle `PING`/`WINDOW_UPDATE`/`SETTINGS` control frames by `continue`-ing with NO per-connection frame-count budget and NO idle/read deadline. `readFrame` enforces only per-frame SIZE (`max_frame_size`), not count or time. `flow_credit_timeout_ns` bounds only WRITE-credit waits, not reads.
+  - A malicious peer can stream `PING(non-ACK)` (forcing PONG) or `WINDOW_UPDATE` forever; the read loop spins responding without ever returning. Pre-existing and transport-wide (affects both the single-call client read and the server connection thread); bounded only by the admission cap (1024 connection threads), so it is CPU/bandwidth abuse rather than memory exhaustion.
+  - NOTE: this is distinct from and broader than NEW-A (the stream-id-skip loop, fixed in `df4813b` with `MAX_SKIPPED_FRAMES`). NEW-A bounded mis-stream DATA/HEADERS; control-frame floods are a separate, pre-existing class.
+- **Why this is a gap:** A standard HTTP/2 hardening requirement (RFC 7540 §6.7 / the 2019 HTTP/2 DoS family) is unmet; a single connection can pin a server thread at 100% CPU pre-dispatch.
+- **Recommended fix:** Add a per-connection control-frame rate/budget (e.g. reset-per-progress counter like `MAX_SKIPPED_FRAMES`, applied to PING/WINDOW_UPDATE on both read paths) and/or a read/idle deadline on `readFrame` for served connections (GOAWAY(ENHANCE_YOUR_CALM) on breach). Design once, apply to client and server read loops.
+- **Acceptance criteria:** A peer flooding PING/WINDOW_UPDATE is disconnected after a bounded number of non-progress control frames (or an idle deadline); a regression test drives the flood and asserts a bounded error/GOAWAY rather than an unbounded loop.
