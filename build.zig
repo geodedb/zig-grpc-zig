@@ -261,6 +261,23 @@ pub fn build(b: *std.Build) void {
     const run_transport_recv_limit_tests = b.addRunArtifact(transport_recv_limit_tests);
     test_step.dependOn(&run_transport_recv_limit_tests.step);
 
+    // Client-side DATA delivery unit tests (closes quality R2 / #57 +
+    // NEW-1 client side). Exercises the extracted `client_mux.deliverData`
+    // core directly to assert the err-implies-end_stream invariant on all
+    // failure paths (bad prefix, over-cap, OOM) so a blocked caller never
+    // deadlocks, plus the client-side response accumulation cap.
+    const client_mux_tests = b.addTest(.{
+        .name = "client-mux-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client_mux_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    client_mux_tests.root_module.linkLibrary(zlib_lib);
+    const run_client_mux_tests = b.addRunArtifact(client_mux_tests);
+    test_step.dependOn(&run_client_mux_tests.step);
+
     // SETTINGS_MAX_FRAME_SIZE enforcement tests (closes I3 / GitLab security
     // issue #8). Verifies oversize peer-declared frame lengths are rejected
     // before allocation and that the GOAWAY response carries

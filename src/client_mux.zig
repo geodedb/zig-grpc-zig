@@ -23,7 +23,7 @@ const Allocator = std.mem.Allocator;
 /// Per-stream completion slot. The owning call() thread allocates this on
 /// its stack, registers it with the mux, writes its request, then blocks on
 /// `cond` until the reader thread sets `end_stream` (or `err`).
-const StreamSlot = struct {
+pub const StreamSlot = struct {
     /// Concatenated DATA-frame payloads for this stream, gRPC 5-byte prefix
     /// stripped. Built up by the reader thread; consumed by the caller after
     /// `end_stream` is signaled.
@@ -33,10 +33,51 @@ const StreamSlot = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
 
-    fn deinit(self: *StreamSlot, allocator: Allocator) void {
+    pub fn deinit(self: *StreamSlot, allocator: Allocator) void {
         self.data.deinit(allocator);
     }
 };
+
+/// Core of readerLoop's DATA handling, extracted for unit testing
+/// (closes quality R2 / #57). Caller MUST hold `slot.mutex` and is
+/// responsible for calling `slot.cond.broadcast` after this returns
+/// whenever `slot.end_stream` is true.
+///
+/// Invariant: on ANY failure (bad prefix, over-cap, OOM) this sets
+/// BOTH `slot.err` and `slot.end_stream` — never just `err` — so a
+/// caller blocked on `while (!slot.end_stream)` always wakes.
+pub fn deliverData(
+    slot: *StreamSlot,
+    allocator: Allocator,
+    payload: []const u8,
+    end: bool,
+    max_recv_message_bytes: u32,
+) void {
+    if (payload.len >= 5) {
+        if (transport.decodeGrpcPrefix(payload)) |prefix| {
+            const msg_len = prefix.msg_len;
+            const over_cap = msg_len > max_recv_message_bytes or
+                slot.data.items.len + msg_len > max_recv_message_bytes;
+            if (over_cap) {
+                slot.err = transport.TransportError.MessageTooLarge;
+                slot.end_stream = true;
+                return;
+            }
+            if (payload.len >= 5 + msg_len) {
+                slot.data.appendSlice(allocator, payload[5 .. 5 + msg_len]) catch |e| {
+                    slot.err = e;
+                    slot.end_stream = true;
+                    return;
+                };
+            }
+        } else |e| {
+            slot.err = e;
+            slot.end_stream = true;
+            return;
+        }
+    }
+    if (end) slot.end_stream = true;
+}
 
 pub const ClientMux = struct {
     allocator: Allocator,
@@ -254,23 +295,9 @@ fn readerLoop(self: *ClientMux) void {
                 const data_len: u32 = @intCast(payload.len);
                 if (self.findStream(sid)) |slot| {
                     slot.mutex.lockUncancelable(self.io);
-                    defer slot.mutex.unlock(self.io);
-                    if (payload.len >= 5) {
-                        if (transport.decodeGrpcPrefix(payload)) |prefix| {
-                            const msg_len = prefix.msg_len;
-                            if (payload.len >= 5 + msg_len) {
-                                slot.data.appendSlice(self.allocator, payload[5 .. 5 + msg_len]) catch |e| {
-                                    slot.err = e;
-                                };
-                            }
-                        } else |e| {
-                            slot.err = e;
-                        }
-                    }
-                    if (end) {
-                        slot.end_stream = true;
-                        slot.cond.broadcast(self.io);
-                    }
+                    deliverData(slot, self.allocator, payload, end, self.transport.max_recv_message_bytes);
+                    if (slot.end_stream) slot.cond.broadcast(self.io);
+                    slot.mutex.unlock(self.io);
                 }
                 self.allocator.free(payload);
                 // Refill receive window so the server keeps sending
