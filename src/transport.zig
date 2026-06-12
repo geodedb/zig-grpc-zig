@@ -34,6 +34,11 @@ pub const TransportError = error{
     /// (RFC 7541 §5.2). Decoding fails closed. Closes I2 (#47).
     HuffmanDecodeError,
     ProtocolError,
+    /// The peer ended the stream with a trailer-only HEADERS frame
+    /// (END_STREAM, no DATA) before any gRPC message — e.g. a gRPC error
+    /// status (UNIMPLEMENTED / UNAUTHENTICATED / handler error). The
+    /// single-call client surfaces this instead of blocking forever.
+    StreamEndedWithoutMessage,
 };
 
 /// Default SETTINGS_MAX_FRAME_SIZE per RFC 7540 §6.5.2 — every HTTP/2
@@ -563,6 +568,17 @@ pub const Transport = struct {
         if (self.stream_send_windows.len > 0) self.allocator.free(self.stream_send_windows);
         if (self.stream_recv_windows.len > 0) self.allocator.free(self.stream_recv_windows);
         self.ioClose();
+    }
+
+    /// Allocate the next CLIENT-initiated stream id (odd, monotonically
+    /// increasing per RFC 7540 §5.1.1) for the single-call client path,
+    /// advancing `last_stream_id`. Returns error.StreamIdExhausted rather
+    /// than wrapping (a wrap would collide with a live/closed stream).
+    pub fn nextClientStreamId(self: *Transport) error{StreamIdExhausted}!u31 {
+        const sid = self.last_stream_id;
+        if (sid > std.math.maxInt(u31) - 2) return error.StreamIdExhausted;
+        self.last_stream_id = sid + 2;
+        return sid;
     }
 
     fn setupHttp2Client(self: *Transport) !void {
@@ -1323,17 +1339,48 @@ pub const Transport = struct {
         self.conn_recv_window = ADVERTISED_INITIAL_WINDOW_SIZE;
     }
 
-    /// Read the next gRPC message from the connection.
-    /// Handles standard gRPC framing: skips HEADERS, SETTINGS, WINDOW_UPDATE,
-    /// PING frames, and extracts the protobuf payload from DATA frames by
-    /// stripping the 5-byte gRPC length-prefixed message header.
+    /// Read the next gRPC message from the connection, accepting frames
+    /// from ANY stream (the SERVER's behavior — it learns the stream id
+    /// from the inbound request HEADERS and never sees a trailer-only
+    /// client request). Thin wrapper over `readMessageCore(null)`;
+    /// observable behavior is byte-for-byte identical to the pre-Iter2
+    /// `readMessage`.
+    pub fn readMessage(self: *Transport) ![]const u8 {
+        return self.readMessageCore(null);
+    }
+
+    /// Read a single unary gRPC message, FILTERED to `expected_sid` — the
+    /// CLIENT single-call path. Skips stale frames left in the buffer by a
+    /// previously-completed stream (e.g. the unread trailer of call N-1),
+    /// and surfaces a trailer-only close (a lone `HEADERS(END_STREAM)` for
+    /// the expected stream, with no DATA) as
+    /// `TransportError.StreamEndedWithoutMessage` instead of blocking
+    /// forever. Control frames (SETTINGS / WINDOW_UPDATE / PING / etc.) are
+    /// handled regardless of stream, exactly as `readMessage`.
+    pub fn readMessageOnStream(self: *Transport, expected_sid: u31) ![]const u8 {
+        return self.readMessageCore(expected_sid);
+    }
+
+    /// Shared core for `readMessage` (expected_sid == null, server/legacy
+    /// behavior) and `readMessageOnStream` (expected_sid != null, client
+    /// stream-id filter). When `expected_sid` is null this is byte-for-byte
+    /// the historical `readMessage`: HEADERS always `continue`, no
+    /// END_STREAM inspection, DATA from any stream assembled. When
+    /// `expected_sid` is set: HEADERS/DATA from other streams are skipped,
+    /// and a trailer-only HEADERS(END_STREAM) on the expected stream yields
+    /// `StreamEndedWithoutMessage`.
+    ///
+    /// Handles standard gRPC framing: skips HEADERS, SETTINGS,
+    /// WINDOW_UPDATE, PING frames, and extracts the protobuf payload from
+    /// DATA frames by stripping the 5-byte gRPC length-prefixed message
+    /// header.
     ///
     /// I3 — a single gRPC message may span multiple HTTP/2 DATA frames
     /// because we honour SETTINGS_MAX_FRAME_SIZE on outbound (and so do
     /// well-behaved peers). We accumulate DATA frames into a per-call
     /// buffer until we have the full gRPC message indicated by the
     /// length-prefix in the first 5 bytes.
-    pub fn readMessage(self: *Transport) ![]const u8 {
+    fn readMessageCore(self: *Transport, expected_sid: ?u31) ![]const u8 {
         var grpc_buf: std.ArrayList(u8) = .empty;
         defer grpc_buf.deinit(self.allocator);
         while (true) {
@@ -1343,6 +1390,17 @@ pub const Transport = struct {
 
             switch (frame_type) {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
+                    // Client filter: skip DATA from a stale/other stream,
+                    // but still refill the receive window so flow control
+                    // stays balanced.
+                    if (expected_sid) |sid| {
+                        if (frame.stream_id != sid) {
+                            const skip_len: u32 = @intCast(payload.len);
+                            self.allocator.free(payload);
+                            self.maybeRefillRecvWindow(frame.stream_id, skip_len);
+                            continue;
+                        }
+                    }
                     // Append this fragment; the gRPC message may have
                     // been split across multiple HTTP/2 DATA frames.
                     const data_len: u32 = @intCast(payload.len);
@@ -1384,7 +1442,37 @@ pub const Transport = struct {
                     return result;
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
-                    self.last_stream_id = frame.stream_id;
+                    // Client filter: skip a HEADERS frame (stale trailer or
+                    // response headers) belonging to a completed/other
+                    // stream WITHOUT inspecting END_STREAM — that close
+                    // belongs to a different call. The header block is freed
+                    // (and any CONTINUATION fragments drained) so no bytes
+                    // are left mid-stream.
+                    if (expected_sid) |sid| {
+                        if (frame.stream_id != sid) {
+                            const end_headers = (frame.flags & http2.frame.FrameFlags.END_HEADERS) != 0;
+                            if (end_headers) {
+                                self.allocator.free(payload);
+                            } else {
+                                const block = self.collectContinuations(frame.stream_id, payload) catch |err| {
+                                    self.allocator.free(payload);
+                                    return err;
+                                };
+                                self.allocator.free(payload);
+                                self.allocator.free(block);
+                            }
+                            continue;
+                        }
+                    }
+                    // SERVER path (expected_sid == null) learns the stream
+                    // id from the inbound request HEADERS. The CLIENT
+                    // filtered path must NOT touch `last_stream_id` — that
+                    // field is the client's monotonic allocation counter
+                    // (advanced only by `nextClientStreamId`). Overwriting
+                    // it with the response stream id would make the NEXT
+                    // call reuse this id, re-introducing the stream-id-reuse
+                    // bug this method exists to fix.
+                    if (expected_sid == null) self.last_stream_id = frame.stream_id;
                     const end_headers = (frame.flags & http2.frame.FrameFlags.END_HEADERS) != 0;
                     if (end_headers) {
                         self.extractPathFromHpack(payload);
@@ -1398,6 +1486,16 @@ pub const Transport = struct {
                         self.allocator.free(payload);
                         self.extractPathFromHpack(block);
                         self.allocator.free(block);
+                    }
+                    // Client filter only: a trailer-only close on the
+                    // expected stream (HEADERS with END_STREAM and no DATA)
+                    // is a gRPC error status. Surface it rather than looping
+                    // forever waiting for a DATA frame that never comes. The
+                    // server path (expected_sid == null) keeps the old
+                    // `continue` — its observable behavior is unchanged.
+                    if (expected_sid != null) {
+                        const end_stream = (frame.flags & http2.frame.FrameFlags.END_STREAM) != 0;
+                        if (end_stream) return TransportError.StreamEndedWithoutMessage;
                     }
                     continue;
                 },

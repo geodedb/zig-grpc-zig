@@ -72,7 +72,16 @@ pub const GrpcClient = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        try self.transport.writeRequest(compressed, method_path);
+        // Allocate a fresh client-initiated stream id for this streaming
+        // call (same monotonic allocator as `call`), so a streamCall that
+        // follows a unary call on the same client uses a fresh, valid id
+        // rather than reusing `last_stream_id`. `readStreamFrame` already
+        // stops on END_STREAM; in the loopback streaming scenario the
+        // streamCall is the first/only call on its connection, so there is
+        // no stale trailer to filter — leaving `readStreamFrame` unchanged
+        // keeps that scenario green.
+        const sid = try self.transport.nextClientStreamId();
+        try self.transport.writeRequestOnStream(sid, compressed, method_path);
 
         while (true) {
             const sf = try self.transport.readStreamFrame();
@@ -136,12 +145,21 @@ pub const GrpcClient = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        try self.transport.writeRequestWithMetadata(
+        // Allocate a FRESH client-initiated stream id for THIS call. The
+        // single-call path previously reused `last_stream_id` (always 1),
+        // so the 2nd+ sequential call on the same client reused HTTP/2
+        // stream id 1 — a closed-stream reuse violation that also left the
+        // prior call's trailer unread in the buffer. With a fresh sid plus
+        // a stream-id-filtered read below, a stale trailer from call N-1 is
+        // skipped instead of being misread as call N's response.
+        const sid = try self.transport.nextClientStreamId();
+        try self.transport.writeRequestOnStreamWithMetadata(
+            sid,
             compressed,
             method_path,
             if (headers.count() == 0) null else &headers,
         );
-        const response_bytes = try self.transport.readMessage();
+        const response_bytes = try self.transport.readMessageOnStream(sid);
         defer self.allocator.free(response_bytes);
 
         // Decompress response

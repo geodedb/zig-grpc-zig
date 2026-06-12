@@ -149,3 +149,88 @@ test "I5 integration: over-8192-byte header block is HeaderBlockTooLarge, no lea
 
     try testing.expectError(transport.TransportError.HeaderBlockTooLarge, t.readMessage());
 }
+
+// --- Iter2-C: stream-id-filtered client read (readMessageOnStream) ---
+//
+// These exercise the exact failure modes the single-call client hit:
+//   (a) a trailer-only error response (lone HEADERS(END_STREAM)) must NOT
+//       loop forever — it surfaces error.StreamEndedWithoutMessage;
+//   (b) a stale stream-1 trailer left in the buffer by call N-1 must be
+//       SKIPPED by call N (which reads on a fresh sid) before its real
+//       response is parsed — the precise loopback regression;
+//   (c) a normal HEADERS(no END_STREAM)+DATA on the expected stream still
+//       returns the message.
+
+test "Iter2-C: trailer-only HEADERS(END_STREAM) yields StreamEndedWithoutMessage (no hang)" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // Lone HEADERS with END_STREAM|END_HEADERS, empty payload, stream 1.
+    // This is a gRPC trailer-only error status (e.g. UNIMPLEMENTED).
+    try pushFrame(&script, alloc, 0x1, 0x1 | 0x4, 1, &.{});
+
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+
+    try testing.expectError(
+        transport.TransportError.StreamEndedWithoutMessage,
+        t.readMessageOnStream(1),
+    );
+}
+
+test "Iter2-C: readMessageOnStream(3) skips stale stream-1 trailer then returns message" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // Stale trailer left by the PREVIOUS call: HEADERS(END_STREAM|END_HEADERS)
+    // on stream 1. Must be skipped because we read on stream 3.
+    try pushFrame(&script, alloc, 0x1, 0x1 | 0x4, 1, &.{});
+    // Current call's real response on stream 3: HEADERS(END_HEADERS, no
+    // END_STREAM) then DATA carrying gRPC framed "hi".
+    try pushFrame(&script, alloc, 0x1, 0x4, 3, &.{});
+    try pushFrame(&script, alloc, 0x0, 0x0, 3, &[_]u8{ 0, 0, 0, 0, 2, 'h', 'i' });
+
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+
+    const msg = try t.readMessageOnStream(3);
+    defer alloc.free(msg);
+    try testing.expectEqualSlices(u8, "hi", msg);
+}
+
+test "Iter2-C: readMessageOnStream(1) returns message on normal HEADERS+DATA" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // Normal unary response on stream 1: HEADERS(END_HEADERS, no END_STREAM)
+    // then DATA carrying gRPC framed "hi".
+    try pushFrame(&script, alloc, 0x1, 0x4, 1, &.{});
+    try pushFrame(&script, alloc, 0x0, 0x0, 1, &[_]u8{ 0, 0, 0, 0, 2, 'h', 'i' });
+
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+
+    const msg = try t.readMessageOnStream(1);
+    defer alloc.free(msg);
+    try testing.expectEqualSlices(u8, "hi", msg);
+}
+
+// --- Iter2-C: nextClientStreamId allocator (odd, monotonic, exhaustion) ---
+
+test "Iter2-C: nextClientStreamId yields 1,3,5 from last_stream_id=1" {
+    var t: transport.Transport = undefined;
+    t.last_stream_id = 1;
+    try testing.expectEqual(@as(u31, 1), try t.nextClientStreamId());
+    try testing.expectEqual(@as(u31, 3), try t.nextClientStreamId());
+    try testing.expectEqual(@as(u31, 5), try t.nextClientStreamId());
+}
+
+test "Iter2-C: nextClientStreamId near max returns StreamIdExhausted" {
+    var t: transport.Transport = undefined;
+    // maxInt(u31) is odd; one below the wrap threshold still works, then exhausts.
+    t.last_stream_id = std.math.maxInt(u31) - 1; // even-ish boundary; > max-2 triggers exhaustion
+    try testing.expectError(error.StreamIdExhausted, t.nextClientStreamId());
+}
