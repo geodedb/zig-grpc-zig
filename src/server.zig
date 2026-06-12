@@ -68,6 +68,11 @@ pub const GrpcServer = struct {
     /// Defaults to `DEFAULT_FLOW_CREDIT_TIMEOUT_MS = 30_000` (30 s).
     /// Closes GAP-FU-002.
     flow_credit_timeout_ns: u64 = DEFAULT_FLOW_CREDIT_TIMEOUT_MS * std.time.ns_per_ms,
+    /// Monotonic count of connections that terminated with an error
+    /// (anything other than a clean peer disconnect). Exposed so
+    /// embedders can alert on error spikes without an otel build
+    /// (closes quality R3 / #58).
+    conn_error_count: std.atomic.Value(u64) = .init(0),
 
     /// Default cap on concurrent accepted connections when
     /// `GRPC_ZIG_MAX_CONNS` is unset.
@@ -75,6 +80,23 @@ pub const GrpcServer = struct {
     /// Default per-stream send-credit timeout (milliseconds) when
     /// `GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS` is unset.
     pub const DEFAULT_FLOW_CREDIT_TIMEOUT_MS: u64 = 30_000;
+
+    /// Default bind interface. Loopback-by-default (closes O1 / #53):
+    /// binding every interface in cleartext h2c was a hostile-network
+    /// footgun. Opt into a public bind explicitly via `initWithBind` or
+    /// the `GRPC_ZIG_BIND_ADDR` env var (e.g. "0.0.0.0").
+    pub const DEFAULT_BIND_ADDRESS: []const u8 = "127.0.0.1";
+
+    /// Read GRPC_ZIG_BIND_ADDR via libc getenv (same rationale as
+    /// `maxConnsFromEnv`); falls back to DEFAULT_BIND_ADDRESS. The
+    /// returned slice is libc-owned (env path) or a static string
+    /// (default) — callers must NOT free it.
+    pub fn bindAddressFromEnv() []const u8 {
+        const raw_ptr = std.c.getenv("GRPC_ZIG_BIND_ADDR") orelse return DEFAULT_BIND_ADDRESS;
+        const raw = std.mem.span(raw_ptr);
+        if (raw.len == 0) return DEFAULT_BIND_ADDRESS;
+        return raw;
+    }
 
     /// Read GRPC_ZIG_MAX_CONNS via libc `getenv`; return
     /// DEFAULT_MAX_CONNS when missing, or propagate
@@ -132,7 +154,13 @@ pub const GrpcServer = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
-        const address = try net.IpAddress.parseIp4("0.0.0.0", port);
+        return initWithBind(allocator, io, bindAddressFromEnv(), port, secret_key);
+    }
+
+    /// Like `init` but binds the given interface (e.g. "0.0.0.0" for a
+    /// deliberate public bind). Closes O1 (#53).
+    pub fn initWithBind(allocator: std.mem.Allocator, io: std.Io, bind_address: []const u8, port: u16, secret_key: []const u8) !GrpcServer {
+        const address = try net.IpAddress.parseIp4(bind_address, port);
         const server = try address.listen(io, .{ .reuse_address = true });
         // Resolve the admission cap. Fall back silently to the default
         // on any malformed env value rather than refusing to boot.
@@ -151,6 +179,11 @@ pub const GrpcServer = struct {
         };
     }
 
+    /// Read the connection-error counter (R3 / #58).
+    pub fn connErrorCount(self: *const GrpcServer) u64 {
+        return self.conn_error_count.load(.monotonic);
+    }
+
     pub fn deinit(self: *GrpcServer) void {
         self.handlers.deinit(self.allocator);
         self.server.deinit(self.io);
@@ -162,6 +195,7 @@ pub const GrpcServer = struct {
 
         while (true) {
             const stream_ = try self.server.accept(self.io);
+            transport.setRpcSocketOptions(stream_.socket.handle);
             // CC-1 + MW-4 — bound concurrent connections. Acquire a
             // semaphore permit BEFORE spawning so a hostile or buggy
             // client cannot exhaust system memory by opening 100k
@@ -199,6 +233,7 @@ pub const GrpcServer = struct {
         // matter how handleConnection returned.
         defer self.conn_sem.post(self.io);
         self.handleConnection(stream_) catch |err| {
+            _ = self.conn_error_count.fetchAdd(1, .monotonic);
             std.log.err("Connection handling failed: {}", .{err});
         };
     }
@@ -250,7 +285,10 @@ pub const GrpcServer = struct {
                 error.TlsWriteFailed,
                 error.TlsHandshakeFailed,
                 error.TlsNotInitialized,
-                => break,
+                => {
+                    std.log.warn("TLS connection error; closing: {}", .{err});
+                    break;
+                },
                 error.MessageTooLarge => {
                     std.log.warn("closing connection: inbound gRPC message exceeded max_recv_message_bytes", .{});
                     break;

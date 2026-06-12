@@ -32,6 +32,7 @@ pub const GrpcClient = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !GrpcClient {
         const address = try net.IpAddress.resolve(io, host, port);
         const connection = try address.connect(io, .{ .mode = .stream });
+        transport.setRpcSocketOptions(connection.socket.handle);
 
         const authority = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
         defer allocator.free(authority);

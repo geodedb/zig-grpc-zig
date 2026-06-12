@@ -118,6 +118,7 @@ pub const ClientMux = struct {
 
         const address = try net.IpAddress.resolve(io, host, port);
         const conn = try address.connect(io, .{ .mode = .stream });
+        transport.setRpcSocketOptions(conn.socket.handle);
 
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);

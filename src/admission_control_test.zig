@@ -77,3 +77,12 @@ test "Semaphore wait then post does not block" {
     sem.post(io);
     sem.post(io);
 }
+
+test "O1: DEFAULT_BIND_ADDRESS is loopback" {
+    try testing.expectEqualStrings("127.0.0.1", server_mod.GrpcServer.DEFAULT_BIND_ADDRESS);
+}
+
+test "O1: bindAddressFromEnv falls back to default when unset" {
+    // GRPC_ZIG_BIND_ADDR is not set in the test environment.
+    try testing.expectEqualStrings("127.0.0.1", server_mod.GrpcServer.bindAddressFromEnv());
+}

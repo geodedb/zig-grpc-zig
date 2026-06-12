@@ -263,6 +263,18 @@ pub const TlsIo = struct {
     close_fn: *const fn (*anyopaque) void,
 };
 
+/// Best-effort socket tuning for RPC traffic: disable Nagle
+/// (TCP_NODELAY) for latency and enable TCP keepalive so dead peers
+/// are eventually reaped. Failures are ignored — these are
+/// optimizations, not correctness requirements, and not every
+/// platform/socket supports them. Closes NW-5 (#32).
+pub fn setRpcSocketOptions(handle: std.posix.socket_t) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const one = std.mem.toBytes(@as(c_int, 1));
+    std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one) catch {};
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, &one) catch {};
+}
+
 /// Pre-encoded HPACK payload for the gRPC server response HEADERS:
 ///   :status: 200                           (static index 8 -> 0x88)
 ///   content-type: application/grpc         (LIE name index 31 -> 0x5f, len 16)
