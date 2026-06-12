@@ -244,6 +244,23 @@ pub fn build(b: *std.Build) void {
     const run_grpc_framing_tests = b.addRunArtifact(grpc_framing_tests);
     test_step.dependOn(&run_grpc_framing_tests.step);
 
+    // Inbound gRPC message size cap tests (closes NEW-1 / #43). Exercises
+    // `Transport.checkRecvMessageSize` / `checkRecvBufferSize` and the
+    // `DEFAULT_MAX_RECV_MESSAGE_BYTES` constant directly to assert that an
+    // unauthenticated peer cannot declare/stream an unbounded message and
+    // exhaust server memory before the auth gate runs.
+    const transport_recv_limit_tests = b.addTest(.{
+        .name = "transport-recv-limit-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transport_recv_limit_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    transport_recv_limit_tests.root_module.linkLibrary(zlib_lib);
+    const run_transport_recv_limit_tests = b.addRunArtifact(transport_recv_limit_tests);
+    test_step.dependOn(&run_transport_recv_limit_tests.step);
+
     // SETTINGS_MAX_FRAME_SIZE enforcement tests (closes I3 / GitLab security
     // issue #8). Verifies oversize peer-declared frame lengths are rejected
     // before allocation and that the GOAWAY response carries

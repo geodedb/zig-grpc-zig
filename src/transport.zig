@@ -20,12 +20,21 @@ pub const TransportError = error{
     /// reader rejects the frame BEFORE allocating its payload buffer to
     /// avoid an unauthenticated memory amplification (closes I3).
     FrameSizeError,
+    /// Peer declared (or streamed) a gRPC message larger than
+    /// `max_recv_message_bytes`. Rejected BEFORE buffering the payload
+    /// to prevent an unauthenticated memory-exhaustion DoS (closes
+    /// NEW-1 / #43).
+    MessageTooLarge,
 };
 
 /// Default SETTINGS_MAX_FRAME_SIZE per RFC 7540 §6.5.2 — every HTTP/2
 /// implementation MUST accept frames at least this large; we apply it as
 /// the inbound cap until the peer negotiates a larger value via SETTINGS.
 pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16384;
+
+/// Default cap on a single inbound gRPC message (the de-facto gRPC
+/// default, e.g. grpc-go's MaxRecvMsgSize). Closes NEW-1 (#43).
+pub const DEFAULT_MAX_RECV_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
 
 /// HTTP/2 SETTINGS parameter ids (RFC 7540 §6.5.2).
 pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
@@ -351,6 +360,10 @@ pub const Transport = struct {
     /// SETTINGS_MAX_FRAME_SIZE). Used only to size outbound DATA
     /// fragmentation in `writeDataFragmentedLocked`.
     peer_max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
+    /// Largest single gRPC message we will assemble from inbound DATA
+    /// frames. Embedders may raise this per-transport before serving.
+    /// Closes NEW-1 (#43).
+    max_recv_message_bytes: u32 = DEFAULT_MAX_RECV_MESSAGE_BYTES,
     /// Connection-level send window. Decremented when we transmit DATA;
     /// incremented when peer sends WINDOW_UPDATE on stream 0 (§6.9).
     conn_send_window: i32 = INITIAL_WINDOW_SIZE_DEFAULT,
@@ -642,6 +655,19 @@ pub const Transport = struct {
     /// the negotiated max — closes I3.
     pub fn checkFrameSize(length: u32, max: u32) TransportError!void {
         if (length > max) return TransportError.FrameSizeError;
+    }
+
+    /// Pure check: declared gRPC message length vs the configured cap.
+    /// Public for unit tests (`transport_recv_limit_test.zig`). Closes NEW-1.
+    pub fn checkRecvMessageSize(msg_len: u32, max: u32) TransportError!void {
+        if (msg_len > max) return TransportError.MessageTooLarge;
+    }
+
+    /// Pure check: cumulative assembly-buffer length (message + 5-byte
+    /// prefix) vs the configured cap. Guards the case where a peer
+    /// streams unbounded DATA without ever completing a message.
+    pub fn checkRecvBufferSize(buf_len: usize, max: u32) TransportError!void {
+        if (buf_len > @as(usize, max) + 5) return TransportError.MessageTooLarge;
     }
 
     /// Initialize the flow-control fields of an arbitrary Transport
@@ -1250,12 +1276,26 @@ pub const Transport = struct {
                     // either window dips below half its initial size).
                     self.maybeRefillRecvWindow(frame.stream_id, data_len);
 
+                    // NEW-1 (#43): bound the assembly buffer BEFORE
+                    // attempting to parse/continue — a peer that streams
+                    // DATA without ever completing a message must not
+                    // grow grpc_buf without limit. RST the stream and
+                    // tear the connection down.
+                    Transport.checkRecvBufferSize(grpc_buf.items.len, self.max_recv_message_bytes) catch |err| {
+                        self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                        return err;
+                    };
+
                     // Try to parse a complete gRPC message from the
                     // accumulated bytes.
                     if (grpc_buf.items.len < 5) continue;
                     const prefix = decodeGrpcPrefix(grpc_buf.items) catch
                         return TransportError.Http2Error;
                     const msg_len = prefix.msg_len;
+                    Transport.checkRecvMessageSize(msg_len, self.max_recv_message_bytes) catch |err| {
+                        self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                        return err;
+                    };
                     if (grpc_buf.items.len < 5 + msg_len) continue;
 
                     const result = self.allocator.alloc(u8, msg_len) catch
@@ -1368,6 +1408,17 @@ pub const Transport = struct {
                     };
                     self.allocator.free(payload);
                     self.maybeRefillRecvWindow(frame.stream_id, data_len);
+
+                    // NEW-1 (#43): bound the assembly buffer BEFORE
+                    // attempting to parse/continue — a peer that streams
+                    // DATA without ever completing a message must not
+                    // grow grpc_buf without limit. RST the stream and
+                    // tear the connection down.
+                    Transport.checkRecvBufferSize(grpc_buf.items.len, self.max_recv_message_bytes) catch |err| {
+                        self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                        return err;
+                    };
+
                     if (grpc_buf.items.len < 5) {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;
@@ -1375,6 +1426,10 @@ pub const Transport = struct {
                     const prefix = decodeGrpcPrefix(grpc_buf.items) catch
                         return TransportError.Http2Error;
                     const msg_len = prefix.msg_len;
+                    Transport.checkRecvMessageSize(msg_len, self.max_recv_message_bytes) catch |err| {
+                        self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                        return err;
+                    };
                     if (grpc_buf.items.len < 5 + msg_len) {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;

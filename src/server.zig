@@ -251,6 +251,10 @@ pub const GrpcServer = struct {
                 error.TlsHandshakeFailed,
                 error.TlsNotInitialized,
                 => break,
+                error.MessageTooLarge => {
+                    std.log.warn("closing connection: inbound gRPC message exceeded max_recv_message_bytes", .{});
+                    break;
+                },
                 else => return err,
             };
             defer self.allocator.free(message);
