@@ -340,11 +340,17 @@ pub const Transport = struct {
     /// `*Uncancelable` variants because cancelling a half-written frame on
     /// the wire would desynchronize the peer.
     write_mutex: std.Io.Mutex = .init,
-    /// Largest frame length we will accept from the peer, per
-    /// SETTINGS_MAX_FRAME_SIZE (RFC 7540 §6.5.2). Initialized to the
-    /// default 16384 and updated when the peer sends a SETTINGS frame
-    /// with parameter id 0x05. Closes I3.
+    /// Largest frame length WE accept from the peer on inbound reads.
+    /// This is OUR advertised SETTINGS_MAX_FRAME_SIZE and is never
+    /// modified by peer SETTINGS — per RFC 7540 §6.5.2 the peer's value
+    /// governs what the PEER accepts, not what we must accept.
+    /// Closes NEW-2 (#44): previously the peer could raise this to
+    /// 16 MiB and amplify per-frame allocations ~1000x. (Also closes I3.)
     max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
+    /// Largest frame length the PEER accepts (their advertised
+    /// SETTINGS_MAX_FRAME_SIZE). Used only to size outbound DATA
+    /// fragmentation in `writeDataFragmentedLocked`.
+    peer_max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
     /// Connection-level send window. Decremented when we transmit DATA;
     /// incremented when peer sends WINDOW_UPDATE on stream 0 (§6.9).
     conn_send_window: i32 = INITIAL_WINDOW_SIZE_DEFAULT,
@@ -1005,7 +1011,9 @@ pub const Transport = struct {
     /// is a 6-byte big-endian (id:u16, value:u32) tuple per RFC 7540
     /// §6.5.1. Unknown ids are ignored. We honour:
     ///   * SETTINGS_MAX_FRAME_SIZE (0x05): clamp to spec range and apply
-    ///     to inbound enforcement.
+    ///     to `peer_max_frame_size` (our OUTBOUND fragmentation cap). Our
+    ///     inbound acceptance cap `max_frame_size` is never moved by the
+    ///     peer — RFC 7540 §6.5.2 governs only what the PEER accepts.
     ///   * SETTINGS_INITIAL_WINDOW_SIZE (0x04): §6.9.2 — adjust every
     ///     existing stream's send window by `new - old`, clamping at
     ///     i32 bounds (a strict implementation would emit
@@ -1020,15 +1028,18 @@ pub const Transport = struct {
                 @as(u32, payload[i + 5]);
             switch (id) {
                 SETTINGS_MAX_FRAME_SIZE => {
-                    // RFC 7540 §6.5.2: peer values <16384 are invalid; we
-                    // clamp to the default (which we always accept). The
-                    // spec maximum is 2^24-1 = 16,777,215.
+                    // RFC 7540 §6.5.2: this advertises what the PEER accepts,
+                    // so it updates `peer_max_frame_size` (our OUTBOUND DATA
+                    // fragmentation cap), NOT our inbound acceptance cap
+                    // `max_frame_size`. Peer values <16384 are invalid; we
+                    // clamp to the default. The spec maximum is
+                    // 2^24-1 = 16,777,215.
                     if (value < DEFAULT_MAX_FRAME_SIZE) {
-                        self.max_frame_size = DEFAULT_MAX_FRAME_SIZE;
+                        self.peer_max_frame_size = DEFAULT_MAX_FRAME_SIZE;
                     } else if (value > 0xFFFFFF) {
-                        self.max_frame_size = 0xFFFFFF;
+                        self.peer_max_frame_size = 0xFFFFFF;
                     } else {
-                        self.max_frame_size = value;
+                        self.peer_max_frame_size = value;
                     }
                 },
                 SETTINGS_INITIAL_WINDOW_SIZE => {
@@ -1139,7 +1150,7 @@ pub const Transport = struct {
         flags: u8,
         payload: []const u8,
     ) !void {
-        const max: usize = @intCast(self.max_frame_size);
+        const max: usize = @intCast(self.peer_max_frame_size);
         if (payload.len == 0) {
             try self.writeFrameLocked(.DATA, flags, stream_id, payload);
             return;

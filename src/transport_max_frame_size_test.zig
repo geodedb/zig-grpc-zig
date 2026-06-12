@@ -116,3 +116,30 @@ test "buildGoawayFrameSizeError encodes the connection-level frame" {
         @as(u32, bytes[16]);
     try testing.expectEqual(@as(u32, 0x06), error_code);
 }
+
+test "NEW-2: peer SETTINGS_MAX_FRAME_SIZE does not raise our inbound cap" {
+    var t: transport.Transport = undefined;
+    t.max_frame_size = transport.DEFAULT_MAX_FRAME_SIZE;
+    t.peer_max_frame_size = transport.DEFAULT_MAX_FRAME_SIZE;
+    // SETTINGS payload: id 0x05 (MAX_FRAME_SIZE), value 0xFFFFFF
+    const payload = [_]u8{ 0x00, 0x05, 0x00, 0xFF, 0xFF, 0xFF };
+    t.applyPeerSettings(&payload);
+    // Outbound fragmentation limit follows the peer...
+    try testing.expectEqual(@as(u32, 0xFFFFFF), t.peer_max_frame_size);
+    // ...but our inbound acceptance cap must NOT move.
+    try testing.expectEqual(transport.DEFAULT_MAX_FRAME_SIZE, t.max_frame_size);
+    // And readFrame's check still rejects an oversize inbound frame.
+    try testing.expectError(
+        transport.TransportError.FrameSizeError,
+        transport.Transport.checkFrameSize(16385, t.max_frame_size),
+    );
+}
+
+test "NEW-2: peer values below RFC minimum clamp to default" {
+    var t: transport.Transport = undefined;
+    t.max_frame_size = transport.DEFAULT_MAX_FRAME_SIZE;
+    t.peer_max_frame_size = transport.DEFAULT_MAX_FRAME_SIZE;
+    const payload = [_]u8{ 0x00, 0x05, 0x00, 0x00, 0x00, 0x01 };
+    t.applyPeerSettings(&payload);
+    try testing.expectEqual(transport.DEFAULT_MAX_FRAME_SIZE, t.peer_max_frame_size);
+}
