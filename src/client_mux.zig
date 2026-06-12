@@ -186,12 +186,6 @@ pub const ClientMux = struct {
         _ = self.streams.remove(sid);
     }
 
-    fn findStream(self: *ClientMux, sid: u31) ?*StreamSlot {
-        self.streams_mutex.lockUncancelable(self.io);
-        defer self.streams_mutex.unlock(self.io);
-        return self.streams.get(sid);
-    }
-
     /// Wake every waiting call() with the same error. Used when the reader
     /// thread can no longer make progress (socket closed, GOAWAY, etc.) so
     /// nobody waits forever.
@@ -304,12 +298,22 @@ fn readerLoop(self: *ClientMux) void {
             .DATA => {
                 const end = (flags & FF.END_STREAM) != 0;
                 const data_len: u32 = @intCast(payload.len);
-                if (self.findStream(sid)) |slot| {
+                // streams_mutex is held across the slot.mutex critical section
+                // so a slot cannot be unregistered/freed by its owning call()
+                // while the reader is using it (fixes a stack-slot UAF). Lock
+                // order: streams_mutex -> slot.mutex, matching broadcastError.
+                self.streams_mutex.lockUncancelable(self.io);
+                if (self.streams.get(sid)) |slot| {
                     slot.mutex.lockUncancelable(self.io);
                     deliverData(slot, self.allocator, payload, end, self.transport.max_recv_message_bytes);
                     if (slot.end_stream) slot.cond.broadcast(self.io);
                     slot.mutex.unlock(self.io);
                 }
+                self.streams_mutex.unlock(self.io);
+                // free(payload) and maybeRefillRecvWindow stay OUTSIDE the
+                // streams_mutex region: the latter can emit a WINDOW_UPDATE
+                // (socket write) and must not serialize/contend under
+                // streams_mutex or interact with write_mutex.
                 self.allocator.free(payload);
                 // Refill receive window so the server keeps sending
                 // (NW-2). Without this the connection-level recv window
@@ -320,13 +324,19 @@ fn readerLoop(self: *ClientMux) void {
             .HEADERS => {
                 const end = (flags & FF.END_STREAM) != 0;
                 if (end) {
-                    if (self.findStream(sid)) |slot| {
+                    // streams_mutex -> slot.mutex (see .DATA arm): held across
+                    // the slot critical section so the owning call() cannot
+                    // unregister/free the stack slot mid-use.
+                    self.streams_mutex.lockUncancelable(self.io);
+                    if (self.streams.get(sid)) |slot| {
                         slot.mutex.lockUncancelable(self.io);
-                        defer slot.mutex.unlock(self.io);
                         slot.end_stream = true;
                         slot.cond.broadcast(self.io);
+                        slot.mutex.unlock(self.io);
                     }
+                    self.streams_mutex.unlock(self.io);
                 }
+                // free(payload) stays outside the streams_mutex region.
                 self.allocator.free(payload);
             },
             .SETTINGS => {
@@ -367,13 +377,19 @@ fn readerLoop(self: *ClientMux) void {
                 }
             },
             .RST_STREAM => {
-                if (self.findStream(sid)) |slot| {
+                // streams_mutex -> slot.mutex (see .DATA arm): held across the
+                // slot critical section so the owning call() cannot
+                // unregister/free the stack slot mid-use.
+                self.streams_mutex.lockUncancelable(self.io);
+                if (self.streams.get(sid)) |slot| {
                     slot.mutex.lockUncancelable(self.io);
-                    defer slot.mutex.unlock(self.io);
                     slot.err = error.StreamReset;
                     slot.end_stream = true;
                     slot.cond.broadcast(self.io);
+                    slot.mutex.unlock(self.io);
                 }
+                self.streams_mutex.unlock(self.io);
+                // free(payload) stays outside the streams_mutex region.
                 self.allocator.free(payload);
             },
             .GOAWAY => {
