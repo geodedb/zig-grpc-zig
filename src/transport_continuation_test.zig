@@ -268,3 +268,63 @@ test "Iter2-C: nextClientStreamId near max returns StreamIdExhausted" {
     t.last_stream_id = std.math.maxInt(u31) - 1; // even-ish boundary; > max-2 triggers exhaustion
     try testing.expectError(error.StreamIdExhausted, t.nextClientStreamId());
 }
+
+// --- NEW-A (CWE-835): bound the stream-id-filtered SKIP loop ---
+//
+// The stale-trailer skip in the client filtered read paths
+// (readMessageOnStream / readStreamFrameOnStream) must not be unbounded.
+// A malicious server can stream tiny DATA/HEADERS frames on a stream the
+// client never reads, each freed (no OOM) but never satisfying the
+// expected-stream filter — an infinite spin / liveness hang. The fix
+// bounds the number of CONSECUTIVE non-expected DATA/HEADERS frames to
+// MAX_SKIPPED_FRAMES, returning ProtocolError when the peer abuses it.
+// Since a true infinite loop can't be unit-tested, we script `cap + a
+// few` stale frames and assert the bounded error fires.
+
+test "NEW-A: readMessageOnStream bounds consecutive stale-stream frames (no infinite skip)" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // Flood: many DATA frames on stream 99 (never the expected stream 3).
+    var i: usize = 0;
+    while (i < transport.MAX_SKIPPED_FRAMES + 5) : (i += 1) {
+        try pushFrame(&script, alloc, 0x0, 0x0, 99, &[_]u8{ 0, 0, 0, 0, 1, 'x' });
+    }
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+    try testing.expectError(transport.TransportError.ProtocolError, t.readMessageOnStream(3));
+}
+
+test "NEW-A: a stale-frame burst BELOW the cap still lets the real message through" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // A few stale frames on stream 1, then the real response on stream 3.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try pushFrame(&script, alloc, 0x0, 0x0, 1, &[_]u8{ 0, 0, 0, 0, 1, 'x' });
+    }
+    try pushFrame(&script, alloc, 0x1, 0x4, 3, &.{}); // HEADERS no END_STREAM, stream 3
+    try pushFrame(&script, alloc, 0x0, 0x0, 3, &[_]u8{ 0, 0, 0, 0, 2, 'h', 'i' });
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+    const msg = try t.readMessageOnStream(3);
+    defer alloc.free(msg);
+    try testing.expectEqualSlices(u8, "hi", msg);
+}
+
+test "NEW-A: readStreamFrameOnStream also bounds stale-stream skipping" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    var i: usize = 0;
+    while (i < transport.MAX_SKIPPED_FRAMES + 5) : (i += 1) {
+        try pushFrame(&script, alloc, 0x0, 0x0, 99, &[_]u8{ 0, 0, 0, 0, 1, 'x' });
+    }
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+    try testing.expectError(transport.TransportError.ProtocolError, t.readStreamFrameOnStream(3));
+}

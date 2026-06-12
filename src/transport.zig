@@ -55,6 +55,14 @@ pub const DEFAULT_MAX_RECV_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
 /// honour our SETTINGS never hit this. Closes I5 (#48).
 pub const MAX_HEADER_BLOCK_BYTES: usize = 8192;
 
+/// Max consecutive DATA/HEADERS frames the stream-id-filtered client
+/// read paths will SKIP (frames belonging to other/completed streams)
+/// before declaring the peer abusive. A single unary call legitimately
+/// skips at most ~1 stale trailer; this generous cap bounds an
+/// otherwise-unbounded skip loop where a malicious server streams frames
+/// on a non-expected stream id forever (NEW-A / CWE-835 liveness DoS).
+pub const MAX_SKIPPED_FRAMES: usize = 256;
+
 /// HTTP/2 SETTINGS parameter ids (RFC 7540 §6.5.2).
 pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
 pub const SETTINGS_ENABLE_PUSH: u16 = 0x02;
@@ -1383,6 +1391,11 @@ pub const Transport = struct {
     fn readMessageCore(self: *Transport, expected_sid: ?u31) ![]const u8 {
         var grpc_buf: std.ArrayList(u8) = .empty;
         defer grpc_buf.deinit(self.allocator);
+        // NEW-A (CWE-835): bound consecutive non-expected DATA/HEADERS
+        // frames skipped by the stream-id filter so a malicious server
+        // cannot hang this call forever by streaming frames on a stream
+        // id we never read. Reset to 0 on any expected-stream progress.
+        var skipped: usize = 0;
         while (true) {
             const frame = try self.readFrame();
             const frame_type = frame.frame_type;
@@ -1398,9 +1411,14 @@ pub const Transport = struct {
                             const skip_len: u32 = @intCast(payload.len);
                             self.allocator.free(payload);
                             self.maybeRefillRecvWindow(frame.stream_id, skip_len);
+                            skipped += 1;
+                            if (skipped > MAX_SKIPPED_FRAMES) return TransportError.ProtocolError;
                             continue;
                         }
                     }
+                    // Real progress for the expected stream: reset the
+                    // stale-skip counter (NEW-A).
+                    skipped = 0;
                     // Append this fragment; the gRPC message may have
                     // been split across multiple HTTP/2 DATA frames.
                     const data_len: u32 = @intCast(payload.len);
@@ -1434,11 +1452,16 @@ pub const Transport = struct {
                         self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
                         return err;
                     };
-                    if (grpc_buf.items.len < 5 + msg_len) continue;
+                    // Widen to usize so 5 + msg_len cannot overflow u32 if
+                    // an embedder sets max_recv_message_bytes near maxInt(u32)
+                    // (Iter3 overflow guard). msg_len is already bounded by
+                    // checkRecvMessageSize above.
+                    const need: usize = 5 + @as(usize, msg_len);
+                    if (grpc_buf.items.len < need) continue;
 
                     const result = self.allocator.alloc(u8, msg_len) catch
                         return error.OutOfMemory;
-                    @memcpy(result, grpc_buf.items[5 .. 5 + msg_len]);
+                    @memcpy(result, grpc_buf.items[5..need]);
                     return result;
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
@@ -1461,6 +1484,8 @@ pub const Transport = struct {
                                 self.allocator.free(payload);
                                 self.allocator.free(block);
                             }
+                            skipped += 1;
+                            if (skipped > MAX_SKIPPED_FRAMES) return TransportError.ProtocolError;
                             continue;
                         }
                     }
@@ -1473,6 +1498,9 @@ pub const Transport = struct {
                     // call reuse this id, re-introducing the stream-id-reuse
                     // bug this method exists to fix.
                     if (expected_sid == null) self.last_stream_id = frame.stream_id;
+                    // Real progress for the expected stream: reset the
+                    // stale-skip counter (NEW-A).
+                    skipped = 0;
                     const end_headers = (frame.flags & http2.frame.FrameFlags.END_HEADERS) != 0;
                     if (end_headers) {
                         self.extractPathFromHpack(payload);
@@ -1616,6 +1644,11 @@ pub const Transport = struct {
         var grpc_buf: std.ArrayList(u8) = .empty;
         defer grpc_buf.deinit(self.allocator);
         var saw_end: bool = false;
+        // NEW-A (CWE-835): bound consecutive non-expected DATA/HEADERS
+        // frames skipped by the stream-id filter so a malicious server
+        // cannot hang this call forever by streaming frames on a stream
+        // id we never read. Reset to 0 on any expected-stream progress.
+        var skipped: usize = 0;
         while (true) {
             const frame = try self.readFrame();
             const frame_type = frame.frame_type;
@@ -1632,9 +1665,14 @@ pub const Transport = struct {
                             const skip_len: u32 = @intCast(payload.len);
                             self.allocator.free(payload);
                             self.maybeRefillRecvWindow(frame.stream_id, skip_len);
+                            skipped += 1;
+                            if (skipped > MAX_SKIPPED_FRAMES) return TransportError.ProtocolError;
                             continue;
                         }
                     }
+                    // Real progress for the expected stream: reset the
+                    // stale-skip counter (NEW-A).
+                    skipped = 0;
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
                     if (end) saw_end = true;
                     const data_len: u32 = @intCast(payload.len);
@@ -1666,13 +1704,18 @@ pub const Transport = struct {
                         self.writeRstStream(frame.stream_id, HTTP2_ERROR_FLOW_CONTROL_ERROR);
                         return err;
                     };
-                    if (grpc_buf.items.len < 5 + msg_len) {
+                    // Widen to usize so 5 + msg_len cannot overflow u32 if
+                    // an embedder sets max_recv_message_bytes near maxInt(u32)
+                    // (Iter3 overflow guard). msg_len is already bounded by
+                    // checkRecvMessageSize above.
+                    const need: usize = 5 + @as(usize, msg_len);
+                    if (grpc_buf.items.len < need) {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;
                     }
                     const result = self.allocator.alloc(u8, msg_len) catch
                         return error.OutOfMemory;
-                    @memcpy(result, grpc_buf.items[5 .. 5 + msg_len]);
+                    @memcpy(result, grpc_buf.items[5..need]);
                     return .{ .data = result, .end_stream = saw_end };
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
@@ -1696,6 +1739,8 @@ pub const Transport = struct {
                                 self.allocator.free(payload);
                                 self.allocator.free(block);
                             }
+                            skipped += 1;
+                            if (skipped > MAX_SKIPPED_FRAMES) return TransportError.ProtocolError;
                             continue;
                         }
                     }
@@ -1707,6 +1752,9 @@ pub const Transport = struct {
                     // `nextClientStreamId`); clobbering it would make the next
                     // call reuse this id.
                     if (expected_sid == null) self.last_stream_id = frame.stream_id;
+                    // Real progress for the expected stream: reset the
+                    // stale-skip counter (NEW-A).
+                    skipped = 0;
                     const end_headers = (flags & http2.frame.FrameFlags.END_HEADERS) != 0;
                     if (end_headers) {
                         self.extractPathFromHpack(payload);
