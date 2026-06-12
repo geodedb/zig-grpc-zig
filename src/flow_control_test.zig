@@ -17,15 +17,7 @@
 const std = @import("std");
 const testing = std.testing;
 const transport = @import("transport.zig");
-const stream_mod = @import("http2/stream.zig");
 const compat = @import("compat.zig");
-
-test "Stream initializes recv_window and send_window to 65535" {
-    var s = try stream_mod.Stream.init(1, std.testing.allocator);
-    defer s.deinit();
-    try testing.expectEqual(@as(i32, 65535), s.recv_window);
-    try testing.expectEqual(@as(i32, 65535), s.send_window);
-}
 
 test "Transport initializes conn_send_window and conn_recv_window to 65535" {
     // Use a default-init Transport — we only inspect the field defaults.

@@ -1,9 +1,5 @@
 const std = @import("std");
 const transport = @import("transport.zig");
-const http2 = struct {
-    pub const connection = @import("http2/connection.zig");
-    pub const frame = @import("http2/frame.zig");
-};
 const net = std.Io.net;
 
 pub fn main(init: std.process.Init) !void {
@@ -17,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     defer stream.close(init.io);
 
     // Initialize transport with HTTP/2
-    var trans = try transport.Transport.initClient(allocator, init.io, stream);
+    var trans = try transport.Transport.initClient(allocator, init.io, stream, "localhost:50051");
     defer trans.deinit();
 
     // Send a message

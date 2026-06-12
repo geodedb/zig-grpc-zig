@@ -1,10 +1,11 @@
 const std = @import("std");
 const net = std.Io.net;
 const http2 = struct {
-    pub const connection = @import("http2/connection.zig");
     pub const frame = @import("http2/frame.zig");
-    pub const stream = @import("http2/stream.zig");
 };
+
+/// HTTP/2 client connection preface (RFC 7540 §3.5).
+pub const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub const TransportError = error{
     ConnectionClosed,
@@ -492,7 +493,7 @@ pub const Transport = struct {
 
     fn setupHttp2Client(self: *Transport) !void {
         // Client sends HTTP/2 connection preface
-        _ = try self.ioWrite(http2.connection.Connection.PREFACE);
+        _ = try self.ioWrite(HTTP2_PREFACE);
 
         // Send initial SETTINGS frame advertising our non-default values
         // (INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_CONCURRENT_STREAMS,
@@ -1125,7 +1126,7 @@ pub const Transport = struct {
         try self.readExact(&preface_buf);
 
         // Validate preface
-        if (!std.mem.eql(u8, &preface_buf, http2.connection.Connection.PREFACE)) {
+        if (!std.mem.eql(u8, &preface_buf, HTTP2_PREFACE)) {
             return TransportError.Http2Error;
         }
 

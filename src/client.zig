@@ -1,5 +1,4 @@
 const std = @import("std");
-const proto = @import("proto/service.zig");
 const transport = @import("transport.zig");
 const compression = @import("features/compression.zig");
 const auth = @import("features/auth.zig");
