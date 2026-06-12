@@ -50,3 +50,10 @@ test "NEW-1 client side: accumulated response beyond cap errors out" {
     try testing.expect(slot.err != null);
     try testing.expect(slot.end_stream);
 }
+
+test "M2: nextStreamId detects u31 wraparound" {
+    try testing.expectEqual(@as(u31, 5), try client_mux.nextStreamId(3));
+    const last_odd: u31 = std.math.maxInt(u31); // 0x7FFFFFFF, odd
+    try testing.expectError(error.StreamIdExhausted, client_mux.nextStreamId(last_odd));
+    try testing.expectError(error.StreamIdExhausted, client_mux.nextStreamId(last_odd - 1));
+}

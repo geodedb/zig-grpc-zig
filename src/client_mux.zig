@@ -79,6 +79,16 @@ pub fn deliverData(
     if (end) slot.end_stream = true;
 }
 
+/// Compute the successor of a client-initiated stream id (odd,
+/// monotonically increasing per RFC 7540 §5.1.1). Returns
+/// `error.StreamIdExhausted` instead of wrapping — a wrapped id would
+/// collide with a live stream in `streams` and corrupt demux
+/// (closes security M2 / #51). Callers should open a fresh connection.
+pub fn nextStreamId(current: u31) error{StreamIdExhausted}!u31 {
+    if (current > std.math.maxInt(u31) - 2) return error.StreamIdExhausted;
+    return current + 2;
+}
+
 pub const ClientMux = struct {
     allocator: Allocator,
     io: std.Io,
@@ -155,11 +165,11 @@ pub const ClientMux = struct {
         self.allocator.destroy(self);
     }
 
-    fn allocStreamId(self: *ClientMux) u31 {
+    fn allocStreamId(self: *ClientMux) error{StreamIdExhausted}!u31 {
         self.streams_mutex.lockUncancelable(self.io);
         defer self.streams_mutex.unlock(self.io);
         const sid = self.next_stream_id;
-        self.next_stream_id +%= 2;
+        self.next_stream_id = try nextStreamId(sid);
         return sid;
     }
 
@@ -250,7 +260,7 @@ pub const ClientMux = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        const sid = self.allocStreamId();
+        const sid = try self.allocStreamId();
 
         var slot: StreamSlot = .{};
         defer slot.deinit(self.allocator);
