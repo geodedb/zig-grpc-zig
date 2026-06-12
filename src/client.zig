@@ -75,16 +75,19 @@ pub const GrpcClient = struct {
         // Allocate a fresh client-initiated stream id for this streaming
         // call (same monotonic allocator as `call`), so a streamCall that
         // follows a unary call on the same client uses a fresh, valid id
-        // rather than reusing `last_stream_id`. `readStreamFrame` already
-        // stops on END_STREAM; in the loopback streaming scenario the
-        // streamCall is the first/only call on its connection, so there is
-        // no stale trailer to filter — leaving `readStreamFrame` unchanged
-        // keeps that scenario green.
+        // rather than reusing `last_stream_id`. The read below is now
+        // stream-id filtered (`readStreamFrameOnStream`): a stale unary
+        // trailer left UNREAD by a prior `call` on this same client —
+        // `call` reads via `readMessageOnStream` and intentionally leaves
+        // its own `HEADERS(END_STREAM)` trailer in the buffer — is skipped
+        // here instead of being misread as this streamCall's
+        // end-of-stream. END_STREAM is still surfaced, but only for our own
+        // `sid`.
         const sid = try self.transport.nextClientStreamId();
         try self.transport.writeRequestOnStream(sid, compressed, method_path);
 
         while (true) {
-            const sf = try self.transport.readStreamFrame();
+            const sf = try self.transport.readStreamFrameOnStream(sid);
             if (sf.data) |raw| {
                 const decompressed = self.compression.decompress(raw, compression_alg) catch |err| {
                     self.allocator.free(raw);

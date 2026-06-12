@@ -126,7 +126,7 @@ pub fn build(b: *std.Build) void {
         "trap 'kill $SERVER_PID 2>/dev/null' EXIT; " ++
             "./zig-out/bin/grpc-server-example & SERVER_PID=$!; " ++
             "sleep 2; " ++
-            "./zig-out/bin/grpc-benchmark --host localhost --port 50051 --requests 10 --clients 1 --size 512 --output text; " ++
+            "./zig-out/bin/grpc-benchmark --host 127.0.0.1 --port 50051 --requests 10 --clients 1 --size 512 --output text; " ++
             "kill $SERVER_PID 2>/dev/null || true",
     });
     benchmark_cmd.step.dependOn(b.getInstallStep());

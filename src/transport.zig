@@ -1581,7 +1581,38 @@ pub const Transport = struct {
     /// surfaces END_STREAM to the caller so it knows when the server is
     /// done sending. Returns `{ data: null, end_stream: true }` for the
     /// trailers frame that ends a streaming response with no payload.
+    ///
+    /// Thin wrapper over `readStreamFrameCore(null)`; observable behavior is
+    /// byte-for-byte identical to the pre-Iter2-D `readStreamFrame` for the
+    /// server / existing null-path callers.
     pub fn readStreamFrame(self: *Transport) !StreamFrame {
+        return self.readStreamFrameCore(null);
+    }
+
+    /// Read the next streaming frame, FILTERED to `expected_sid` — the
+    /// CLIENT server-streaming path. Mirrors `readMessageOnStream`: DATA /
+    /// HEADERS frames from a stale or otherwise unrelated stream (e.g. the
+    /// unread trailer of a prior unary `call` on the same client) are
+    /// skipped — their receive-window credit is refilled and their header
+    /// blocks drained — rather than being misread as THIS stream's
+    /// end-of-stream. DATA / HEADERS on `expected_sid` behave exactly as
+    /// `readStreamFrame`. Control frames (SETTINGS / WINDOW_UPDATE / PING /
+    /// etc.) are handled regardless of stream.
+    pub fn readStreamFrameOnStream(self: *Transport, expected_sid: u31) !StreamFrame {
+        return self.readStreamFrameCore(expected_sid);
+    }
+
+    /// Shared core for `readStreamFrame` (expected_sid == null, server /
+    /// legacy behavior) and `readStreamFrameOnStream` (expected_sid != null,
+    /// client stream-id filter). When `expected_sid` is null this is
+    /// byte-for-byte the historical `readStreamFrame`: HEADERS always set
+    /// `last_stream_id`, DATA/HEADERS from any stream are assembled, and a
+    /// HEADERS(END_STREAM) on any stream ends the read. When `expected_sid`
+    /// is set: DATA / HEADERS from other streams are skipped (window refilled
+    /// for DATA, header block drained for HEADERS), `last_stream_id` is left
+    /// untouched (it is the client's monotonic allocation counter), and only
+    /// the expected stream's END_STREAM ends the read.
+    fn readStreamFrameCore(self: *Transport, expected_sid: ?u31) !StreamFrame {
         var grpc_buf: std.ArrayList(u8) = .empty;
         defer grpc_buf.deinit(self.allocator);
         var saw_end: bool = false;
@@ -1593,6 +1624,17 @@ pub const Transport = struct {
 
             switch (frame_type) {
                 @intFromEnum(http2.frame.FrameType.DATA) => {
+                    // Client filter: skip DATA from a stale/other stream,
+                    // but still refill the receive window so flow control
+                    // stays balanced.
+                    if (expected_sid) |sid| {
+                        if (frame.stream_id != sid) {
+                            const skip_len: u32 = @intCast(payload.len);
+                            self.allocator.free(payload);
+                            self.maybeRefillRecvWindow(frame.stream_id, skip_len);
+                            continue;
+                        }
+                    }
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
                     if (end) saw_end = true;
                     const data_len: u32 = @intCast(payload.len);
@@ -1634,8 +1676,37 @@ pub const Transport = struct {
                     return .{ .data = result, .end_stream = saw_end };
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
+                    // Client filter: skip a HEADERS frame (stale trailer or
+                    // response headers) belonging to a completed/other
+                    // stream WITHOUT inspecting END_STREAM — that close
+                    // belongs to a different call. The header block is freed
+                    // (and any CONTINUATION fragments drained) so no bytes
+                    // are left mid-stream, and `last_stream_id` is left
+                    // untouched (it is the client's allocation counter).
+                    if (expected_sid) |sid| {
+                        if (frame.stream_id != sid) {
+                            const end_headers = (flags & http2.frame.FrameFlags.END_HEADERS) != 0;
+                            if (end_headers) {
+                                self.allocator.free(payload);
+                            } else {
+                                const block = self.collectContinuations(frame.stream_id, payload) catch |err| {
+                                    self.allocator.free(payload);
+                                    return err;
+                                };
+                                self.allocator.free(payload);
+                                self.allocator.free(block);
+                            }
+                            continue;
+                        }
+                    }
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
-                    self.last_stream_id = frame.stream_id;
+                    // SERVER / legacy null path learns the stream id from the
+                    // inbound HEADERS. The CLIENT filtered path must NOT touch
+                    // `last_stream_id` — it is the client's monotonic
+                    // allocation counter (advanced only by
+                    // `nextClientStreamId`); clobbering it would make the next
+                    // call reuse this id.
+                    if (expected_sid == null) self.last_stream_id = frame.stream_id;
                     const end_headers = (flags & http2.frame.FrameFlags.END_HEADERS) != 0;
                     if (end_headers) {
                         self.extractPathFromHpack(payload);

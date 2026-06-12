@@ -218,6 +218,40 @@ test "Iter2-C: readMessageOnStream(1) returns message on normal HEADERS+DATA" {
     try testing.expectEqualSlices(u8, "hi", msg);
 }
 
+// --- Iter2-D: stream-id-filtered streaming client read
+// (readStreamFrameOnStream) ---
+//
+// The latent bug: after a unary `call` reads via `readMessageOnStream` it
+// intentionally leaves its own HEADERS(END_STREAM) trailer UNREAD in the
+// buffer. A subsequent `streamCall` on the SAME client that read via the
+// unfiltered `readStreamFrame` would misread that stale trailer as its own
+// end-of-stream and abandon its real response. `readStreamFrameOnStream`
+// skips the stale trailer and reads its own stream's message + end.
+
+test "Iter2-D: readStreamFrameOnStream skips stale trailer from a completed stream" {
+    const alloc = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    // Stale unary trailer from stream 1 (HEADERS END_STREAM|END_HEADERS),
+    // left unread by a prior `call`:
+    try pushFrame(&script, alloc, 0x1, 0x1 | 0x4, 1, &.{});
+    // This streamCall's response on stream 3: HEADERS(END_HEADERS, no
+    // END_STREAM) then DATA(END_STREAM) carrying gRPC framed "hi" — so the
+    // streamed message and end arrive together.
+    try pushFrame(&script, alloc, 0x1, 0x4, 3, &.{});
+    try pushFrame(&script, alloc, 0x0, 0x1, 3, &[_]u8{ 0, 0, 0, 0, 2, 'h', 'i' });
+
+    var fake = FakeStream{ .read_buf = script.items, .allocator = alloc };
+    defer fake.write_buf.deinit(alloc);
+    var t = fakeTransport(&fake);
+
+    const sf = try t.readStreamFrameOnStream(3);
+    defer if (sf.data) |d| alloc.free(d);
+    try testing.expect(sf.data != null);
+    try testing.expectEqualSlices(u8, "hi", sf.data.?);
+    try testing.expect(sf.end_stream);
+}
+
 // --- Iter2-C: nextClientStreamId allocator (odd, monotonic, exhaustion) ---
 
 test "Iter2-C: nextClientStreamId yields 1,3,5 from last_stream_id=1" {

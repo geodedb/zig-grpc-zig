@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     try server.handlers.append(
         allocator,
         .{
-            .name = "SayHello",
+            .name = "/grpc.example/SayHello",
             .handler_fn = sayHello,
         },
     );
@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     try server.handlers.append(
         allocator,
         .{
-            .name = "Benchmark",
+            .name = "/grpc.benchmark/Benchmark",
             .handler_fn = benchmarkHandler,
         },
     );
