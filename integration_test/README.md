@@ -25,7 +25,7 @@ The integration test suite validates that the Zig gRPC server correctly implemen
 
 ## Prerequisites
 
-- Zig 0.15.2
+- Zig 0.16.0
 - Python 3.8+
 - pip (Python package manager)
 
@@ -40,6 +40,7 @@ Run the complete test suite automatically:
 ```
 
 This script will:
+
 1. Build the test server
 2. Start the server on port 50052
 3. Set up a Python virtual environment
@@ -52,17 +53,20 @@ This script will:
 If you prefer to run steps manually:
 
 1. **Build the test server:**
+
    ```bash
    cd ..
    zig build integration_test
    ```
 
 2. **Start the server in one terminal:**
+
    ```bash
    ./zig-out/bin/grpc-test-server
    ```
 
 3. **Run the Python tests in another terminal:**
+
    ```bash
    cd integration_test
    python3 -m venv venv
@@ -77,21 +81,25 @@ If you prefer to run steps manually:
 The integration tests validate:
 
 ### 1. Echo Handler
+
 - Tests basic unary RPC calls
 - Validates request/response flow
 - Ensures message delivery
 
 ### 2. CompressedEcho Handler
+
 - Tests compression support
 - Validates gzip compression on responses
 - Ensures data integrity with compression
 
 ### 3. HealthCheck Handler
+
 - Tests health checking protocol
 - Validates service status reporting
 - Ensures availability monitoring
 
 ### 4. SecureEcho Handler
+
 - Tests authentication integration
 - Validates secure RPC calls
 - (Note: Full auth validation requires additional setup)
@@ -110,10 +118,13 @@ The test server runs with the following configuration:
 ### Server fails to start
 
 - Check if port 50052 is already in use:
+
   ```bash
   lsof -i :50052
   ```
+
 - View server logs:
+
   ```bash
   cat /tmp/grpc_test_server.log
   ```
@@ -124,6 +135,7 @@ The test server runs with the following configuration:
 - Check that the server is running
 - Verify virtual environment activation
 - Reinstall dependencies:
+
   ```bash
   pip install -r requirements.txt --force-reinstall
   ```

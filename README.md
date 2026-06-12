@@ -9,13 +9,29 @@ A blazingly fast gRPC client & server implementation in Zig, designed for maximu
 ## ⚡️ Features
 
 - 🔥 **Blazingly Fast**: Built from ground up in Zig for maximum performance
-- 🔐 **Full Security**: Built-in JWT authentication and TLS support
+- 🔐 **Auth**: Built-in JWT (HS256) authentication; TLS is bring-your-own via the `on_tls_accept` callback (no built-in TLS engine — see [SECURITY.md](SECURITY.md))
 - 🗜️ **Compression**: Support for gzip and deflate compression
 - 🌊 **Streaming**: Efficient bi-directional streaming
 - 💪 **HTTP/2**: Full HTTP/2 support with proper flow control
 - 🏥 **Health Checks**: Built-in health checking system
 - 🎯 **Zero Dependencies**: Pure Zig implementation
 - 🔍 **Type Safety**: Leverages Zig's comptime for compile-time checks
+
+## 🔒 Security posture
+
+grpc-zig is an **experimental v0.1.x library**. Read this before exposing a server:
+
+- **Transport is plaintext h2c by default.** There is no built-in TLS engine,
+  ALPN, or certificate handling. Terminate TLS in front (reverse proxy / mTLS
+  sidecar) or supply your own via the `on_tls_accept` callback. Tracking: GAP-0009.
+- **Authentication is off by default.** Set `server.require_auth = true` and
+  provide a strong secret to enforce the JWT (HS256) gate.
+- **Bind address defaults to `127.0.0.1`.** Opt into a public bind explicitly
+  with `GrpcServer.initWithBind(..., "0.0.0.0", ...)` or `GRPC_ZIG_BIND_ADDR=0.0.0.0`.
+- **Resource limits (defaults):** inbound message 4 MiB (`max_recv_message_bytes`),
+  inbound frame 16 KiB, concurrent connections 1024 (`GRPC_ZIG_MAX_CONNS`),
+  per-stream flow-credit timeout 30 s (`GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS`).
+- Vulnerability reports: see [SECURITY.md](SECURITY.md).
 
 ## 🚀 Quick Start
 
@@ -109,10 +125,10 @@ All features are demonstrated in the [examples/](examples/) directory:
 1. Add the dependency to your project:
 
 ```sh
-zig fetch --save git+https://github.com/ziglana/gRPC-zig#main
+zig fetch --save git+https://gitlab.com/devnw/zig/grpc-zig#main
 ```
 
-2. Add to your `build.zig`:
+1. Add to your `build.zig`:
 
 ```zig
 const grpc_zig_dep = b.dependency("grpc_zig", .{
@@ -127,7 +143,7 @@ exe.root_module.addImport("grpc-server", grpc_zig_dep.module("grpc-server"));
 exe.root_module.addImport("grpc-client", grpc_zig_dep.module("grpc-client"));
 ```
 
-3. Import in your code:
+1. Import in your code:
 
 ```zig
 const GrpcServer = @import("grpc-server").GrpcServer;
@@ -144,7 +160,7 @@ Clone the repository and add it to your `build.zig.zon`:
     .version = "0.1.0",
     .dependencies = .{
         .grpc_zig = .{
-            .url = "https://github.com/ziglana/gRPC-zig/archive/refs/heads/main.tar.gz",
+            .url = "https://gitlab.com/devnw/zig/grpc-zig/-/archive/main/grpc-zig-main.tar.gz",
             // Replace with actual hash after first fetch
             .hash = "...",
         },
@@ -156,7 +172,7 @@ Clone the repository and add it to your `build.zig.zon`:
 
 Benchmarked against other gRPC implementations (ops/sec, lower is better):
 
-```
+```text
 gRPC-zig    │████████░░░░░░░░░░│  2.1ms
 gRPC Go     │██████████████░░░░│  3.8ms
 gRPC C++    │████████████████░░│  4.2ms
@@ -182,14 +198,16 @@ zig build benchmark
 ```
 
 **Benchmark Options:**
+
 - `--host <host>`: Server host (default: localhost)
-- `--port <port>`: Server port (default: 50051)  
+- `--port <port>`: Server port (default: 50051)
 - `--requests <n>`: Number of requests per client (default: 1000)
 - `--clients <n>`: Number of concurrent clients (default: 10)
 - `--size <bytes>`: Request payload size (default: 1024)
 - `--output <format>`: Output format: text|json (default: text)
 
 **Benchmark Metrics:**
+
 - Latency statistics (min, max, average, P95, P99)
 - Throughput (requests per second)
 - Error rates and success rates
@@ -210,6 +228,7 @@ zig build test
 ```
 
 The test suite covers:
+
 - Compression algorithms (gzip, deflate, none)
 - Benchmark handler functionality
 - Core protocol functionality
@@ -239,6 +258,7 @@ python3 test_client.py
 ```
 
 The integration tests validate:
+
 - HTTP/2 protocol compliance
 - gRPC request/response flow
 - Compression functionality
