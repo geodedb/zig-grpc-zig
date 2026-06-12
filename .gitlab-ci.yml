@@ -231,6 +231,22 @@ loopback-test:
     - timeout 60 ./zig-out/bin/grpc-loopback-test
   needs: ["zig-build-0.16.0"]
 
+# Connection-thread stack-overflow reproduction (GAP-0018 — remote DoS).
+# Runs a server on a stack-trace-capturing allocator (DebugAllocator, as the
+# shipped example uses) and opens a single raw TCP connection. Before the fix
+# the 512 KiB connection-thread stack overflowed in the DWARF self-unwinder
+# during `Transport.initServer` -> `allocStreamWindows`, SIGSEGV-ing the
+# process on the FIRST accepted connection. The binary must exit 0 and print
+# "CONN STACK TEST PASSED"; a crash surfaces as a non-zero exit (124 if it
+# hangs after the SIGSEGV). Run under a 30 s wall clock.
+conn-stack-test:
+  extends: .zig-host-base
+  stage: test
+  script:
+    - zig build conn-stack-test
+    - timeout 30 ./zig-out/bin/grpc-conn-stack-test
+  needs: ["zig-build-0.16.0"]
+
 # Go-Go interop is the control: proves the harness itself works.
 # Must pass — this never fails because of grpc-zig protocol gaps.
 interop-go-go:

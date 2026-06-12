@@ -469,6 +469,27 @@ pub fn build(b: *std.Build) void {
     const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
     loopback_test_step.dependOn(&install_loopback_test.step);
 
+    // Connection-thread stack-overflow reproduction (closes GAP-0018 —
+    // remote DoS). Runs a server on a `DebugAllocator` (stack-trace
+    // capturing) and opens a single raw TCP connection. Before the fix the
+    // 512 KiB connection-thread stack overflows in the DWARF self-unwinder
+    // during `Transport.initServer` -> `allocStreamWindows`, SIGSEGV-ing the
+    // process on the FIRST accepted connection. After the fix the server
+    // survives and the binary prints "CONN STACK TEST PASSED".
+    const conn_stack_test = b.addExecutable(.{
+        .name = "grpc-conn-stack-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/conn_stack_test_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    conn_stack_test.root_module.linkLibrary(zlib_lib);
+    conn_stack_test.root_module.addImport("build_options", build_options_mod);
+    const install_conn_stack_test = b.addInstallArtifact(conn_stack_test, .{});
+    const conn_stack_test_step = b.step("conn-stack-test", "Build the connection-thread stack-overflow reproduction");
+    conn_stack_test_step.dependOn(&install_conn_stack_test.step);
+
     // Path-based handler dispatch test (closes GAP-0003 / #4). Two
     // handlers registered with distinct names; the test verifies each is
     // routed correctly by `:path` and that an unregistered path returns a

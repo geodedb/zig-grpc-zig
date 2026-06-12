@@ -73,6 +73,20 @@ pub const GrpcServer = struct {
     /// embedders can alert on error spikes without an otel build
     /// (closes quality R3 / #58).
     conn_error_count: std.atomic.Value(u64) = .init(0),
+    /// Stack size (bytes) for each spawned connection thread (CC-4).
+    /// Sized from the `GRPC_ZIG_CONN_STACK_SIZE` env var, falling back to
+    /// `DEFAULT_CONN_STACK_SIZE`. The default is deliberately larger than
+    /// the original 512 KiB CC-4 value because a stack-trace-capturing
+    /// allocator (e.g. Zig 0.16's `std.heap.DebugAllocator`, used by the
+    /// shipped `examples/basic_server.zig`) runs the DWARF self-unwinder
+    /// on its FIRST allocation inside `Transport.initServer` ->
+    /// `allocStreamWindows`. The unwinder allocates large CFI register-rule
+    /// state on the stack; 512 KiB overflowed into the guard page and
+    /// SIGSEGV-ed the connection thread on the first accepted, still
+    /// unauthenticated TCP connection (GAP-0018, remote DoS). Operators
+    /// running a non-capturing allocator (`c_allocator`, arena, etc.) can
+    /// reclaim memory by lowering this via the env var. Closes GAP-0018.
+    conn_stack_size: usize = DEFAULT_CONN_STACK_SIZE,
 
     /// Default cap on concurrent accepted connections when
     /// `GRPC_ZIG_MAX_CONNS` is unset.
@@ -80,6 +94,42 @@ pub const GrpcServer = struct {
     /// Default per-stream send-credit timeout (milliseconds) when
     /// `GRPC_ZIG_FLOW_CREDIT_TIMEOUT_MS` is unset.
     pub const DEFAULT_FLOW_CREDIT_TIMEOUT_MS: u64 = 30_000;
+
+    /// Default connection-thread stack size (bytes) when
+    /// `GRPC_ZIG_CONN_STACK_SIZE` is unset. 8 MiB — matches the glibc
+    /// default pthread stack.
+    ///
+    /// WHY 8 MiB (not the old CC-4 value of 512 KiB): a stack-trace-
+    /// capturing allocator (Zig 0.16's `std.heap.DebugAllocator`, which
+    /// the shipped `examples/basic_server.zig` uses) runs the DWARF
+    /// self-unwinder on its FIRST allocation. The unwinder
+    /// (`Dwarf.SelfUnwinder.computeRules`) materializes large CFI
+    /// register-rule state on the stack. Measured against the
+    /// `conn-stack-test` reproduction under the DebugAllocator
+    /// (`src/conn_stack_test_main.zig`): 512 KiB SIGSEGVs 8/8 runs on the
+    /// first accepted connection inside `Transport.initServer` ->
+    /// `allocStreamWindows`; 544 KiB and up pass reliably (544 KiB / 768 KiB
+    /// / 1 MiB / 2 MiB / 4 MiB / 8 MiB each passed every run). The smallest
+    /// reliably-passing measured value is ~544 KiB; doubling that for margin
+    /// lands near 1.1 MiB. We deliberately set the DEFAULT higher — the
+    /// glibc default of 8 MiB — so the safe default exactly matches what
+    /// every connection thread got BEFORE the CC-4 optimization was
+    /// introduced (zero regression risk for capturing allocators, and the
+    /// guard page still backstops genuine runaway recursion). Operators
+    /// using a non-capturing allocator (`c_allocator`, arena, etc.) can
+    /// reclaim idle-connection memory by lowering this via
+    /// `GRPC_ZIG_CONN_STACK_SIZE`. Closes GAP-0018.
+    pub const DEFAULT_CONN_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+    /// Lower bound (bytes) accepted for `GRPC_ZIG_CONN_STACK_SIZE`. 64 KiB.
+    /// The empirical DebugAllocator crash floor is just above 512 KiB, so
+    /// 64 KiB is NOT a safety guarantee for capturing allocators — it is a
+    /// sanity guard that stops an operator from reintroducing the crash
+    /// class with an absurdly small value (e.g. 4096) that can't even hold
+    /// the transport's own frames. Operators who KNOW they run a
+    /// non-capturing allocator can legitimately set values below the
+    /// DebugAllocator floor down to this minimum.
+    pub const MIN_CONN_STACK_SIZE: usize = 64 * 1024;
 
     /// Default bind interface. Loopback-by-default (closes O1 / #53):
     /// binding every interface in cleartext h2c was a hostile-network
@@ -153,6 +203,32 @@ pub const GrpcServer = struct {
         return std.fmt.parseInt(u64, raw, 10) catch error.InvalidFlowCreditTimeout;
     }
 
+    /// Read GRPC_ZIG_CONN_STACK_SIZE (bytes) via libc `getenv`; return
+    /// `DEFAULT_CONN_STACK_SIZE` when missing. Malformed or out-of-range
+    /// values fall back to the default rather than refusing to boot — the
+    /// safe default is always recoverable, and silently shrinking the
+    /// stack on a typo would reintroduce the GAP-0018 crash class. Closes
+    /// GAP-0018.
+    pub fn connStackSizeFromEnv() usize {
+        const raw_ptr = std.c.getenv("GRPC_ZIG_CONN_STACK_SIZE") orelse
+            return DEFAULT_CONN_STACK_SIZE;
+        const raw = std.mem.span(raw_ptr);
+        return parseConnStackSize(raw) catch DEFAULT_CONN_STACK_SIZE;
+    }
+
+    /// Parse a GRPC_ZIG_CONN_STACK_SIZE value (bytes). Rejects 0,
+    /// non-digit input, and anything below `MIN_CONN_STACK_SIZE` (64 KiB)
+    /// so an operator can't reintroduce the GAP-0018 crash class with an
+    /// absurdly small stack. Public for unit tests. Mirrors
+    /// `parseMaxConnsValue`'s shape with an added lower-bound floor.
+    pub fn parseConnStackSize(raw: []const u8) !usize {
+        if (raw.len == 0) return error.InvalidConnStackSize;
+        const n = std.fmt.parseInt(usize, raw, 10) catch return error.InvalidConnStackSize;
+        if (n == 0) return error.InvalidConnStackSize;
+        if (n < MIN_CONN_STACK_SIZE) return error.InvalidConnStackSize;
+        return n;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16, secret_key: []const u8) !GrpcServer {
         return initWithBind(allocator, io, bindAddressFromEnv(), port, secret_key);
     }
@@ -176,6 +252,7 @@ pub const GrpcServer = struct {
             .health_check = health.HealthCheck.init(allocator),
             .conn_sem = .{ .permits = max_conns },
             .flow_credit_timeout_ns = flowCreditTimeoutNsFromEnv(),
+            .conn_stack_size = connStackSizeFromEnv(),
         };
     }
 
@@ -211,13 +288,29 @@ pub const GrpcServer = struct {
             // cooperative reschedule. Dedicated OS thread + detach is the
             // correct primitive for this shape.
             //
-            // CC-4 — cap the pthread stack at 512 KiB instead of the
-            // glibc default of 8 MiB. The handler stack frames in this
-            // codebase are small (one allocator, a couple ArrayLists,
-            // and HPACK fixed-size buffers) so 512 KiB is comfortable
-            // headroom; this drops idle-connection memory from ~8 MiB
-            // to ~512 KiB, ~16x reduction at fleet steady state.
-            const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, connectionThread, .{ self, stream_ }) catch |err| {
+            // CC-4 — size the per-connection pthread stack from
+            // `self.conn_stack_size` (env: `GRPC_ZIG_CONN_STACK_SIZE`,
+            // default `DEFAULT_CONN_STACK_SIZE` = 8 MiB).
+            //
+            // The handler stack frames in this codebase are small (one
+            // allocator, a couple ArrayLists, and HPACK fixed-size
+            // buffers), so the ORIGINAL CC-4 optimization capped this at
+            // 512 KiB to cut idle-connection memory ~16x. That value is
+            // unsafe when the embedder uses a stack-trace-capturing
+            // allocator: the connection thread's FIRST allocation
+            // (`Transport.initServer` -> `allocStreamWindows`) runs the
+            // DWARF self-unwinder, which materializes large CFI
+            // register-rule state on the stack and overflowed 512 KiB into
+            // the guard page -> SIGSEGV on the first unauthenticated
+            // connection (GAP-0018, remote DoS). The DEFAULT is now 8 MiB
+            // (the glibc default; the measured DebugAllocator crash floor
+            // is just above 512 KiB, so this is a large verified margin).
+            // Operators running a non-capturing
+            // allocator can reclaim that memory by lowering
+            // `GRPC_ZIG_CONN_STACK_SIZE` (floor `MIN_CONN_STACK_SIZE`,
+            // 64 KiB). The memory optimization is preserved — just no
+            // longer the unsafe default.
+            const thread = std.Thread.spawn(.{ .stack_size = self.conn_stack_size }, connectionThread, .{ self, stream_ }) catch |err| {
                 std.log.err("Failed to spawn connection thread: {}", .{err});
                 stream_.close(self.io);
                 // Spawn failed — return the permit we reserved.

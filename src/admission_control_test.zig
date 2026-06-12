@@ -78,6 +78,56 @@ test "Semaphore wait then post does not block" {
     sem.post(io);
 }
 
+test "GrpcServer.DEFAULT_CONN_STACK_SIZE is 8 MiB" {
+    // GAP-0018 — the connection-thread stack default must be large enough
+    // to survive the DWARF self-unwinder a stack-trace-capturing allocator
+    // (e.g. DebugAllocator) runs on its first allocation inside
+    // `Transport.initServer`. 8 MiB matches the glibc default and gives a
+    // large verified margin over the ~512 KiB measured crash floor.
+    try testing.expectEqual(@as(usize, 8 * 1024 * 1024), server_mod.GrpcServer.DEFAULT_CONN_STACK_SIZE);
+}
+
+test "GrpcServer.MIN_CONN_STACK_SIZE is 64 KiB" {
+    try testing.expectEqual(@as(usize, 64 * 1024), server_mod.GrpcServer.MIN_CONN_STACK_SIZE);
+}
+
+test "parseConnStackSize accepts a valid byte count at or above the floor" {
+    // GAP-0018 — the value is interpreted as a raw byte count for the
+    // pthread stack. Anything at or above MIN_CONN_STACK_SIZE (64 KiB) is
+    // accepted verbatim.
+    try testing.expectEqual(@as(usize, 65536), try server_mod.GrpcServer.parseConnStackSize("65536"));
+    try testing.expectEqual(@as(usize, 8 * 1024 * 1024), try server_mod.GrpcServer.parseConnStackSize("8388608"));
+    try testing.expectEqual(@as(usize, 2 * 1024 * 1024), try server_mod.GrpcServer.parseConnStackSize("2097152"));
+}
+
+test "parseConnStackSize rejects zero" {
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("0"));
+}
+
+test "parseConnStackSize rejects empty and non-digit input" {
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize(""));
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("big"));
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("-1"));
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("8m"));
+}
+
+test "parseConnStackSize rejects values below the 64 KiB floor" {
+    // An operator must not be able to reintroduce the GAP-0018 crash class
+    // with an absurdly small stack. 1024 bytes is well below the floor.
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("1024"));
+    // Exactly one byte under the floor is still rejected.
+    try testing.expectError(error.InvalidConnStackSize, server_mod.GrpcServer.parseConnStackSize("65535"));
+}
+
+test "connStackSizeFromEnv returns the default when env var unset" {
+    // GRPC_ZIG_CONN_STACK_SIZE is not set in the test environment, so the
+    // helper falls back to DEFAULT_CONN_STACK_SIZE.
+    try testing.expectEqual(
+        server_mod.GrpcServer.DEFAULT_CONN_STACK_SIZE,
+        server_mod.GrpcServer.connStackSizeFromEnv(),
+    );
+}
+
 test "O1: DEFAULT_BIND_ADDRESS is loopback" {
     try testing.expectEqualStrings("127.0.0.1", server_mod.GrpcServer.DEFAULT_BIND_ADDRESS);
 }
