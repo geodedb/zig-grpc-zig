@@ -230,6 +230,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolution summary:** With MW-1/2/3 deletions (-128 KiB heap/conn), CC-4 stack cap (8 MiB to 512 KiB stack/conn), and CC-1 admission cap (default 1024 conns), the combined resident-memory ceiling drops from ~8 GiB to well under 600 MiB at the cap. Further gating now happens at admission rather than after thread spawn.
 - **Evidence:** see MW-1/2/3, CC-4, CC-1 entries.
 - **Resolved date:** 2026-04-26
+- **⚠ Note 2026-06-12:** the CC-4 portion of this ceiling changed — the connection-thread stack default reverted from 512 KiB to 8 MiB to fix the GAP-0018 segfault (see P-CC-4). Because thread stacks are demand-paged, idle-connection *RSS* is still dominated by heap state, not the stack reservation; the 8 MiB figure is virtual address space, lowerable via `GRPC_ZIG_CONN_STACK_SIZE` under non-capturing allocators. The heap-side reductions (MW-1/2/3) and the CC-1 admission cap are unchanged.
 
 ### P-CC-1: Unbounded thread-per-connection accept loop [RESOLVED]
 
@@ -250,6 +251,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolution summary:** `SpawnConfig.stack_size = 512 * 1024` for the per-connection thread. ~16x reduction in idle-connection memory; combined with the CC-1 admission cap, saves ~7.5 GiB at fleet steady state vs the glibc default.
 - **Evidence:** `src/server.zig` -- `SpawnConfig.stack_size`.
 - **Resolved date:** 2026-04-26
+- **⚠ Superseded 2026-06-12 (GAP-0018):** the fixed 512 KiB cap was found UNSAFE under any stack-trace-capturing allocator (Zig 0.16's `std.heap.DebugAllocator`, which the shipped example uses): the DWARF self-unwinder allocates large CFI state on the stack during the connection thread's first allocation (`Transport.initServer` → `allocStreamWindows`), overflowing the 512 KiB stack and SIGSEGV-ing on the first accepted connection — a pre-auth remote DoS. Fixed in `77ed8d4`: the connection-thread stack size is now **configurable** via `GRPC_ZIG_CONN_STACK_SIZE` (64 KiB floor) with a **safe 8 MiB default**. Note thread stacks are demand-paged, so the 8 MiB reservation does not cost 8 MiB of RSS per idle connection — actual resident memory tracks pages touched (a few KiB for an idle/handshaked connection). Operators running a non-capturing allocator (e.g. `c_allocator`, release builds) may lower the value via the env var to reclaim virtual address space. Regression-gated by `zig build conn-stack-test` (CI).
 
 ---
 
