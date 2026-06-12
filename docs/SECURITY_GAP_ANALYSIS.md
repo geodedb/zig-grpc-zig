@@ -1,8 +1,21 @@
 # Security Gap Analysis — grpc-zig
 
-Last updated: 2026-06-11 (audit-fix pass: A5, I2, I5, I6, I7, M2, O1, NEW-1/2/3 closed)
+Last updated: 2026-06-12 (iteration-2/3 audit-fix pass: GAP-0018 cluster, NEW-A, CM-UAF closed; GAP-0019/0020 opened)
 Scope: full repository (`src/`, `build.zig`, `.gitlab-ci.yml`) at HEAD `ac7f771`.
 
+> **Closed in the 2026-06-12 iteration-2/3 audit-fix pass (branch `fix/audit-2026-06-11`; see `docs/GAP_ANALYSIS_RESOLVED.md`):**
+>
+> - **GAP-0018** (High, pre-auth remote DoS) -- connection-thread stack overflow (segfault) on the benchmark single-call path; configurable, enlarged connection-thread stack -- `77ed8d4`
+> - **readMessage trailer-only hang** -- `readMessage` hung on trailer-only responses; fresh stream id per call + stream-id-filtered read -- `6ef4497`
+> - **single-call stream-id reuse** -- single-call path reused a stream id across calls -- `6ef4497`
+> - **NEW-A** (liveness DoS) -- unbounded stream-id-skip loop in the client read paths (introduced earlier this pass, then fixed); bounded via `MAX_SKIPPED_FRAMES` -- `df4813b`
+> - **CM-UAF** -- `ClientMux` stack-slot use-after-free race; `streams_mutex` now held across the slot critical section -- `bcbc73a`
+>
+> **Newly opened this pass (tracked):**
+>
+> - **GAP-0020** (Medium DoS) -- no PING/control-frame flood resistance (no per-connection frame budget / read-idle timeout) -- GitLab #75
+> - **GAP-0019** (feature gap) -- client cannot connect by hostname (no DNS resolution) -- tracked in `docs/GAP_ANALYSIS.md` GAP-0019 (GitLab #74)
+>
 > **Closed in 2026-06-11 audit-fix pass (branch `fix/audit-2026-06-11`; see `docs/GAP_ANALYSIS_RESOLVED.md`):**
 >
 > - **NEW-1** (High, P0) -- unbounded inbound gRPC message assembly (pre-auth memory DoS); cap added (`max_recv_message_bytes` 4 MiB) -- `16ce41c` -- closed GitLab #43
@@ -27,7 +40,7 @@ Scope: full repository (`src/`, `build.zig`, `.gitlab-ci.yml`) at HEAD `ac7f771`
 > - Source: Phase 3 adversarial security review (auth, transport/HPACK, memory, resource, ops, supply-chain).
 > - Audience: maintainers and embedders. Treat as security-sensitive material until criticals are patched.
 >
-> **Still OPEN after the 2026-06-11 pass:** O2 (#54, no built-in TLS engine -- GAP-0009), R2-sec (#52, MAX_CONCURRENT_STREAMS not enforced per connection), S1 (#55, CI allow_failure default unverified), S3 (#56, branch protection unverified), M1 (`@intCast` truncations -- downgraded to Info; recheck).
+> **Still OPEN after the 2026-06-12 iteration-2/3 pass:** GAP-0020 (#75, PING/control-frame flood -- Medium DoS, new this pass), O2 (#54, no built-in TLS engine -- GAP-0009), R2-sec (#52, MAX_CONCURRENT_STREAMS not enforced per connection), S1 (#55, CI allow_failure default unverified), S3 (#56, branch protection unverified), M1 (`@intCast` truncations -- downgraded to Info; recheck). GAP-0019 (#74, hostname/DNS) is a feature gap tracked in `docs/GAP_ANALYSIS.md`.
 
 ---
 
