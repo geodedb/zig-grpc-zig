@@ -11,6 +11,7 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 1. **HPACK / codec depth.** Static-table coverage and dynamic-table byte-bounded eviction still incomplete (GAP-0005). Knock-on effects on metadata-heavy traces and conformance fuzzing (GAP-0015).
 2. **Feature surface advertised but not shipped.** Bidi streaming + interop coverage (GAP-0007, GAP-0014), health on the wire (GAP-0008), built-in TLS + ALPN (GAP-0009), gzip/encoding (GAP-0011), generic proto3 codec (GAP-0006), interop matrix breadth (GAP-0012), CI perf gating (GAP-0013), observability surface (GAP-0016).
 3. **Verifier follow-ups from gap-close.** Both 2026-04-26 verifier carry-overs (`GAP-FU-001`, `GAP-FU-002`) are now closed; resolutions live in `docs/GAP_ANALYSIS_RESOLVED.md`.
+4. **New finding from the 2026-06-11 audit-fix pass.** The benchmark single-call `GrpcClient` path fails 100% with `error.ParseFailed` (GAP-0018) -- pre-existing, client-side, untriaged; the loopback/mux path is unaffected.
 
 ## Blockers for Phase 4 issue creation
 
@@ -21,7 +22,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 ## Open Gaps
 
 ### GAP-0005: HPACK only parses :path; dynamic-table state shaky
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/6
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/6>
 - **Category:** Correctness (HTTP/2 protocol)
 - **Severity:** High
 - **Requirement source:** RFC 7541; downstream of GAP-0010 / GAP-0015.
@@ -35,7 +37,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** All §C vectors decode; encoder/decoder roundtrip random sets; server exposes parsed metadata to handlers; ties into GAP-0015 fuzz harness.
 
 ### GAP-0006: No general proto3 codec
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/7
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/7>
 - **Category:** Feature (codec)
 - **Severity:** High
 - **Requirement source:** Implicit in shipping a gRPC library.
@@ -48,7 +51,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Encode/decode int32/int64/sint*/fixed*/string/bytes/repeated/message; round-trip random messages against Go reference; tests cover unknown-field preservation.
 
 ### GAP-0007: Streaming RPCs only partially work; CI exercises only unary
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/8
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/8>
 - **Category:** Feature
 - **Severity:** High
 - **Requirement source:** README.md:14 ("Efficient bi-directional streaming").
@@ -62,7 +66,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Client-stream and bidi roundtrip against Go server; cancellation propagates; interop matrix exercises all four modes.
 
 ### GAP-0008: Health service unreachable over the wire
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/9
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/9>
 - **Category:** Feature
 - **Severity:** High
 - **Requirement source:** README.md:16 ("Built-in health checking system").
@@ -75,7 +80,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** `grpc-health-probe -addr=...` succeeds; status changes reflected in `Watch` responses.
 
 ### GAP-0009: TLS BYO only; no built-in engine, ALPN, or cert pinning
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/10
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/10>
 - **Category:** Feature (TLS)
 - **Severity:** High
 - **Requirement source:** README.md:12 ("Built-in JWT authentication and TLS support").
@@ -86,7 +92,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Server accepts cert+key paths; client connects to `grpcs://` and verifies identity; ALPN negotiates `h2`; integration test with self-signed cert.
 
 ### GAP-0010: Hard-coded request headers; no custom metadata possible
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/11
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/11>
 - **Category:** Correctness (codec)
 - **Severity:** High
 - **Requirement source:** gRPC spec for client-side metadata.
@@ -98,7 +105,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** `grpc-timeout: 5S` round-trips and is honored server-side; `-bin` headers base64-encoded; metadata visible to handlers; invalid names rejected client-side.
 
 ### GAP-0011: Server hardcodes Algorithm.none; never decompresses gzip
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/12
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/12>
 - **Category:** Correctness
 - **Severity:** High
 - **Requirement source:** gRPC spec for `grpc-encoding` / `grpc-accept-encoding`.
@@ -111,7 +119,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Gzip request decompressed; gzip response emitted when supported; unsupported encoding returns UNIMPLEMENTED.
 
 ### GAP-0012: Cross-stack interop matrix only Go x Zig
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/14
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/14>
 - **Category:** Feature (interop)
 - **Severity:** Medium
 - **Requirement source:** Implicit in shipping a cross-language protocol implementation.
@@ -124,7 +133,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Rust and Python pairs pass; CI required gating on at least one cross-pair.
 
 ### GAP-0013: Benchmark not wired to CI; harness sequential despite --clients
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/15
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/15>
 - **Category:** Feature (observability)
 - **Severity:** Medium
 - **Requirement source:** Implicit in publishing benchmarks.
@@ -137,7 +147,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** `--clients` scales under load; CI publishes JSON artifact; regression threshold enforced.
 
 ### GAP-0014: Streaming not exercised in interop matrix
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/16
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/16>
 - **Category:** Test (interop)
 - **Severity:** Medium
 - **Requirement source:** gRPC interop test suite.
@@ -151,7 +162,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** Matrix runs all four modes; CI summary reports per-mode results.
 
 ### GAP-0015: No HPACK/Huffman fuzz or RFC 7541 conformance tests
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/17
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/17>
 - **Category:** Test (correctness)
 - **Severity:** Medium
 - **Requirement source:** RFC 7541 §C.
@@ -165,7 +177,8 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Acceptance criteria:** All §C vectors pass; fuzz harness runs in CI; adversarial inputs rejected without panic.
 
 ### GAP-0016: Only ad-hoc std.log; no metrics/traces surface
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/19
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/19>
 - **Category:** Feature (observability)
 - **Severity:** Low
 - **Requirement source:** Operational requirement for production deployment.
@@ -176,3 +189,21 @@ After the 2026-04-26 gap-close pass, four blockers have been retired (auth bypas
 - **Impact/Risk:** Production usability is poor.
 - **Recommended fix:** Define `Logger` interface (vtable); minimal metrics surface (counter/histogram); optional tracing span API; default impl backed by `std.log` and counters.
 - **Acceptance criteria:** Custom logger injectable; per-RPC metrics emitted; documented in README.
+
+### GAP-0018: Benchmark single-call GrpcClient path returns error.ParseFailed (100% failure) [NEW finding 2026-06-11]
+
+- **Issue:** _not yet filed_ (recorded here for the next audit iteration to triage)
+- **Category:** Correctness (client / transport)
+- **Severity:** High (until triaged)
+- **Requirement source:** New finding observed during the 2026-06-11 audit-fix pass while running `zig build benchmark`.
+- **Note on Gap-ID:** `GAP-0017` is already taken (`docs/GAP_ANALYSIS_RESOLVED.md`, "Zero dependencies claim verified"); this new finding is assigned `GAP-0018` to avoid collision.
+- **Pre-existing, NOT caused by this pass:** The benchmark touched in this pass only removed the hardcoded secret and parallelized workers; the transport/parse path was untouched. Removing the hardcoded secret did not change the symptom. The failure reproduces independently of the audit-fix changes.
+- **Symptom (evidence):**
+  - `zig build benchmark` against the example server reports a 100% error rate; every single-call attempt fails with `error.ParseFailed`.
+  - The example server log is empty, so the failure is client-side and occurs before any auth/dispatch on the server.
+- **Scope:**
+  - Confined to the single-call path: `GrpcClient.call` -> `readMessage`.
+  - The loopback / multiplexed `ClientMux` path works (loopback ALL SCENARIOS PASSED at HEAD), so this is specific to the single-call response-parse path, not the shared framing.
+- **Why this is a gap:** A documented, shipped benchmark entrypoint fails 100% of the time on its primary single-call path, masking real throughput/latency numbers and indicating a likely response-parse defect in `GrpcClient.call`/`readMessage`.
+- **Recommended fix:** Triage in the next iteration -- capture the raw bytes the client receives before `readMessage` parses them, compare against the loopback/mux path that succeeds, and determine whether the defect is in frame reassembly, the gRPC length-prefix decode, or HEADERS handling on the single-call path.
+- **Acceptance criteria:** `zig build benchmark` against the example server completes with a 0% `error.ParseFailed` rate; a regression test exercises the single-call `GrpcClient.call` response-parse path directly.

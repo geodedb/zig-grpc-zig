@@ -3,6 +3,7 @@
 Repository: `devnw/zig/grpc-zig`
 Last sync: 2026-04-26 (gap-close pass)
 Companion files:
+
 - `docs/GAP_ANALYSIS.md` (open functional/feature gaps)
 - `docs/QUALITY_GAP_ANALYSIS.md` (open quality findings)
 - `docs/PERF_GAP_ANALYSIS.md` (open performance findings)
@@ -12,7 +13,10 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 
 ---
 
+## Functional / Feature Gap Resolutions
+
 ### GAP-0017: "Zero dependencies" claim verified [RESOLVED]
+
 - **Issue:** none (resolved at gap-detection time; no platform issue created)
 - **Category:** Docs
 - **Source tag:** G-DOC-01
@@ -26,7 +30,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 ---
 
 ### GAP-0001: Server accepts every RPC unauthenticated despite advertising JWT auth [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/2 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/2> (closed)
 - **Category:** Security (Critical)
 - **Resolution commit:** `51a5924` -- *fix(security): close GAP-0001 - reject requests with missing or invalid authorization*
 - **Resolution summary:** Added `GrpcServer.require_auth` (default off for back-compat). When enabled, the dispatch loop reads `trans.lastAuthorization()` and calls `auth.verifyToken`; missing or invalid token short-circuits with `endStreamWithStatus(stream_id, 16, @errorName(err))` (UNAUTHENTICATED). Transport now captures the `authorization` header into a 1024-byte bounded buffer during HPACK extraction (handles LIE-with-incremental-indexing, Literal-Without-Indexing, static-table index 23, plain-text and Huffman strings). Multi-byte HPACK 7-bit-prefix integer encoding (`hpackInt7Encode`) added so JWT values >127 bytes round-trip.
@@ -37,7 +42,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### GAP-0002: Per-RPC authorization metadata silently dropped on the wire [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/3 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/3> (closed)
 - **Category:** Correctness / Security (Critical)
 - **Resolution commit:** `cc2d9b7` -- *fix: close GAP-0002 - transmit per-RPC metadata in HEADERS*
 - **Resolution summary:** Introduced `writeRequestHeadersWithMetadata` which appends each metadata entry as an HPACK Literal-with-Incremental-Indexing header after the canonical pseudo-headers. `GrpcClient.call` now plumbs the headers map (and JWT, when `auth` is set) through `writeRequestWithMetadata` instead of dropping it. Existing `writeRequestHeaders` is a null-metadata wrapper, so byte-for-byte output is unchanged for metadata-free callers.
@@ -49,7 +55,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### GAP-0003: Server always invokes handlers.items[0] regardless of :path [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/4 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/4> (closed)
 - **Category:** Correctness (Critical)
 - **Resolution commit:** `bf55446` -- *fix: close GAP-0003 - dispatch by :path instead of handlers[0]*
 - **Resolution summary:** Server dispatch now linear-scans `self.handlers` for a name == method match. On miss, emits `grpc-status: 12` (UNIMPLEMENTED) trailer-only HEADERS via `endStreamWithStatus` and continues. Loopback scenarios now register one handler per `:path` (`/Echo`, `/Passthrough`, `/Stream`, `/loopback.Mux/Echo`).
@@ -59,7 +66,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### GAP-0004: Flow control window never decremented; large streams stall [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/5 (closed); also closes perf #13 (NW-1+NW-2+NW-3)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/5> (closed); also closes perf #13 (NW-1+NW-2+NW-3)
 - **Category:** Correctness / HTTP/2 protocol (High)
 - **Resolution commit:** `efd9ef6` -- *fix: close GAP-0004 - track and honor HTTP/2 flow control + h2spec CI*
 - **Resolution summary:** Full HTTP/2 flow-control state machine. Server and client now advertise non-default SETTINGS (INITIAL_WINDOW_SIZE 1 MiB, MAX_FRAME_SIZE 16384, MAX_CONCURRENT_STREAMS 100, MAX_HEADER_LIST_SIZE 8192). Per-stream and connection windows tracked as `i32 send_window` / `i32 recv_window`. `processWindowUpdate` validates non-zero and rejects overflow past 2^31-1 with FLOW_CONTROL_ERROR. `reserveSendCredit` uses `flow_cv` to block writers; `maybeRefillRecvWindow` emits WINDOW_UPDATE below the half-threshold. `applyPeerSettings` honours SETTINGS_INITIAL_WINDOW_SIZE per RFC 7540 §6.9.2. Outbound DATA fragmenter fragments a gRPC-framed buffer into max_frame_size-sized DATA frames; reassembly accumulates into a per-call ArrayList until the gRPC length-prefix indicates a complete message. CI now runs h2spec generic + http2 conformance suites against the Zig interop server.
@@ -76,6 +84,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 ## Verifier Follow-Up Resolutions
 
 ### GAP-FU-002: Per-stream send-credit timeout in flow control [RESOLVED]
+
 - **Issue:** none filed (filed under `security`, severity::medium / `reliability`)
 - **Category:** Security / Reliability (slow-loris class, Medium)
 - **Source:** Verifier pass on commit `efd9ef6` (2026-04-26).
@@ -84,14 +93,15 @@ Resolved or invalidated gaps are recorded here for historical traceability.
   - `src/transport.zig` -- `flow_epoch` + `flow_credit_timeout_ns` fields replacing `flow_cv`; new `wakeFlowWaiters`, `reserveSendCredit` (returns `error{FlowControlTimeout}!void`), `reserveSendCreditOrRst`, `writeRstStream`. Broadcast sites in `processWindowUpdate` and `applyPeerSettings` updated.
   - `src/server.zig` -- `GrpcServer.flow_credit_timeout_ns`, `DEFAULT_FLOW_CREDIT_TIMEOUT_MS`, `flowCreditTimeoutNsFromEnv`, `parseFlowCreditTimeoutMs`; `handleConnection` propagates the timeout onto the new Transport.
   - `src/flow_control_test.zig` -- 3 new tests:
-      * `reserveSendCredit returns FlowControlTimeout when peer never advertises credit` (slow-loris fault injection: starves both windows, sets a 50 ms timeout, asserts timeout fires within (~30 ms, 1 s)).
-      * `reserveSendCredit succeeds when credit is available within the timeout` (no false positive on funded streams).
-      * `reserveSendCredit with timeout=0 keeps legacy unbounded behaviour for funded streams`.
+    - `reserveSendCredit returns FlowControlTimeout when peer never advertises credit` (slow-loris fault injection: starves both windows, sets a 50 ms timeout, asserts timeout fires within (~30 ms, 1 s)).
+    - `reserveSendCredit succeeds when credit is available within the timeout` (no false positive on funded streams).
+    - `reserveSendCredit with timeout=0 keeps legacy unbounded behaviour for funded streams`.
   - `src/admission_control_test.zig` -- 3 new tests for `parseFlowCreditTimeoutMs` (accepts `0`, rejects empty / non-numeric / negative; default constant pinned to `30_000`).
   - `zig build test` -- 45/45 unit tests pass; `zig build loopback-test` ALL SCENARIOS PASSED including the multiplexed 128-calls-on-1-connection scenario which exercises the flow-control fast path on legitimate, funded streams.
 - **Resolved date:** 2026-04-26
 
 ### GAP-FU-001: R1 acceptance text references RST_STREAM; impl emits gRPC-canonical trailer-only HEADERS [RESOLVED]
+
 - **Issue:** none filed (filed under `quality-finding`, severity::low)
 - **Category:** Docs / api-contract (Low)
 - **Source:** Verifier pass on commit `0993e5e` (2026-04-26).
@@ -106,6 +116,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 ## Quality Domain Resolutions
 
 ### Q-R1: Server swallows handler errors -- wire-contract breach [RESOLVED]
+
 - **Issue:** none filed (quality findings tracker creation deferred)
 - **Category:** Reliability / api-contract (Critical, PriorityScore 200)
 - **Resolution commits:** `19fcf38` (precursor: `endStreamWithStatus` helper) + `0993e5e` (R1 fix)
@@ -118,6 +129,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### Q-A1: gRPC error contract not modelled -- no `endStreamWithStatus(code, message)` helper [RESOLVED]
+
 - **Issue:** none filed
 - **Category:** api-contract (High, PriorityScore 112.5)
 - **Resolution commit:** `19fcf38` -- *feat(transport): add endStreamWithStatus helper for non-zero gRPC status*
@@ -132,20 +144,23 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 ## Security Domain Resolutions
 
 ### S-A1: AuthN never invoked on dispatch path [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/2 (same as GAP-0001; closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/2> (same as GAP-0001; closed)
 - **Category:** Authentication (Critical, Risk 30, CWE-306 / OWASP A07:2021)
 - **Resolution commit:** `51a5924`
 - **Resolution summary:** See GAP-0001.
 - **Resolved date:** 2026-04-26
 
 ### S-A2: Client never serializes `authorization` metadata [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/3 (same as GAP-0002; closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/3> (same as GAP-0002; closed)
 - **Category:** Authentication (Critical, Risk 24, CWE-287 / OWASP A07:2021)
 - **Resolution commit:** `cc2d9b7`
 - **Resolution summary:** See GAP-0002.
 - **Resolved date:** 2026-04-26
 
 ### S-A3: `generateToken` emits no signature; `verifyToken` compares HMAC bytes to decimal `iat` [RESOLVED]
+
 - **Issue:** none filed (held back per disclosure policy until fix landed)
 - **Category:** Authentication / Cryptography (Critical, Risk 30, CWE-347 / OWASP A02:2021)
 - **Resolution commit:** `5ec22b8` -- *fix(security): close A3 - implement RFC 7519 JWT with constant-time HMAC compare* (also closes M3)
@@ -156,6 +171,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### S-M3: Non-constant-time `std.mem.eql` for HMAC compare [RESOLVED]
+
 - **Issue:** none filed
 - **Category:** Memory safety / timing (Medium, CWE-208)
 - **Resolution commit:** `5ec22b8` (folded into S-A3 fix)
@@ -163,6 +179,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### S-I1: HPACK `hpackDecodeInt` shift-counter overflow [RESOLVED]
+
 - **Issue:** none filed (held back per disclosure policy)
 - **Category:** Input parsing (Critical, Risk 18, CWE-190)
 - **Resolution commit:** `9322f96` -- *fix(security): close I1 - cap HPACK varint shift to prevent overflow*
@@ -173,6 +190,7 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### S-I3: `SETTINGS_MAX_FRAME_SIZE` not enforced [RESOLVED]
+
 - **Issue:** none filed (held back per disclosure policy)
 - **Category:** Resource exhaustion (High, Risk 18, CWE-770)
 - **Resolution commit:** `8919308` -- *fix(security): close I3 - enforce SETTINGS_MAX_FRAME_SIZE on inbound frames*
@@ -187,7 +205,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 ## Performance Domain Resolutions
 
 ### P-MW-1 + P-MW-2: Unused 64 KiB read_buf + write_buf per Transport [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/24 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/24> (closed)
 - **Category:** Memory (P1, Score 20)
 - **Resolution commit:** `3238c26` -- *perf: close MW-1/2/3 - remove unused per-Transport buffers and dead http2_conn*
 - **Resolution summary:** Deleted `read_buf` and `write_buf` fields and their alloc/free in `initClient`, `initServer`, `initServerTls`, `deinit`. No code path ever read from or wrote to either slice -- every byte movement went through stack buffers in `readExact` / `ioWriteLocked`. -128 KiB per connection.
@@ -195,7 +214,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### P-MW-3: Dead `http2_conn` Connection field; `sendFrame` is a no-op [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/25 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/25> (closed)
 - **Category:** Memory / cleanup (P1, Score 15)
 - **Resolution commit:** `3238c26`
 - **Resolution summary:** Removed `http2_conn` field plus matching alloc/free; deleted the no-op `sendFrame` stub in `src/http2/connection.zig`. Saves a per-connection HPACK encoder/decoder + AutoHashMap allocation pair.
@@ -203,7 +223,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### P-MW-4: ~131 KiB heap + 8 MiB stack/conn -- ~8 GiB at 1k conns [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/18 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/18> (closed)
 - **Category:** Memory umbrella (P0, Score 16)
 - **Resolution commits:** `3238c26` (MW-1/2/3) + `0fd05ac` (CC-4) + `ac7f771` (CC-1 + admission cap) collectively
 - **Resolution summary:** With MW-1/2/3 deletions (-128 KiB heap/conn), CC-4 stack cap (8 MiB to 512 KiB stack/conn), and CC-1 admission cap (default 1024 conns), the combined resident-memory ceiling drops from ~8 GiB to well under 600 MiB at the cap. Further gating now happens at admission rather than after thread spawn.
@@ -211,7 +232,8 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### P-CC-1: Unbounded thread-per-connection accept loop [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/20 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/20> (closed)
 - **Category:** Concurrency / admission control (P0, Score 32)
 - **Resolution commit:** `ac7f771` -- *perf(server): close CC-1 + MW-4 - bound concurrent connections*
 - **Resolution summary:** Bounded admission control. `GRPC_ZIG_MAX_CONNS` env var (default 1024) caps live connection count; exceeded limit gates accept via a counting semaphore. Outstanding accept counter decremented on connection-thread exit. Combined with CC-4 stack cap, this puts a hard ceiling under the per-conn memory cost.
@@ -221,9 +243,59 @@ Resolved or invalidated gaps are recorded here for historical traceability.
 - **Resolved date:** 2026-04-26
 
 ### P-CC-4: 8 MiB pthread stack per connection [RESOLVED]
-- **Issue:** https://gitlab.com/devnw/zig/grpc-zig/-/issues/21 (closed)
+
+- **Issue:** <https://gitlab.com/devnw/zig/grpc-zig/-/issues/21> (closed)
 - **Category:** Concurrency / memory (P0, Score 32)
 - **Resolution commit:** `0fd05ac` -- *perf: close CC-4 - cap connection-thread stack at 512 KiB*
 - **Resolution summary:** `SpawnConfig.stack_size = 512 * 1024` for the per-connection thread. ~16x reduction in idle-connection memory; combined with the CC-1 admission cap, saves ~7.5 GiB at fleet steady state vs the glibc default.
 - **Evidence:** `src/server.zig` -- `SpawnConfig.stack_size`.
 - **Resolved date:** 2026-04-26
+
+---
+
+## 2026-06-11 audit-fix pass
+
+Closed on branch `fix/audit-2026-06-11` (on top of `e060433`). Verification for every item: `zig build test` green + loopback ALL SCENARIOS PASSED at HEAD. Each line is `Gap-ID — GitLab issue — commit — summary`.
+
+### Security domain
+
+- **NEW-1 (High, pre-auth memory DoS)** — #43 — `16ce41c` — cap inbound gRPC message assembly (`max_recv_message_bytes` 4 MiB).
+- **NEW-2 (Medium)** — #44 — `721eda3` — peer SETTINGS can no longer raise the inbound frame-size cap (preserves I3).
+- **NEW-3 (Medium)** — #45 — `e3f1594` — truthful README security posture; added SECURITY.md; removed Full-Security/built-in-TLS overclaim.
+- **A5 (High)** — #46 — `5a03dc4` — removed hardcoded `benchmark-secret-key` from `src/`.
+- **I2 (High)** — #47 — `b2e8c4e` — HPACK Huffman decode fails closed; RFC 7541 vector tests added.
+- **I5 (High)** — #48 — `98d1c7b` / `b2071c8` — CONTINUATION reassembly (no longer dropped) + leak-detecting tests.
+- **I6 (High)** — #49 — `1d27136` — gRPC length-prefix / compression flag validated against DATA frame boundaries.
+- **I7 (Medium-latent)** — #50 — `21136ef` — deleted dead stub HPACK decoder with latent OOB reads.
+- **M2-sec (Medium)** — #51 — `61e2f15` — error on stream-id exhaustion instead of silently wrapping `next_stream_id`.
+- **O1 (High)** — #53 — `7b810a4` — loopback-default bind with `bind_address` option (no hardcoded `0.0.0.0`).
+
+### Quality domain
+
+- **R2 (Critical)** — #57 — `8c79e2e` — client_mux always signals end_stream on delivery failure; caps response accumulation (fixes OOM deadlock).
+- **M3 / M4 (High)** — #61 — `1d27136` — shared 5-byte gRPC length-prefix encoder/decoder helpers.
+- **M1 / M2-dup (High)** — #62 — `1d27136` — deduplicated response-headers HPACK literal + gRPC trailer literal (OK trailers).
+- **M5 / M6 (High/Medium)** — #64 — `21136ef` — deleted dead `http2/connection.zig` and `http2/{hpack,stream}.zig`.
+- **R3 (High)** — #58 — `7b810a4` — connection error counter instead of silently discarding errors.
+- **R4 (High)** — #59 — `7b810a4` — TLS read failures log a warning before break.
+- **T3 (Medium)** — #69 — `a43e991` — removed commented-out HelloRequest/HelloResponse test scaffolding.
+- **M11 / M12 (Low)** — #72 — `a43e991` — removed dead `checkHealth` stub and unused `proto/service.zig` import.
+- **D1 / D2 (Medium)** — #70 — `e3f1594` — reconciled Zig version drift and corrected the upstream URL.
+
+### Performance domain
+
+- **BH-1 (P0)** — #22 — `5a03dc4` — benchmark workers run in parallel honoring `concurrent_clients`.
+- **BH-4 (P0)** — #23 — `5a03dc4` — benchmark JSON output to stdout instead of stderr.
+- **BH-5 (P3)** — #42 — `5a03dc4` — printUsage emits trailing newlines.
+- **AG-5 (P3)** — #41 — `5a03dc4` — dropped redundant 256-byte `last_method` memset on every Transport init.
+- **NW-5 (P1)** — #32 — `7b810a4` — TCP_NODELAY/keepalive on listener and accepted sockets.
+- **BH-7 (P1)** — #34 — verified `compat.nanoTimestamp` is monotonic ns-grade; no code change required.
+
+### Won't-fix
+
+- **AG-3 (P3)** — #40 — won't-fix. Early exit from `extractPathFromHpack` would desynchronize the HPACK dynamic table — literal-with-incremental-indexing entries appearing after `:path` must still be pushed to keep the dynamic table consistent across requests, so full iteration is required for correctness. Cost is bounded (one HEADERS frame, ≤8 KiB).
+
+### Partial (issues remain OPEN)
+
+- **T1 (High)** — #63 — `b2e8c4e` — HPACK Huffman/dynamic-table tests landed; `extractPathFromHpack` end-to-end coverage and fuzzing remain. Issue left open.
+- **D3 (Medium)** — #71 — `e3f1594` — SECURITY.md and CONTRIBUTING.md added; CODEOWNERS and `docs/ADRS/ADR-0001` remain. Issue left open.

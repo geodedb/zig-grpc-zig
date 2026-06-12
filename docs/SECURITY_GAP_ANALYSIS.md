@@ -1,17 +1,33 @@
 # Security Gap Analysis — grpc-zig
 
-> Last updated: 2026-04-26 (post gap-close: 5 closed -- A1, A2, A3, M3, I1, I3)
-> Scope: full repository (`src/`, `build.zig`, `.gitlab-ci.yml`) at HEAD `ac7f771`.
+Last updated: 2026-06-11 (audit-fix pass: A5, I2, I5, I6, I7, M2, O1, NEW-1/2/3 closed)
+Scope: full repository (`src/`, `build.zig`, `.gitlab-ci.yml`) at HEAD `ac7f771`.
 
-> **Closed in this pass (see `docs/GAP_ANALYSIS_RESOLVED.md`):**
+> **Closed in 2026-06-11 audit-fix pass (branch `fix/audit-2026-06-11`; see `docs/GAP_ANALYSIS_RESOLVED.md`):**
+>
+> - **NEW-1** (High, P0) -- unbounded inbound gRPC message assembly (pre-auth memory DoS); cap added (`max_recv_message_bytes` 4 MiB) -- `16ce41c` -- closed GitLab #43
+> - **NEW-2** (Medium) -- peer SETTINGS could raise inbound frame cap; now refused -- `721eda3` -- closed GitLab #44
+> - **NEW-3** (Medium) -- README security overclaim; truthful posture + SECURITY.md -- `e3f1594` -- closed GitLab #45
+> - **A5** (High, 18) -- hardcoded `benchmark-secret-key` removed from `src/` -- `5a03dc4` -- closed GitLab #46
+> - **I2** (High, 12) -- HPACK Huffman decode now fails closed + RFC 7541 vector tests -- `b2e8c4e` -- closed GitLab #47
+> - **I5** (High, 12) -- CONTINUATION reassembly (no longer dropped) + leak-detecting tests -- `98d1c7b` / `b2071c8` -- closed GitLab #48
+> - **I6** (High, 12) -- gRPC length-prefix / compression flag validated against DATA boundaries -- `1d27136` -- closed GitLab #49
+> - **I7** (Medium-latent, 6) -- dead stub HPACK decoder with OOB reads deleted -- `21136ef` -- closed GitLab #50
+> - **M2** (Medium, 6) -- stream-id exhaustion now errors instead of wrapping -- `61e2f15` -- closed GitLab #51
+> - **O1** (High, 18) -- loopback-default bind + `bind_address` option -- `7b810a4` -- closed GitLab #53
+>
+> **Closed in the 2026-04-26 gap-close pass (see `docs/GAP_ANALYSIS_RESOLVED.md`):**
+>
 > - **A1** (Critical, 30) -- AuthN never invoked on dispatch -- `51a5924` -- closed GitLab #2
 > - **A2** (Critical, 24) -- Client never serializes authorization metadata -- `cc2d9b7` -- closed GitLab #3
 > - **A3** (Critical, 30) -- broken JWT generate/verify -- `5ec22b8` (also closes M3)
 > - **M3** (Medium, 6) -- non-constant-time HMAC compare -- `5ec22b8`
 > - **I1** (Critical, 18) -- HPACK varint shift overflow -- `9322f96`
 > - **I3** (High, 18) -- SETTINGS_MAX_FRAME_SIZE not enforced -- `8919308`
-> Source: Phase 3 adversarial security review (auth, transport/HPACK, memory, resource, ops, supply-chain).
-> Audience: maintainers and embedders. Treat as security-sensitive material until criticals are patched.
+> - Source: Phase 3 adversarial security review (auth, transport/HPACK, memory, resource, ops, supply-chain).
+> - Audience: maintainers and embedders. Treat as security-sensitive material until criticals are patched.
+>
+> **Still OPEN after the 2026-06-11 pass:** O2 (#54, no built-in TLS engine -- GAP-0009), R2-sec (#52, MAX_CONCURRENT_STREAMS not enforced per connection), S1 (#55, CI allow_failure default unverified), S3 (#56, branch protection unverified), M1 (`@intCast` truncations -- downgraded to Info; recheck).
 
 ---
 
@@ -34,15 +50,17 @@ These are gating actions. Each one assumes that the released `main` branch is in
 
 ## 1. Stats
 
-| Severity | Count | SLA |
-|---------:|:-----:|:----|
-| Critical | 4     | 7 days  |
-| High     | 6     | 30 days |
-| Medium   | 5     | 90 days |
-| Low      | 3     | 180 days |
-| **Total** | **18** | |
+| Severity | Total | Open | SLA |
+|---------:|:-----:|:----:|:----|
+| Critical | 4     | 0    | 7 days  |
+| High     | 6     | 0    | 30 days |
+| Medium   | 5     | 3    | 90 days |
+| Low      | 3     | 3    | 180 days |
+| Info     | 1     | 1    | n/a |
+| **Total** | **19** | **7** | |
 
-Open GitLab issues already filed (public — see "Tracker State" §6): 3.
+Counts include the M1 row, re-graded from High to Info this pass (recheck next pass).
+Open after the 2026-06-11 audit-fix pass: O2 (#54, Medium), R2 (#52, Medium), S1 (#55, Medium), S2 (Low, not filed), S3 (#56, Low), O3 (Low, no action required), M1 (Info). All Critical/High security findings are now closed.
 
 ---
 
@@ -72,26 +90,26 @@ auth_required_factor: 1.5 if no auth needed, 1.0 otherwise
 | A2 | Critical | 24 | Client never serializes `authorization` metadata | `src/client.zig:81-96`, `src/transport.zig:33-96` | CWE-287 / OWASP A07:2021 | **closed (cc2d9b7, 2026-04-26)** |
 | A3 | Critical | 30 | `generateToken` emits no signature; `verifyToken` compares HMAC bytes to decimal `iat` | `src/features/auth.zig:33-66` | CWE-347 / OWASP A02:2021 | **closed (5ec22b8, 2026-04-26)** |
 | A4 | High     | 12 | Single-handler dispatch — `:path` ignored, `handlers.items[0]` always | `src/server.zig:131-138`; `getMethodPath` exists at `src/transport.zig:587` but is unread | CWE-863 | **closed (bf55446, 2026-04-26)** |
-| A5 | High     | 18 | Hardcoded shared secret in library code | `src/benchmark.zig:15` (`secret_key: []const u8 = "benchmark-secret-key"`) | CWE-798 | open |
+| A5 | High     | 18 | Hardcoded shared secret in library code | `src/benchmark.zig:15` (`secret_key: []const u8 = "benchmark-secret-key"`) | CWE-798 | **closed (5a03dc4, 2026-06-11)** -- GitLab #46 |
 
 ### 3.2 Input Parsing / HTTP-2 / HPACK (7)
 
 | ID  | Sev | Risk | Finding | Evidence | CWE / OWASP | Status |
 |-----|:---:|:----:|---------|----------|-------------|--------|
 | I1 | Critical | 18 | HPACK integer-decoder shift-counter overflow | `src/transport.zig:691-707` (`m: std.math.Log2Int(usize)` += 7 unbounded) | CWE-190 | **closed (9322f96, 2026-04-26)** |
-| I2 | High | 12 | Huffman table missing 20-, 21-, 22-, 23-, 24-, 25-, 26-, 27-, 28-bit, 30-bit, and EOS groups | `src/transport.zig:652-687` | CWE-117 | open |
+| I2 | High | 12 | Huffman table missing 20-, 21-, 22-, 23-, 24-, 25-, 26-, 27-, 28-bit, 30-bit, and EOS groups | `src/transport.zig:652-687` | CWE-117 | **closed (b2e8c4e, 2026-06-11)** -- GitLab #47 (fails closed + RFC 7541 vectors) |
 | I3 | High | 18 | `SETTINGS_MAX_FRAME_SIZE` not enforced; `payload = alloc(u8, length)` at u24 width | `src/transport.zig:332`, settings handler `:443-455` is no-op | CWE-770 | **closed (8919308, 2026-04-26)** |
 | I4 | High | 12 | `WINDOW_UPDATE` accepted but never honored — no flow control | `src/transport.zig:456-460` | CWE-770 | **closed (efd9ef6, 2026-04-26)** |
-| I5 | High | 12 | `CONTINUATION` frames silently fall to the `else→skip` arm; no header reassembly | `src/transport.zig:485-489` | CWE-444 | open |
-| I6 | High | 12 | Truncated DATA payloads return the buffer including the 5-byte gRPC prefix as message — fallback at `:429-431` | `src/transport.zig:418-431` | CWE-130 | open |
-| I7 | Medium-latent | 6 | `hpack.zig` stub OOB on `encoded[1]`/`encoded[2+name_len]` if length under-runs; only safe today because that decoder is dead code | `src/http2/hpack.zig:86-101` | CWE-125 | open |
+| I5 | High | 12 | `CONTINUATION` frames silently fall to the `else→skip` arm; no header reassembly | `src/transport.zig:485-489` | CWE-444 | **closed (98d1c7b/b2071c8, 2026-06-11)** -- GitLab #48 |
+| I6 | High | 12 | Truncated DATA payloads return the buffer including the 5-byte gRPC prefix as message — fallback at `:429-431` | `src/transport.zig:418-431` | CWE-130 | **closed (1d27136, 2026-06-11)** -- GitLab #49 |
+| I7 | Medium-latent | 6 | `hpack.zig` stub OOB on `encoded[1]`/`encoded[2+name_len]` if length under-runs; only safe today because that decoder is dead code | `src/http2/hpack.zig:86-101` | CWE-125 | **closed (21136ef, 2026-06-11)** -- GitLab #50 (dead module deleted) |
 
 ### 3.3 Memory Safety (3)
 
 | ID  | Sev | Risk | Finding | Evidence | CWE | Status |
 |-----|:---:|:----:|---------|----------|-----|--------|
-| M1 | High | 12 | `@intCast` truncations on attacker-controlled lengths/offsets | `src/transport.zig:355, 863, 922, 974` | CWE-681 | open |
-| M2 | Medium | 6 | `next_stream_id: u31` advanced by `+%= 2` — silently wraps after ~1.07 B streams; subsequent stream IDs collide with live ones | `src/client_mux.zig:120` | CWE-190 / CWE-694 | open |
+| M1 | Info | 12 | `@intCast` truncations on attacker-controlled lengths/offsets | `src/transport.zig:355, 863, 922, 974` | CWE-681 | open (downgraded to Info; recheck next pass) |
+| M2 | Medium | 6 | `next_stream_id: u31` advanced by `+%= 2` — silently wraps after ~1.07 B streams; subsequent stream IDs collide with live ones | `src/client_mux.zig:120` | CWE-190 / CWE-694 | **closed (61e2f15, 2026-06-11)** -- GitLab #51 (errors on exhaustion) |
 | M3 | Medium | 6 | Non-constant-time `std.mem.eql` for HMAC compare (theoretical until A3 is fixed) | `src/features/auth.zig:49` | CWE-208 | **closed (5ec22b8 via timing_safe.eql, 2026-04-26)** |
 
 ### 3.4 Resource Exhaustion (2)
@@ -99,23 +117,23 @@ auth_required_factor: 1.5 if no auth needed, 1.0 otherwise
 | ID  | Sev | Risk | Finding | Evidence | CWE | Status |
 |-----|:---:|:----:|---------|----------|-----|--------|
 | R1 | High | 18 | Thread-per-connection unbounded; no rate-limit, no max-conns | `src/server.zig:55-69` | CWE-770 | **closed (ac7f771 admission cap, 2026-04-26)** |
-| R2 | Medium | 6 | No per-connection stream cap (advertised `MAX_CONCURRENT_STREAMS` not enforced) | `src/transport.zig:443-455`, server-side | CWE-770 | open (server now advertises 100 via efd9ef6 but doesn't enforce on accept) |
+| R2 | Medium | 6 | No per-connection stream cap (advertised `MAX_CONCURRENT_STREAMS` not enforced) | `src/transport.zig:443-455`, server-side | CWE-770 | open -- GitLab #52 (server advertises 100 via efd9ef6 but still doesn't enforce on accept) |
 
 ### 3.5 Operational Defaults (3)
 
-| ID  | Sev | Risk | Finding | Evidence | CWE |
-|-----|:---:|:----:|---------|----------|-----|
-| O1 | High | 18 | Hardcoded `0.0.0.0` bind in server constructor — no opt-in | `src/server.zig:32` | CWE-1327 |
-| O2 | Medium | 6 | TLS optional via `on_tls_accept` callback only — no built-in TLS, no ALPN, no cert pinning, no docs | `src/server.zig:29, 79-94` | CWE-319 |
-| O3 | Low | 2 | `-fno-sanitize=undefined` scoped to vendored zlib — *acceptable*; flagged for transparency, no action required | `build.zig:46` | — |
+| ID  | Sev | Risk | Finding | Evidence | CWE | Status |
+|-----|:---:|:----:|---------|----------|-----|--------|
+| O1 | High | 18 | Hardcoded `0.0.0.0` bind in server constructor — no opt-in | `src/server.zig:32` | CWE-1327 | **closed (7b810a4, 2026-06-11)** -- GitLab #53 (loopback-default bind + `bind_address`) |
+| O2 | Medium | 6 | TLS optional via `on_tls_accept` callback only — no built-in TLS, no ALPN, no cert pinning, no docs | `src/server.zig:29, 79-94` | CWE-319 | open -- GitLab #54 (GAP-0009) |
+| O3 | Low | 2 | `-fno-sanitize=undefined` scoped to vendored zlib — *acceptable*; flagged for transparency, no action required | `build.zig:46` | — | open (no action required) |
 
 ### 3.6 Supply Chain / CI (3)
 
 | ID  | Sev | Risk | Finding | Evidence | Notes |
 |-----|:---:|:----:|---------|----------|-------|
-| S1 | Medium | 6 | SAST/dep-scan/SBOM components from `gitlab.com/devnw/ci-catalog` may internally `allow_failure: true` (catalog default) — *unverified* | `.gitlab-ci.yml:43-50` | Need to inspect catalog v1.7.1 source to confirm; if true, security gates do not block MR. |
-| S2 | Low | 2 | Dependency pinning unverified | `build.zig.zon` | Confirm hashes are pinned and `--system-package-mode` constraints are documented. |
-| S3 | Low | 2 | Branch protection on `main` not verified | GitLab settings | Confirm push, force-push, and direct-merge are restricted; require MR + pipeline pass. |
+| S1 | Medium | 6 | SAST/dep-scan/SBOM components from `gitlab.com/devnw/ci-catalog` may internally `allow_failure: true` (catalog default) — *unverified* | `.gitlab-ci.yml:43-50` | open -- GitLab #55. Need to inspect catalog v1.7.1 source to confirm; if true, security gates do not block MR. |
+| S2 | Low | 2 | Dependency pinning unverified | `build.zig.zon` | open. Confirm hashes are pinned and `--system-package-mode` constraints are documented. |
+| S3 | Low | 2 | Branch protection on `main` not verified | GitLab settings | open -- GitLab #56. Confirm push, force-push, and direct-merge are restricted; require MR + pipeline pass. |
 
 ---
 
