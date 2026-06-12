@@ -261,6 +261,23 @@ pub fn build(b: *std.Build) void {
     const run_transport_recv_limit_tests = b.addRunArtifact(transport_recv_limit_tests);
     test_step.dependOn(&run_transport_recv_limit_tests.step);
 
+    // CONTINUATION-frame reassembly unit tests (closes I5 / #48). Exercises
+    // `Transport.appendHeaderFragment`, the `HeaderBlockTooLarge` bound, and
+    // the `MAX_HEADER_BLOCK_BYTES` constant directly to assert that a header
+    // block (HEADERS + CONTINUATION fragments) is reassembled up to the
+    // advertised SETTINGS_MAX_HEADER_LIST_SIZE and rejected beyond it.
+    const transport_continuation_tests = b.addTest(.{
+        .name = "transport-continuation-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transport_continuation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    transport_continuation_tests.root_module.linkLibrary(zlib_lib);
+    const run_transport_continuation_tests = b.addRunArtifact(transport_continuation_tests);
+    test_step.dependOn(&run_transport_continuation_tests.step);
+
     // Client-side DATA delivery unit tests (closes quality R2 / #57 +
     // NEW-1 client side). Exercises the extracted `client_mux.deliverData`
     // core directly to assert the err-implies-end_stream invariant on all

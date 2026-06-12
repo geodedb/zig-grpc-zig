@@ -25,6 +25,11 @@ pub const TransportError = error{
     /// to prevent an unauthenticated memory-exhaustion DoS (closes
     /// NEW-1 / #43).
     MessageTooLarge,
+    /// A header block (HEADERS + CONTINUATION fragments) exceeded
+    /// MAX_HEADER_BLOCK_BYTES, or CONTINUATION sequencing violated
+    /// RFC 7540 §6.10. Closes I5 (#48).
+    HeaderBlockTooLarge,
+    ProtocolError,
 };
 
 /// Default SETTINGS_MAX_FRAME_SIZE per RFC 7540 §6.5.2 — every HTTP/2
@@ -35,6 +40,11 @@ pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16384;
 /// Default cap on a single inbound gRPC message (the de-facto gRPC
 /// default, e.g. grpc-go's MaxRecvMsgSize). Closes NEW-1 (#43).
 pub const DEFAULT_MAX_RECV_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Cap on a reassembled header block (HEADERS + CONTINUATIONs). Matches
+/// the SETTINGS_MAX_HEADER_LIST_SIZE we advertise (8192) — peers that
+/// honour our SETTINGS never hit this. Closes I5 (#48).
+pub const MAX_HEADER_BLOCK_BYTES: usize = 8192;
 
 /// HTTP/2 SETTINGS parameter ids (RFC 7540 §6.5.2).
 pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
@@ -670,6 +680,50 @@ pub const Transport = struct {
         if (buf_len > @as(usize, max) + 5) return TransportError.MessageTooLarge;
     }
 
+    /// Append one HEADERS/CONTINUATION fragment to a reassembly buffer,
+    /// enforcing MAX_HEADER_BLOCK_BYTES (or a caller-supplied bound for
+    /// tests). Public for unit tests. Closes I5 (#48).
+    pub fn appendHeaderFragment(
+        buf: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        fragment: []const u8,
+        max_len: usize,
+    ) (TransportError || error{OutOfMemory})!void {
+        if (buf.items.len + fragment.len > max_len) return TransportError.HeaderBlockTooLarge;
+        try buf.appendSlice(allocator, fragment);
+    }
+
+    /// Reassemble a complete header block starting from a HEADERS frame
+    /// that did NOT carry END_HEADERS: read CONTINUATION frames (which
+    /// MUST be contiguous and on the same stream — RFC 7540 §6.10) until
+    /// one carries END_HEADERS. Returns the owned, assembled block
+    /// (caller frees). `first_payload` is appended but NOT freed (caller
+    /// still owns/frees it).
+    fn collectContinuations(self: *Transport, stream_id: u31, first_payload: []const u8) ![]u8 {
+        var block: std.ArrayList(u8) = .empty;
+        errdefer block.deinit(self.allocator);
+        try appendHeaderFragment(&block, self.allocator, first_payload, MAX_HEADER_BLOCK_BYTES);
+        while (true) {
+            const cont = try self.readFrame();
+            const is_continuation = cont.frame_type == @intFromEnum(http2.frame.FrameType.CONTINUATION);
+            const same_stream = cont.stream_id == stream_id;
+            if (!is_continuation or !same_stream) {
+                self.allocator.free(cont.payload);
+                self.emitGoawayProtocolError();
+                return TransportError.ProtocolError;
+            }
+            const end_headers = (cont.flags & http2.frame.FrameFlags.END_HEADERS) != 0;
+            appendHeaderFragment(&block, self.allocator, cont.payload, MAX_HEADER_BLOCK_BYTES) catch |err| {
+                self.allocator.free(cont.payload);
+                self.emitGoawayProtocolError();
+                return err;
+            };
+            self.allocator.free(cont.payload);
+            if (end_headers) break;
+        }
+        return block.toOwnedSlice(self.allocator);
+    }
+
     /// Initialize the flow-control fields of an arbitrary Transport
     /// pointer in-place. Used only by unit tests that don't want to
     /// stand up a full Transport (no socket / allocator). Sets exactly
@@ -796,38 +850,36 @@ pub const Transport = struct {
         return bytes;
     }
 
-    /// Build the bytes for a connection-level GOAWAY frame announcing
-    /// FRAME_SIZE_ERROR. Caller owns the returned slice. Used by
-    /// `readFrame` after rejecting an oversize peer frame so the peer
-    /// learns why the connection is closing.
-    pub fn buildGoawayFrameSizeError(allocator: std.mem.Allocator, last_stream_id: u31) ![]u8 {
-        // Layout: 9-byte frame header + 8-byte payload.
-        //   header: length(3) | type(1=GOAWAY=0x07) | flags(1=0) | stream_id(4=0)
-        //   payload: R + last-stream-id (4 bytes) | error code (4 bytes)
+    /// Build the bytes for a connection-level GOAWAY frame with the
+    /// given HTTP/2 error code. Caller owns the returned slice.
+    pub fn buildGoawayFrame(allocator: std.mem.Allocator, last_stream_id: u31, error_code: u32) ![]u8 {
         const payload_len: u32 = 8;
         var bytes = try allocator.alloc(u8, 9 + payload_len);
         errdefer allocator.free(bytes);
-        // Header
         bytes[0] = @intCast((payload_len >> 16) & 0xFF);
         bytes[1] = @intCast((payload_len >> 8) & 0xFF);
         bytes[2] = @intCast(payload_len & 0xFF);
         bytes[3] = @intFromEnum(http2.frame.FrameType.GOAWAY);
-        bytes[4] = 0; // flags
+        bytes[4] = 0;
         bytes[5] = 0;
         bytes[6] = 0;
         bytes[7] = 0;
-        bytes[8] = 0; // stream id 0
-        // Payload
+        bytes[8] = 0;
         const lsid: u32 = @intCast(last_stream_id);
-        bytes[9] = @intCast((lsid >> 24) & 0x7F); // R bit clear
+        bytes[9] = @intCast((lsid >> 24) & 0x7F);
         bytes[10] = @intCast((lsid >> 16) & 0xFF);
         bytes[11] = @intCast((lsid >> 8) & 0xFF);
         bytes[12] = @intCast(lsid & 0xFF);
-        bytes[13] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 24) & 0xFF);
-        bytes[14] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 16) & 0xFF);
-        bytes[15] = @intCast((HTTP2_ERROR_FRAME_SIZE_ERROR >> 8) & 0xFF);
-        bytes[16] = @intCast(HTTP2_ERROR_FRAME_SIZE_ERROR & 0xFF);
+        bytes[13] = @intCast((error_code >> 24) & 0xFF);
+        bytes[14] = @intCast((error_code >> 16) & 0xFF);
+        bytes[15] = @intCast((error_code >> 8) & 0xFF);
+        bytes[16] = @intCast(error_code & 0xFF);
         return bytes;
+    }
+
+    /// Back-compat wrapper used by `transport_max_frame_size_test.zig`.
+    pub fn buildGoawayFrameSizeError(allocator: std.mem.Allocator, last_stream_id: u31) ![]u8 {
+        return buildGoawayFrame(allocator, last_stream_id, HTTP2_ERROR_FRAME_SIZE_ERROR);
     }
 
     /// Process a peer WINDOW_UPDATE frame. The 4-byte payload is a
@@ -1029,6 +1081,14 @@ pub const Transport = struct {
     /// any write failure since we are about to tear the connection down.
     fn emitGoawayFrameSizeError(self: *Transport) void {
         const bytes = buildGoawayFrameSizeError(self.allocator, self.last_stream_id) catch return;
+        defer self.allocator.free(bytes);
+        _ = self.ioWrite(bytes) catch {};
+    }
+
+    /// Send a GOAWAY with PROTOCOL_ERROR. Best-effort (see
+    /// emitGoawayFrameSizeError).
+    fn emitGoawayProtocolError(self: *Transport) void {
+        const bytes = buildGoawayFrame(self.allocator, self.last_stream_id, HTTP2_ERROR_PROTOCOL_ERROR) catch return;
         defer self.allocator.free(bytes);
         _ = self.ioWrite(bytes) catch {};
     }
@@ -1304,13 +1364,21 @@ pub const Transport = struct {
                     return result;
                 },
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
-                    // Standard gRPC sends HEADERS before DATA. Remember the
-                    // stream ID so we can respond on the same stream.
                     self.last_stream_id = frame.stream_id;
-                    // Extract :path from HPACK-encoded headers
-                    self.extractPathFromHpack(payload);
-                    self.allocator.free(payload);
-                    // Continue reading to get the DATA frame
+                    const end_headers = (frame.flags & http2.frame.FrameFlags.END_HEADERS) != 0;
+                    if (end_headers) {
+                        self.extractPathFromHpack(payload);
+                        self.allocator.free(payload);
+                    } else {
+                        // I5 (#48): reassemble CONTINUATION fragments.
+                        const block = self.collectContinuations(frame.stream_id, payload) catch |err| {
+                            self.allocator.free(payload);
+                            return err;
+                        };
+                        self.allocator.free(payload);
+                        self.extractPathFromHpack(block);
+                        self.allocator.free(block);
+                    }
                     continue;
                 },
                 @intFromEnum(http2.frame.FrameType.SETTINGS) => {
@@ -1360,6 +1428,14 @@ pub const Transport = struct {
                 @intFromEnum(http2.frame.FrameType.GOAWAY) => {
                     self.allocator.free(payload);
                     return TransportError.ConnectionClosed;
+                },
+                @intFromEnum(http2.frame.FrameType.CONTINUATION) => {
+                    // §6.10: a CONTINUATION with no preceding open header
+                    // block is a connection error (PROTOCOL_ERROR). The
+                    // in-block case is consumed by collectContinuations.
+                    self.allocator.free(payload);
+                    self.emitGoawayProtocolError();
+                    return TransportError.ProtocolError;
                 },
                 else => {
                     // Unknown frame type — skip
@@ -1442,8 +1518,19 @@ pub const Transport = struct {
                 @intFromEnum(http2.frame.FrameType.HEADERS) => {
                     const end = (flags & http2.frame.FrameFlags.END_STREAM) != 0;
                     self.last_stream_id = frame.stream_id;
-                    self.extractPathFromHpack(payload);
-                    self.allocator.free(payload);
+                    const end_headers = (flags & http2.frame.FrameFlags.END_HEADERS) != 0;
+                    if (end_headers) {
+                        self.extractPathFromHpack(payload);
+                        self.allocator.free(payload);
+                    } else {
+                        const block = self.collectContinuations(frame.stream_id, payload) catch |err| {
+                            self.allocator.free(payload);
+                            return err;
+                        };
+                        self.allocator.free(payload);
+                        self.extractPathFromHpack(block);
+                        self.allocator.free(block);
+                    }
                     if (end) return .{ .data = null, .end_stream = true };
                     continue;
                 },
@@ -1481,6 +1568,14 @@ pub const Transport = struct {
                 => {
                     self.allocator.free(payload);
                     return TransportError.ConnectionClosed;
+                },
+                @intFromEnum(http2.frame.FrameType.CONTINUATION) => {
+                    // §6.10: a CONTINUATION with no preceding open header
+                    // block is a connection error (PROTOCOL_ERROR). The
+                    // in-block case is consumed by collectContinuations.
+                    self.allocator.free(payload);
+                    self.emitGoawayProtocolError();
+                    return TransportError.ProtocolError;
                 },
                 else => {
                     self.allocator.free(payload);

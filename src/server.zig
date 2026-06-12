@@ -255,6 +255,10 @@ pub const GrpcServer = struct {
                     std.log.warn("closing connection: inbound gRPC message exceeded max_recv_message_bytes", .{});
                     break;
                 },
+                error.ProtocolError, error.HeaderBlockTooLarge => {
+                    std.log.warn("closing connection: HTTP/2 protocol violation in header block", .{});
+                    break;
+                },
                 else => return err,
             };
             defer self.allocator.free(message);

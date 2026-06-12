@@ -380,6 +380,14 @@ fn readerLoop(self: *ClientMux) void {
                 self.broadcastError(error.GoAway);
                 return;
             },
+            .CONTINUATION => {
+                // We never expect fragmented response headers from the
+                // small trailer sets gRPC servers emit; treat as fatal
+                // rather than silently dropping header bytes (I5/#48).
+                self.allocator.free(payload);
+                self.broadcastError(error.ProtocolError);
+                return;
+            },
             else => {
                 self.allocator.free(payload);
             },
