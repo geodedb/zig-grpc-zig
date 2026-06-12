@@ -228,6 +228,22 @@ pub fn build(b: *std.Build) void {
     const run_hpack_varint_tests = b.addRunArtifact(hpack_varint_tests);
     test_step.dependOn(&run_hpack_varint_tests.step);
 
+    // gRPC length-prefix helper + OK trailers constant tests (closes #61,
+    // #62, #49). Exercises `encodeGrpcPrefix`/`decodeGrpcPrefix` and the
+    // hoisted `OK_TRAILERS_BYTES` payload, including rejection of invalid
+    // compression-flag bytes (finding I6).
+    const grpc_framing_tests = b.addTest(.{
+        .name = "grpc-framing-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grpc_framing_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    grpc_framing_tests.root_module.linkLibrary(zlib_lib);
+    const run_grpc_framing_tests = b.addRunArtifact(grpc_framing_tests);
+    test_step.dependOn(&run_grpc_framing_tests.step);
+
     // SETTINGS_MAX_FRAME_SIZE enforcement tests (closes I3 / GitLab security
     // issue #8). Verifies oversize peer-declared frame lengths are rejected
     // before allocation and that the GOAWAY response carries

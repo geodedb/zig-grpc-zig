@@ -256,14 +256,15 @@ fn readerLoop(self: *ClientMux) void {
                     slot.mutex.lockUncancelable(self.io);
                     defer slot.mutex.unlock(self.io);
                     if (payload.len >= 5) {
-                        const msg_len = (@as(u32, payload[1]) << 24) |
-                            (@as(u32, payload[2]) << 16) |
-                            (@as(u32, payload[3]) << 8) |
-                            @as(u32, payload[4]);
-                        if (payload.len >= 5 + msg_len) {
-                            slot.data.appendSlice(self.allocator, payload[5 .. 5 + msg_len]) catch |e| {
-                                slot.err = e;
-                            };
+                        if (transport.decodeGrpcPrefix(payload)) |prefix| {
+                            const msg_len = prefix.msg_len;
+                            if (payload.len >= 5 + msg_len) {
+                                slot.data.appendSlice(self.allocator, payload[5 .. 5 + msg_len]) catch |e| {
+                                    slot.err = e;
+                                };
+                            }
+                        } else |e| {
+                            slot.err = e;
                         }
                     }
                     if (end) {

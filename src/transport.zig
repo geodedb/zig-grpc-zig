@@ -270,6 +270,41 @@ pub const RESPONSE_HEADERS_BYTES = [_]u8{
     'c',
 };
 
+/// Pre-encoded HPACK trailer payload for a successful gRPC response:
+///   grpc-status: 0   (LIE literal-name 0x40, name "grpc-status", value "0")
+/// Hoisted from the duplicated literals in `endStream` and
+/// `writeMessageOnStream` (closes quality M2).
+pub const OK_TRAILERS_BYTES = [_]u8{
+    0x40, 11, 'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's', 1, '0',
+};
+
+/// Decoded gRPC 5-byte message prefix (compression flag + u32 length).
+pub const GrpcPrefix = struct { compressed: bool, msg_len: u32 };
+
+/// Encode the gRPC length prefix (flag byte 0 = uncompressed) into
+/// `out[0..5]`. Single definition for the three write paths (closes M3).
+pub fn encodeGrpcPrefix(out: *[5]u8, msg_len: u32) void {
+    out[0] = 0;
+    out[1] = @intCast((msg_len >> 24) & 0xFF);
+    out[2] = @intCast((msg_len >> 16) & 0xFF);
+    out[3] = @intCast((msg_len >> 8) & 0xFF);
+    out[4] = @intCast(msg_len & 0xFF);
+}
+
+/// Decode and validate a gRPC 5-byte message prefix. The compression
+/// flag byte MUST be 0 or 1 (gRPC over HTTP/2 spec); anything else is
+/// a framing error (closes I6 / #49). Closes M4: single definition for
+/// the three read paths.
+pub fn decodeGrpcPrefix(buf: []const u8) error{InvalidGrpcPrefix}!GrpcPrefix {
+    if (buf.len < 5) return error.InvalidGrpcPrefix;
+    if (buf[0] > 1) return error.InvalidGrpcPrefix;
+    const msg_len = (@as(u32, buf[1]) << 24) |
+        (@as(u32, buf[2]) << 16) |
+        (@as(u32, buf[3]) << 8) |
+        @as(u32, buf[4]);
+    return .{ .compressed = buf[0] == 1, .msg_len = msg_len };
+}
+
 pub const Transport = struct {
     stream: net.Stream,
     io: std.Io,
@@ -1207,10 +1242,9 @@ pub const Transport = struct {
                     // Try to parse a complete gRPC message from the
                     // accumulated bytes.
                     if (grpc_buf.items.len < 5) continue;
-                    const msg_len = (@as(u32, grpc_buf.items[1]) << 24) |
-                        (@as(u32, grpc_buf.items[2]) << 16) |
-                        (@as(u32, grpc_buf.items[3]) << 8) |
-                        @as(u32, grpc_buf.items[4]);
+                    const prefix = decodeGrpcPrefix(grpc_buf.items) catch
+                        return TransportError.Http2Error;
+                    const msg_len = prefix.msg_len;
                     if (grpc_buf.items.len < 5 + msg_len) continue;
 
                     const result = self.allocator.alloc(u8, msg_len) catch
@@ -1327,10 +1361,9 @@ pub const Transport = struct {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;
                     }
-                    const msg_len = (@as(u32, grpc_buf.items[1]) << 24) |
-                        (@as(u32, grpc_buf.items[2]) << 16) |
-                        (@as(u32, grpc_buf.items[3]) << 8) |
-                        @as(u32, grpc_buf.items[4]);
+                    const prefix = decodeGrpcPrefix(grpc_buf.items) catch
+                        return TransportError.Http2Error;
+                    const msg_len = prefix.msg_len;
                     if (grpc_buf.items.len < 5 + msg_len) {
                         if (saw_end) return .{ .data = null, .end_stream = true };
                         continue;
@@ -1749,14 +1782,9 @@ pub const Transport = struct {
     pub fn writeStreamMessage(self: *Transport, message: []const u8, is_first: bool) !void {
         const sid = self.last_stream_id;
 
-        const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
-        grpc_frame[0] = 0;
-        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
-        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
-        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
-        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        encodeGrpcPrefix(grpc_frame[0..5], @intCast(message.len));
         @memcpy(grpc_frame[5..], message);
 
         // Reserve send-window credit BEFORE acquiring write_mutex so we
@@ -1778,10 +1806,7 @@ pub const Transport = struct {
     /// End a gRPC server stream by sending TRAILERS with grpc-status: 0.
     pub fn endStream(self: *Transport) !void {
         const sid = self.last_stream_id;
-        const trailers = [_]u8{
-            0x40, 11, 'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's', 1, '0',
-        };
-        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &trailers);
+        try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &OK_TRAILERS_BYTES);
     }
 
     /// End a gRPC stream with a non-zero (or zero) status code and an
@@ -1870,14 +1895,9 @@ pub const Transport = struct {
     /// concurrent writers (multiple in-flight client calls) can't
     /// interleave their frames on the wire.
     pub fn writeMessageOnStream(self: *Transport, stream_id: u31, message: []const u8) !void {
-        const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
-        grpc_frame[0] = 0;
-        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
-        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
-        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
-        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        encodeGrpcPrefix(grpc_frame[0..5], @intCast(message.len));
         @memcpy(grpc_frame[5..], message);
 
         // Reserve send-window credit BEFORE acquiring write_mutex.
@@ -1890,24 +1910,7 @@ pub const Transport = struct {
         try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_HEADERS, stream_id, &RESPONSE_HEADERS_BYTES);
         try self.writeDataFragmentedLocked(stream_id, 0, grpc_frame);
 
-        const trailers = [_]u8{
-            0x40,
-            11,
-            'g',
-            'r',
-            'p',
-            'c',
-            '-',
-            's',
-            't',
-            'a',
-            't',
-            'u',
-            's',
-            1,
-            '0',
-        };
-        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, stream_id, &trailers);
+        try self.writeFrameLocked(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, stream_id, &OK_TRAILERS_BYTES);
     }
 
     /// Write a CLIENT request: HEADERS (request-shaped) + DATA with
@@ -1960,14 +1963,9 @@ pub const Transport = struct {
         );
         defer self.allocator.free(headers_bytes);
 
-        const grpc_msg_len: u32 = @intCast(message.len);
         const grpc_frame = try self.allocator.alloc(u8, 5 + message.len);
         defer self.allocator.free(grpc_frame);
-        grpc_frame[0] = 0;
-        grpc_frame[1] = @intCast((grpc_msg_len >> 24) & 0xFF);
-        grpc_frame[2] = @intCast((grpc_msg_len >> 16) & 0xFF);
-        grpc_frame[3] = @intCast((grpc_msg_len >> 8) & 0xFF);
-        grpc_frame[4] = @intCast(grpc_msg_len & 0xFF);
+        encodeGrpcPrefix(grpc_frame[0..5], @intCast(message.len));
         @memcpy(grpc_frame[5..], message);
 
         // Reserve send-window credit BEFORE acquiring write_mutex.
