@@ -1,31 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const proto = @import("proto/service.zig");
 const benchmark = @import("benchmark.zig");
-
-// TODO: Update these tests for the new protobuf API
-// test "HelloRequest encode/decode" {
-//     const request = proto.HelloRequest{ .name = "test" };
-//     var buf: [1024]u8 = undefined;
-//     var writer = proto.ProtoWriter.init(&buf);
-//     try request.encode(&writer);
-//
-//     var reader = proto.ProtoReader.init(buf[0..writer.pos]);
-//     const decoded = try proto.HelloRequest.decode(&reader);
-//     try testing.expectEqualStrings("test", decoded.name);
-// }
-
-// TODO: Update these tests for the new protobuf API
-// test "HelloResponse encode/decode" {
-//     const response = proto.HelloResponse{ .message = "Hello, test!" };
-//     var buf: [1024]u8 = undefined;
-//     var writer = proto.ProtoWriter.init(&buf);
-//     try response.encode(&writer);
-//
-//     var reader = proto.ProtoReader.init(buf[0..writer.pos]);
-//     const decoded = try proto.HelloResponse.decode(&reader);
-//     try testing.expectEqualStrings("Hello, test!", decoded.message);
-// }
 
 test "benchmark handler" {
     var gpa = std.heap.DebugAllocator(.{}).init;

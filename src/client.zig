@@ -3,7 +3,6 @@ const transport = @import("transport.zig");
 const compression = @import("features/compression.zig");
 const auth = @import("features/auth.zig");
 const streaming = @import("features/streaming.zig");
-const health = @import("features/health.zig");
 const net = std.Io.net;
 
 /// Public otel seam re-export. When `-Dwith_otel=false` (default),
@@ -52,11 +51,6 @@ pub const GrpcClient = struct {
 
     pub fn setAuth(self: *GrpcClient, secret_key: []const u8) !void {
         self.auth = auth.Auth.init(self.allocator, secret_key);
-    }
-
-    pub fn checkHealth(_: *GrpcClient, _: []const u8) !health.HealthStatus {
-        // Health check requires JSON serialization; return unknown for now
-        return .UNKNOWN;
     }
 
     /// Server-streaming RPC: send a single request, then read messages until
