@@ -7,6 +7,19 @@
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
             .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",
         },
+        // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy). Local
+        // path dep until the fips package is published; the eventual form is:
+        //   .fips = .{
+        //       .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.0#<sha>",
+        //       .hash = "<zig-fetch-hash>",
+        //       .lazy = true,
+        //   },
+        // Zig 0.16 rejects absolute .path values, so this is the build-root-
+        // relative path to /home/benji/src/devnw/zig/fips.
+        .fips = .{
+            .path = "../../../../../devnw/zig/fips",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

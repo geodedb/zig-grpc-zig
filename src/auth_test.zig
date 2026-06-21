@@ -133,3 +133,18 @@ test "constant-time compare smoke test" {
     b[31] ^= 0x01;
     try testing.expect(!crypto.timing_safe.eql([32]u8, a, b));
 }
+
+test "FIPS-0007: crypto_backend HMAC-SHA256 matches std and detects mismatch" {
+    const crypto_backend = @import("crypto_backend");
+    var tag: [32]u8 = undefined;
+    const n = try crypto_backend.Mac.hmac(.sha256, "k", "msg", &tag);
+    try testing.expectEqual(@as(usize, 32), n);
+    // RFC 4231 TC2 vector for cross-check.
+    var tag2: [32]u8 = undefined;
+    _ = try crypto_backend.Mac.hmac(.sha256, "Jefe", "what do ya want for nothing?", &tag2);
+    const expect = [_]u8{
+        0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+        0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43,
+    };
+    try testing.expectEqualSlices(u8, &expect, &tag2);
+}

@@ -10,14 +10,45 @@ pub fn build(b: *std.Build) void {
     // otel/scripts/verify-consumer-noop.sh).
     const with_otel = false; // 2026-05-02: hardcoded after removing the lazy otel dep — see build.zig.zon header note.
 
+    // -Dfips: route security crypto through the linked OpenSSL FIPS-140-3
+    // provider. OFF by default with zero overhead; the lazy `fips` dependency
+    // is resolved only when this is true.
+    const fips = b.option(bool, "fips", "Route security crypto through the linked FIPS-140-3 provider (off by default; zero overhead when off)") orelse false;
+    const openssl_path = b.option([]const u8, "openssl_path", "OpenSSL install prefix for non-standard installs (e.g. /usr/local/ssl)");
+    const link = @import("src/link.zig");
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "with_otel", with_otel);
+    build_options.addOption(bool, "fips", fips);
     // Materialize ONE shared `build_options` module. Each consumer
     // module imports the SAME module instance via `addImport` to avoid
     // Zig's "file exists in modules X and X0" error when two
     // independent `addOptions` modules end up sharing a transitive
     // file path.
     const build_options_mod = build_options.createModule();
+
+    // FIPS seam — SHARED NAMED `crypto_backend` module on the SAME single
+    // `build_options` instance. The lazy `fips` dep + OpenSSL link are pulled
+    // only when -Dfips=true.
+    const crypto_backend_mod = b.addModule("crypto_backend", .{
+        .root_source_file = b.path("src/crypto_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = build_options_mod }},
+    });
+    const std_shim_mod = b.addModule("std_shim", .{
+        .root_source_file = b.path("src/std_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_backend_mod.addImport("std_shim", std_shim_mod);
+    if (fips) {
+        if (b.lazyDependency("fips", .{ .target = target, .optimize = optimize, .openssl_path = openssl_path orelse "/usr/local/ssl" })) |fips_dep| {
+            const fm = fips_dep.module("fips");
+            crypto_backend_mod.addImport("fips", fm);
+            link.linkOpenssl(b, fm, openssl_path);
+        }
+    }
 
     // Build zlib from upstream source
     const zlib_dep = b.dependency("zlib", .{});
@@ -78,6 +109,7 @@ pub fn build(b: *std.Build) void {
     });
     server_mod.linkLibrary(zlib_lib);
     server_mod.addImport("build_options", build_options_mod);
+    server_mod.addImport("crypto_backend", crypto_backend_mod);
 
     // Client module (for internal use and library export)
     const client_mod = b.addModule("grpc-client", .{
@@ -87,6 +119,7 @@ pub fn build(b: *std.Build) void {
     });
     client_mod.linkLibrary(zlib_lib);
     client_mod.addImport("build_options", build_options_mod);
+    client_mod.addImport("crypto_backend", crypto_backend_mod);
 
     // Gated otel dependency. The `lazy = true` entry in build.zig.zon
     // means Zig only fetches the package when this branch executes;
@@ -114,6 +147,7 @@ pub fn build(b: *std.Build) void {
     });
     benchmark.root_module.linkLibrary(zlib_lib);
     benchmark.root_module.addImport("build_options", build_options_mod);
+    benchmark.root_module.addImport("crypto_backend", crypto_backend_mod);
     b.installArtifact(benchmark);
 
     // Benchmark step with automatic server management
@@ -153,6 +187,7 @@ pub fn build(b: *std.Build) void {
     server_example.root_module.addImport("grpc", server_mod);
     server_example.root_module.linkLibrary(zlib_lib);
     server_example.root_module.addImport("build_options", build_options_mod);
+    server_example.root_module.addImport("crypto_backend", crypto_backend_mod);
     b.installArtifact(server_example);
 
     const client_example = b.addExecutable(.{
@@ -166,6 +201,7 @@ pub fn build(b: *std.Build) void {
     client_example.root_module.addImport("grpcclient", client_mod);
     client_example.root_module.linkLibrary(zlib_lib);
     client_example.root_module.addImport("build_options", build_options_mod);
+    client_example.root_module.addImport("crypto_backend", crypto_backend_mod);
     b.installArtifact(client_example);
 
     // Tests
@@ -179,6 +215,7 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.linkLibrary(zlib_lib);
     tests.root_module.addImport("build_options", build_options_mod);
+    tests.root_module.addImport("crypto_backend", crypto_backend_mod);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
@@ -209,6 +246,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     auth_tests.root_module.linkLibrary(zlib_lib);
+    auth_tests.root_module.addImport("crypto_backend", crypto_backend_mod);
     const run_auth_tests = b.addRunArtifact(auth_tests);
     test_step.dependOn(&run_auth_tests.step);
 
@@ -355,6 +393,7 @@ pub fn build(b: *std.Build) void {
     });
     admission_tests.root_module.linkLibrary(zlib_lib);
     admission_tests.root_module.addImport("build_options", build_options_mod);
+    admission_tests.root_module.addImport("crypto_backend", crypto_backend_mod);
     const run_admission_tests = b.addRunArtifact(admission_tests);
     test_step.dependOn(&run_admission_tests.step);
 
@@ -373,6 +412,7 @@ pub fn build(b: *std.Build) void {
     });
     observability_disabled_tests.root_module.addImport("grpc-server", server_mod);
     observability_disabled_tests.root_module.addImport("build_options", build_options_mod);
+    observability_disabled_tests.root_module.addImport("crypto_backend", crypto_backend_mod);
     observability_disabled_tests.root_module.linkLibrary(zlib_lib);
     const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
     test_step.dependOn(&run_observability_disabled_tests.step);
@@ -396,6 +436,7 @@ pub fn build(b: *std.Build) void {
     });
     observability_enabled_tests.root_module.addImport("grpc-server", server_mod);
     observability_enabled_tests.root_module.addImport("build_options", build_options_mod);
+    observability_enabled_tests.root_module.addImport("crypto_backend", crypto_backend_mod);
     observability_enabled_tests.root_module.linkLibrary(zlib_lib);
     if (with_otel) {
         // Re-resolve the otel module under the same `with_otel` guard
@@ -442,6 +483,7 @@ pub fn build(b: *std.Build) void {
     integration_test_server.root_module.addImport("proto", integration_test_mod);
     integration_test_server.root_module.linkLibrary(zlib_lib);
     integration_test_server.root_module.addImport("build_options", build_options_mod);
+    integration_test_server.root_module.addImport("crypto_backend", crypto_backend_mod);
 
     const install_integration_test = b.addInstallArtifact(integration_test_server, .{});
     const integration_test_step = b.step("integration_test", "Build integration test server");
@@ -464,6 +506,7 @@ pub fn build(b: *std.Build) void {
     });
     loopback_test.root_module.linkLibrary(zlib_lib);
     loopback_test.root_module.addImport("build_options", build_options_mod);
+    loopback_test.root_module.addImport("crypto_backend", crypto_backend_mod);
 
     const install_loopback_test = b.addInstallArtifact(loopback_test, .{});
     const loopback_test_step = b.step("loopback-test", "Build the in-process loopback smoke test");
@@ -486,6 +529,7 @@ pub fn build(b: *std.Build) void {
     });
     conn_stack_test.root_module.linkLibrary(zlib_lib);
     conn_stack_test.root_module.addImport("build_options", build_options_mod);
+    conn_stack_test.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_conn_stack_test = b.addInstallArtifact(conn_stack_test, .{});
     const conn_stack_test_step = b.step("conn-stack-test", "Build the connection-thread stack-overflow reproduction");
     conn_stack_test_step.dependOn(&install_conn_stack_test.step);
@@ -504,6 +548,7 @@ pub fn build(b: *std.Build) void {
     });
     dispatch_test.root_module.linkLibrary(zlib_lib);
     dispatch_test.root_module.addImport("build_options", build_options_mod);
+    dispatch_test.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_dispatch_test = b.addInstallArtifact(dispatch_test, .{});
     const dispatch_test_step = b.step("dispatch-test", "Build the path-based dispatch test");
     dispatch_test_step.dependOn(&install_dispatch_test.step);
@@ -521,6 +566,7 @@ pub fn build(b: *std.Build) void {
     });
     auth_gate_test.root_module.linkLibrary(zlib_lib);
     auth_gate_test.root_module.addImport("build_options", build_options_mod);
+    auth_gate_test.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_auth_gate_test = b.addInstallArtifact(auth_gate_test, .{});
     const auth_gate_test_step = b.step("auth-gate-test", "Build the server-side auth gate test");
     auth_gate_test_step.dependOn(&install_auth_gate_test.step);
@@ -539,6 +585,7 @@ pub fn build(b: *std.Build) void {
     });
     handler_error_test.root_module.linkLibrary(zlib_lib);
     handler_error_test.root_module.addImport("build_options", build_options_mod);
+    handler_error_test.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_handler_error_test = b.addInstallArtifact(handler_error_test, .{});
     const handler_error_test_step = b.step("handler-error-test", "Build the handler-error trailer test");
     handler_error_test_step.dependOn(&install_handler_error_test.step);
@@ -589,6 +636,7 @@ pub fn build(b: *std.Build) void {
     interop_server.root_module.linkLibrary(zlib_lib);
     interop_server.root_module.addImport("grpc-server", server_mod);
     interop_server.root_module.addImport("build_options", build_options_mod);
+    interop_server.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_interop_server = b.addInstallArtifact(interop_server, .{});
     const interop_server_step = b.step("interop-server", "Build the Zig interop server binary");
     interop_server_step.dependOn(&install_interop_server.step);
@@ -604,6 +652,7 @@ pub fn build(b: *std.Build) void {
     interop_client.root_module.linkLibrary(zlib_lib);
     interop_client.root_module.addImport("grpc-client", client_mod);
     interop_client.root_module.addImport("build_options", build_options_mod);
+    interop_client.root_module.addImport("crypto_backend", crypto_backend_mod);
     const install_interop_client = b.addInstallArtifact(interop_client, .{});
     const interop_client_step = b.step("interop-client", "Build the Zig interop client binary");
     interop_client_step.dependOn(&install_interop_client.step);
