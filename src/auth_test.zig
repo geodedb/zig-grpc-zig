@@ -148,3 +148,14 @@ test "FIPS-0007: crypto_backend HMAC-SHA256 matches std and detects mismatch" {
     };
     try testing.expectEqualSlices(u8, &expect, &tag2);
 }
+
+test "FIPS-0007b: generateToken HMAC verifies for a fixed key + claims (seam-routed)" {
+    const allocator = std.testing.allocator;
+    var a = auth.Auth.init(allocator, "fixed-secret-key-0001");
+    const t1 = try a.generateToken("bob", 3600);
+    defer allocator.free(t1);
+    // verifyToken must accept its own freshly-signed token.
+    const claims = try a.verifyToken(t1);
+    defer allocator.free(claims.sub);
+    try testing.expectEqualStrings("bob", claims.sub);
+}

@@ -17,7 +17,10 @@
 const std = @import("std");
 const crypto = std.crypto;
 const compat = @import("../compat.zig");
+const crypto_backend = @import("crypto_backend");
 
+// fips-exempt: compile-time mac_length only; the HMAC computation goes through
+// the seam (crypto_backend.Mac).
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const b64url = std.base64.url_safe_no_pad;
 
@@ -102,7 +105,8 @@ pub const Auth = struct {
         defer self.allocator.free(signing_input);
 
         var mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&mac, signing_input, self.secret_key);
+        // FIPS-0007: HS256 JWT signature HMAC-SHA256 via the seam.
+        _ = crypto_backend.Mac.hmac(.sha256, self.secret_key, signing_input, &mac) catch return AuthError.InvalidToken;
 
         const sig_b64 = try b64Encode(self.allocator, &mac);
         defer self.allocator.free(sig_b64);
@@ -176,7 +180,8 @@ pub const Auth = struct {
         const signing_input = token[0..signing_input_len]; // header_b64 . payload_b64
 
         var expected_mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&expected_mac, signing_input, self.secret_key);
+        // FIPS-0007: HS256 JWT verify HMAC-SHA256 via the seam.
+        _ = crypto_backend.Mac.hmac(.sha256, self.secret_key, signing_input, &expected_mac) catch return AuthError.InvalidSignature;
 
         const provided_sig = b64Decode(self.allocator, sig_b64) catch
             return AuthError.MalformedToken;
@@ -187,6 +192,7 @@ pub const Auth = struct {
         }
         var provided_arr: [HmacSha256.mac_length]u8 = undefined;
         @memcpy(&provided_arr, provided_sig);
+        // fips-exempt: non-security-algorithm — constant-time tag compare.
         if (!crypto.timing_safe.eql([HmacSha256.mac_length]u8, expected_mac, provided_arr)) {
             return AuthError.InvalidSignature;
         }
