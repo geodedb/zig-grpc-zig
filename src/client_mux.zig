@@ -152,9 +152,16 @@ pub const ClientMux = struct {
         // exit. Best-effort: ignore failure (e.g. NotConnected if peer
         // already closed) since we'll close the fd next anyway.
         // SHUT_RDWR == 2 (POSIX).
-        if (self.transport.tls_io == null) {
-            _ = std.c.shutdown(self.transport.stream.socket.handle, 2);
-        }
+        //
+        // SONNY-1568: unconditional, mirroring `GrpcServer.handleConnection`.
+        // `ClientMux.init` only builds plaintext transports today, so the
+        // former `if (self.transport.tls_io == null)` guard was never false
+        // here — but it encoded the same latent hang the server had: a
+        // reader blocked inside a TLS read is only woken by `shutdown()` on
+        // the underlying fd, so skipping it for TLS would wedge `join()`
+        // forever the day a TLS-capable mux lands. `shutdown()` targets the
+        // fd the TLS layer reads through, so it is correct for both.
+        _ = std.c.shutdown(self.transport.stream.socket.handle, 2);
 
         if (self.reader_started) {
             self.reader_thread.join();

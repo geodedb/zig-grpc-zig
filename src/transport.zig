@@ -455,6 +455,20 @@ pub const Transport = struct {
     /// loris peer can't pin a writer thread for the lifetime of the
     /// process. Closes GAP-FU-002.
     flow_credit_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// SONNY-1568: set once, under `flow_mutex`, by whoever owns the
+    /// connection's read side when the peer is known to be gone (for the
+    /// server that is the per-connection reader thread on its way out; see
+    /// `markPeerGone`). Guarded by `flow_mutex` so it participates in the
+    /// same lost-wakeup-free protocol as the send windows: the flag is set
+    /// and `flow_epoch` bumped under one lock, and `reserveSendCredit`
+    /// re-reads it under that lock on entry and after every wake.
+    ///
+    /// Without it a handler parked on send credit is invisible to the
+    /// reader's exit (the reader only closes the request queue, which the
+    /// writer is not waiting on) and sleeps out the whole
+    /// `flow_credit_timeout_ns` -- up to 30 s of a held admission-control
+    /// permit and an unjoinable connection thread.
+    peer_gone: bool = false,
 
     /// Allocate the per-stream flow-control arrays on the heap. Used by
     /// every init path so the embedded slices are non-empty and indexable.
@@ -782,6 +796,7 @@ pub const Transport = struct {
         // check (idx >= MAX_TRACKED_STREAMS short-circuits).
         t.stream_send_windows = &[_]i32{};
         t.stream_recv_windows = &[_]i32{};
+        t.peer_gone = false;
     }
 
     /// Apply a WINDOW_UPDATE increment to a flow-control window pointer.
@@ -998,9 +1013,28 @@ pub const Transport = struct {
     /// waiter that hasn't yet entered the futex will skip the wait
     /// because its `epoch` argument no longer matches the current
     /// value (futex returns `EAGAIN`).
-    fn wakeFlowWaiters(self: *Transport) void {
+    pub fn wakeFlowWaiters(self: *Transport) void {
         _ = self.flow_epoch.fetchAdd(1, .release);
         self.io.futexWake(u32, &self.flow_epoch.raw, std.math.maxInt(u32));
+    }
+
+    /// SONNY-1568: publish "the peer is gone" to every writer parked in
+    /// `reserveSendCredit` and release them immediately with
+    /// `error.PeerGone`.
+    ///
+    /// Called by the owner of the connection's read side as it exits (the
+    /// server's per-connection reader thread), i.e. on EOF / socket error /
+    /// GOAWAY / RST_STREAM. The flag is set under `flow_mutex` and the epoch
+    /// bumped inside the same critical section, which is exactly the
+    /// protocol `processWindowUpdate` uses: a writer that has read the flag
+    /// as false and is about to sleep either sees the new epoch (and its
+    /// futex wait returns `EAGAIN` at once) or is woken by the `futexWake`.
+    /// Idempotent and safe to call after the writer has already left.
+    pub fn markPeerGone(self: *Transport) void {
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        self.peer_gone = true;
+        self.wakeFlowWaiters();
     }
 
     /// Reserve `n` octets of send-window credit, blocking until both
@@ -1010,11 +1044,17 @@ pub const Transport = struct {
     /// returns. On timeout returns `error.FlowControlTimeout` without
     /// touching the windows. Caller must NOT hold flow_mutex.
     ///
+    /// SONNY-1568: returns `error.PeerGone` the moment `peer_gone` is
+    /// observed (on entry, and after every wake) so a handler parked
+    /// mid-write is released as soon as the reader thread notices the peer
+    /// vanished, instead of sleeping out the full `flow_credit_timeout_ns`
+    /// while holding its admission-control permit.
+    ///
     /// The bounded wait closes GAP-FU-002: a slow-loris peer that
     /// opens streams but never advertises credit can no longer pin
     /// `MAX_CONNS` writer threads forever. When `flow_credit_timeout_ns`
     /// is `0` the wait is unbounded (legacy behaviour).
-    pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{FlowControlTimeout}!void {
+    pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone }!void {
         if (n == 0) return;
         const idx: ?usize = blk: {
             if (stream_id == 0) break :blk null;
@@ -1040,6 +1080,12 @@ pub const Transport = struct {
         defer self.flow_mutex.unlock(self.io);
 
         while (true) {
+            // SONNY-1568: checked here rather than only after the futex
+            // returns, so this also covers the writer that parks *after*
+            // the reader has already exited. `peer_gone` is only ever set
+            // (never cleared) under `flow_mutex`, which we hold.
+            if (self.peer_gone) return error.PeerGone;
+
             const conn_avail = self.conn_send_window;
             const stream_avail: i32 = if (idx) |i| self.stream_send_windows[i] else std.math.maxInt(i32);
             const avail = @min(conn_avail, stream_avail);
@@ -1097,8 +1143,12 @@ pub const Transport = struct {
     /// HTTP/2 `RST_STREAM` frame with `FLOW_CONTROL_ERROR` (0x03) for
     /// the offending stream and propagates the error. Used by every
     /// outbound DATA write path. Closes GAP-FU-002.
-    fn reserveSendCreditOrRst(self: *Transport, stream_id: u31, n: u32) error{FlowControlTimeout}!void {
+    fn reserveSendCreditOrRst(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone }!void {
         self.reserveSendCredit(stream_id, n) catch |err| switch (err) {
+            // SONNY-1568: the peer is gone, so there is nobody to receive
+            // an RST_STREAM (and the write would only fail on a dead
+            // socket). Propagate so the handler unwinds immediately.
+            error.PeerGone => return err,
             error.FlowControlTimeout => {
                 std.log.warn(
                     "flow-control credit timeout on stream {d}; sending RST_STREAM(FLOW_CONTROL_ERROR)",

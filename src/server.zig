@@ -445,9 +445,17 @@ pub const GrpcServer = struct {
             // POSIX `close()` on one thread does not wake another blocked in
             // `read()` on the same fd; `shutdown(SHUT_RDWR)` does. Mirrors
             // `ClientMux.deinit`. Best-effort — the fd is closed next anyway.
-            if (trans.tls_io == null) {
-                _ = std.c.shutdown(trans.stream.socket.handle, 2);
-            }
+            //
+            // SONNY-1568: done UNCONDITIONALLY, including for TLS. The old
+            // `if (trans.tls_io == null)` guard meant that when the handler
+            // loop left early on a TLS connection (a fatal dispatch error,
+            // say) while the reader was blocked inside a TLS read, nothing
+            // unblocked it and `join()` hung forever. `shutdown()` acts on
+            // the underlying fd, which the TLS layer reads through, so it
+            // wakes the reader for TLS exactly as it does for plaintext;
+            // the TLS read then surfaces as a TLS/EOF error the reader
+            // already classifies as a clean disconnect.
+            _ = std.c.shutdown(trans.stream.socket.handle, 2);
             reader_thread.join();
         }
 
@@ -728,6 +736,19 @@ fn connectionReader(ctx: *ConnReader) void {
         ),
         else => fatal = err,
     };
+    // SONNY-1568: the reader owns the read side of the socket, so its exit
+    // is this connection's death certificate. Publish that BEFORE closing
+    // the queue.
+    //
+    // Closing the queue only wakes a handler blocked in `RequestQueue.pop`.
+    // A handler that is mid-response is instead parked in
+    // `Transport.reserveSendCredit` (a futex on `flow_epoch`) waiting for a
+    // WINDOW_UPDATE that can never arrive now — it would sleep out the full
+    // `flow_credit_timeout_ns` (30 s by default) still holding its
+    // admission-control permit, and `handleConnection` could not join us
+    // until it did. `markPeerGone` sets the flag under `flow_mutex` and
+    // wakes every credit waiter, which returns `error.PeerGone` at once.
+    ctx.trans.markPeerGone();
     ctx.queue.close(fatal);
 }
 
@@ -738,6 +759,43 @@ fn connectionReader(ctx: *ConnReader) void {
 /// Frame handling mirrors `Transport.readMessageCore(null)` (the server /
 /// legacy path) one-for-one; the only difference is that a completed gRPC
 /// message is pushed onto the dispatch queue instead of being returned.
+///
+/// HAZARD — the reader can be stalled by a peer that stops reading TCP
+/// (SONNY-1568, minor): three things this loop does take
+/// `Transport.write_mutex` — the SETTINGS ACK, the PING ACK, and the
+/// receive-window refills inside `Transport.maybeRefillRecvWindow`. If a
+/// handler is at that moment inside `ioWriteLocked` on a socket whose send
+/// buffer the peer has stopped draining, that handler holds `write_mutex`
+/// until the kernel accepts the bytes, and the reader blocks on the mutex
+/// and stops reading. The SONNY-1560 fix itself survives this — the
+/// WINDOW_UPDATE path (`Transport.processWindowUpdate`) needs only
+/// `flow_mutex`, never `write_mutex`, so credit keeps flowing and a stuck
+/// writer still makes progress the instant the peer credits it — but a peer
+/// that both withholds credit and refuses to read can wedge both threads
+/// until `flow_credit_timeout_ns` fires. Mitigations, neither taken here
+/// because both are bigger than this change:
+///   * a bounded write deadline on the socket (`SO_SNDTIMEO`, or a
+///     deadline threaded through `ioWriteLocked`) so no writer can hold
+///     `write_mutex` longer than that bound. `Transport` has no such
+///     deadline today — `setRpcSocketOptions` sets only `TCP_NODELAY` and
+///     `SO_KEEPALIVE` — so there is nothing cheap to apply to the ACK and
+///     refill writes below;
+///   * a dedicated writer thread with an outbound frame queue, so control
+///     frames never contend with response bytes for the socket at all.
+///
+/// INVARIANT — cross-stream DATA accumulation: `grpc_buf` is a SINGLE
+/// assembly buffer for the whole connection and the completed message is
+/// attributed to `pending`, i.e. to the most recent HEADERS seen, not to
+/// `frame.stream_id`. Interleaving DATA from two streams would therefore
+/// splice their payloads together. That is safe against this repo's peers
+/// and is inherited verbatim from `Transport.readMessageCore`: `ClientMux`
+/// (and `Transport.writeRequestOnStream`) emit a request's HEADERS and its
+/// DATA under one acquisition of `write_mutex`, so a request's frames
+/// cannot be split by another stream's frames on the wire. `loopback-test`
+/// scenario 6 covers the concurrent case (8 in-flight ClientMux streams ×
+/// 16 messages). A general-purpose peer that fragments a large request
+/// across streams would need per-stream assembly buffers keyed by
+/// `frame.stream_id`; the `pending` snapshot is the seam for that.
 fn readFrames(ctx: *ConnReader) !void {
     const self = ctx.server;
     const trans = ctx.trans;

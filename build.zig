@@ -590,14 +590,18 @@ pub fn build(b: *std.Build) void {
     const handler_error_test_step = b.step("handler-error-test", "Build the handler-error trailer test");
     handler_error_test_step.dependOn(&install_handler_error_test.step);
 
-    // SONNY-1560 — per-connection reader thread regression test. Verifies
-    // that WINDOW_UPDATE / PING keep being processed while a handler writes
-    // a response (a 4 MiB server-streaming response to a crediting client
-    // completes in seconds instead of stalling for `flow_credit_timeout_ns`),
-    // that a stream that never gets credit fails with the credit timeout
-    // without wedging the rest of the connection, and that the reader thread
-    // is joined when a client disappears mid-response. Unlike the other
-    // executable-based tests this step BUILDS AND RUNS the binary.
+    // SONNY-1560 / SONNY-1568 — per-connection reader thread regression test.
+    // Verifies that WINDOW_UPDATE / PING keep being processed while a handler
+    // writes a response (a 4 MiB server-streaming response to a crediting
+    // client completes in seconds instead of stalling for
+    // `flow_credit_timeout_ns`), that a stream that never gets credit fails
+    // with the credit timeout without wedging the rest of the connection,
+    // that the reader thread is joined when a client disappears mid-response,
+    // that a handler PARKED on send credit is released when the peer vanishes
+    // (SONNY-1568) rather than sleeping out the 30 s credit timeout, and that
+    // pipelining past MAX_PENDING_REQUESTS refuses the overflow with
+    // grpc-status 8 without leaking or wedging the connection. Unlike the
+    // other executable-based tests this step BUILDS AND RUNS the binary.
     const flow_control_reader_test = b.addExecutable(.{
         .name = "grpc-flow-control-reader-test",
         .root_module = b.createModule(.{

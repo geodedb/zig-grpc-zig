@@ -237,6 +237,94 @@ test "reserveSendCredit with timeout=0 keeps legacy unbounded behaviour for fund
     try testing.expectEqual(@as(i32, 4096 - 1024), t.stream_send_windows[1]);
 }
 
+/// Waker for the test below: marks the peer gone a short moment after the
+/// writer has (almost certainly) parked. The assertion does not depend on
+/// winning that race — if `markPeerGone` lands first, `reserveSendCredit`
+/// takes the on-entry check instead of the wake path and still returns
+/// `error.PeerGone` immediately.
+fn markPeerGoneAfterDelay(t: *transport.Transport, io: std.Io) void {
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    t.markPeerGone();
+}
+
+test "reserveSendCredit returns PeerGone immediately when the peer is already gone" {
+    // SONNY-1568 — the reader thread exits (peer vanished) before the
+    // handler ever parks. The writer must NOT sleep out
+    // `flow_credit_timeout_ns` (30 s here): the on-entry check under
+    // `flow_mutex` has to surface `error.PeerGone` right away, leaving the
+    // windows untouched.
+    const allocator = std.testing.allocator;
+
+    const send = try allocator.alloc(i32, 8);
+    defer allocator.free(send);
+    @memset(send, 0); // starved: only `peer_gone` can end the wait
+
+    const recv = try allocator.alloc(i32, 8);
+    defer allocator.free(recv);
+    @memset(recv, 65535);
+
+    var t: transport.Transport = undefined;
+    transport.Transport.initFlowControlForTest(&t);
+    t.io = std.testing.io;
+    t.conn_send_window = 0;
+    t.stream_send_windows = send;
+    t.stream_recv_windows = recv;
+    t.flow_mutex = .init;
+    t.flow_epoch = .init(0);
+    t.flow_credit_timeout_ns = 30 * std.time.ns_per_s;
+
+    t.markPeerGone();
+
+    const start_ns = compat.nanoTimestamp();
+    const result = transport.Transport.reserveSendCredit(&t, 1, 100);
+    const elapsed_ns = compat.nanoTimestamp() - start_ns;
+
+    try testing.expectError(error.PeerGone, result);
+    // Orders of magnitude below both the 30 s credit timeout and any
+    // plausible scheduler hiccup.
+    try testing.expect(elapsed_ns < 1 * std.time.ns_per_s);
+    try testing.expectEqual(@as(i32, 0), t.conn_send_window);
+    try testing.expectEqual(@as(i32, 0), t.stream_send_windows[1]);
+}
+
+test "reserveSendCredit wakes with PeerGone when the reader marks the peer gone mid-park" {
+    // SONNY-1568 — the wake path: a writer already parked on the
+    // `flow_epoch` futex is released by `markPeerGone` (the reader thread's
+    // exit) rather than by credit or by the timeout. Without the wake this
+    // returns `error.FlowControlTimeout` after 30 s and the test's bound
+    // fails.
+    const allocator = std.testing.allocator;
+
+    const send = try allocator.alloc(i32, 8);
+    defer allocator.free(send);
+    @memset(send, 0);
+
+    const recv = try allocator.alloc(i32, 8);
+    defer allocator.free(recv);
+    @memset(recv, 65535);
+
+    var t: transport.Transport = undefined;
+    transport.Transport.initFlowControlForTest(&t);
+    t.io = std.testing.io;
+    t.conn_send_window = 0;
+    t.stream_send_windows = send;
+    t.stream_recv_windows = recv;
+    t.flow_mutex = .init;
+    t.flow_epoch = .init(0);
+    t.flow_credit_timeout_ns = 30 * std.time.ns_per_s;
+
+    const waker = try std.Thread.spawn(.{}, markPeerGoneAfterDelay, .{ &t, std.testing.io });
+
+    const start_ns = compat.nanoTimestamp();
+    const result = transport.Transport.reserveSendCredit(&t, 1, 100);
+    const elapsed_ns = compat.nanoTimestamp() - start_ns;
+    waker.join();
+
+    try testing.expectError(error.PeerGone, result);
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(i32, 0), t.conn_send_window);
+}
+
 test "buildWindowUpdateFrame produces a 4-byte u31 increment" {
     var allocator = std.testing.allocator;
     const bytes = try transport.Transport.buildWindowUpdateFrame(allocator, 7, 32768);
