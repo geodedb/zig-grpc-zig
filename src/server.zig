@@ -6,6 +6,9 @@ const auth = @import("features/auth.zig");
 const streaming = @import("features/streaming.zig");
 const health = @import("features/health.zig");
 const net = std.Io.net;
+const http2 = struct {
+    pub const frame = @import("http2/frame.zig");
+};
 
 pub const Transport = transport.Transport;
 pub const TlsIo = transport.TlsIo;
@@ -33,6 +36,63 @@ pub const Handler = struct {
     handler_fn: *const fn ([]const u8, []const u8, *transport.Transport, std.mem.Allocator) anyerror!void,
 };
 
+/// gRPC server over HTTP/2.
+///
+/// THREADING MODEL (per accepted connection)
+/// -----------------------------------------
+/// Every accepted connection owns exactly TWO threads for its whole life:
+///
+///   * the **reader thread** (`connectionReader`) is the ONLY thread that
+///     calls `Transport.readFrame`. It owns inbound frame parsing and the
+///     HPACK decoder state, answers connection-level control frames
+///     inline (SETTINGS ACK, PING ACK, WINDOW_UPDATE credit, RST_STREAM /
+///     GOAWAY teardown), refills our receive windows, assembles inbound
+///     DATA into complete gRPC messages, and hands each finished request
+///     to the handler thread through a bounded `RequestQueue`.
+///
+///   * the **handler thread** is the connection thread spawned by
+///     `start()` (`connectionThread` -> `handleConnection`). After
+///     spawning the reader it does nothing but pop requests off the queue
+///     and run the auth gate + dispatch + response writes, exactly as
+///     before. Requests are still served strictly one at a time per
+///     connection, so handler-visible ordering is unchanged.
+///
+/// WHY (SONNY-1560): before this split, the same thread read frames AND
+/// ran the handler. While a handler was writing a large response nobody
+/// drained the socket, so the peer's WINDOW_UPDATE frames were never
+/// processed; once the peer's initial send window (1 MiB) was consumed the
+/// writer parked in `Transport.reserveSendCredit` until
+/// `flow_credit_timeout_ns` (30 s) expired. Flow control itself was always
+/// correct — it simply never got fed. With a dedicated reader the credit
+/// keeps flowing while the handler writes.
+///
+/// SHARED STATE AND THE LOCK THAT GUARDS IT
+/// ----------------------------------------
+///   * socket writes                 -> `Transport.write_mutex`. Both
+///     threads write (reader: SETTINGS/PING ACK, WINDOW_UPDATE, RST_STREAM,
+///     GOAWAY; handler: HEADERS/DATA/TRAILERS). Every multi-frame sequence
+///     takes the mutex once, so frames can never interleave on the wire.
+///   * send windows + `flow_epoch`   -> `Transport.flow_mutex` (unchanged).
+///     The reader credits them via `processWindowUpdate` /
+///     `applyPeerSettings`; the handler consumes them via
+///     `reserveSendCredit`.
+///   * the request queue             -> `RequestQueue.mutex` + `.cond`.
+///   * receive windows, HPACK dynamic table, `last_method`,
+///     `last_authorization` -> single-writer: the READER thread only.
+///     Handlers must use the `path` argument passed to `handler_fn`, NOT
+///     `Transport.lastMethod()` / `lastAuthorization()`, which now describe
+///     whatever HEADERS frame the reader saw most recently. The per-request
+///     values are snapshotted into the queued `PendingRequest`.
+///   * `Transport.last_stream_id`    -> single-writer: the HANDLER thread
+///     only. It is set from the popped request before dispatch, so
+///     `writeMessage` / `writeStreamMessage` / `endStream` keep targeting
+///     the stream being served.
+///
+/// TEARDOWN is deterministic: the reader exits on EOF/error/GOAWAY and
+/// closes the queue (carrying any fatal error); the handler drains what is
+/// already queued, leaves the loop, shuts the socket down and JOINS the
+/// reader before `Transport.deinit()` closes the fd. No connection thread
+/// is ever left behind.
 pub const GrpcServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -358,40 +418,41 @@ pub const GrpcServer = struct {
         var message_stream = streaming.MessageStream.init(self.allocator, 1024);
         defer message_stream.deinit();
 
-        while (true) {
-            const message = trans.readMessage() catch |err| switch (err) {
-                // Treat all "client went away" signals as a clean shutdown.
-                // The kernel surfaces a peer-side close as ConnectionClosed
-                // when the read returns 0 bytes, but it can also surface as
-                // ConnectionResetByPeer or EndOfStream depending on whether
-                // the peer sent FIN cleanly or RST. Logging these as errors
-                // produces noise on every legitimate disconnect.
-                error.ConnectionClosed,
-                error.ConnectionResetByPeer,
-                error.EndOfStream,
-                error.BrokenPipe,
-                => break,
-                // TLS errors indicate the connection is gone — treat like
-                // ConnectionClosed to avoid propagating the error which could
-                // cause cleanup issues (double-free on aarch64).
-                error.TlsReadFailed,
-                error.TlsWriteFailed,
-                error.TlsHandshakeFailed,
-                error.TlsNotInitialized,
-                => {
-                    std.log.warn("TLS connection error; closing: {}", .{err});
-                    break;
-                },
-                error.MessageTooLarge => {
-                    std.log.warn("closing connection: inbound gRPC message exceeded max_recv_message_bytes", .{});
-                    break;
-                },
-                error.ProtocolError, error.HeaderBlockTooLarge => {
-                    std.log.warn("closing connection: HTTP/2 protocol violation in header block", .{});
-                    break;
-                },
-                else => return err,
-            };
+        // SONNY-1560: hand inbound frame parsing to a dedicated reader
+        // thread so connection-level control frames (above all
+        // WINDOW_UPDATE) keep being processed while a handler is writing
+        // a response. See the `GrpcServer` doc comment for the model.
+        var queue = RequestQueue{ .allocator = self.allocator, .io = self.io };
+        defer queue.deinit();
+
+        var reader_ctx = ConnReader{ .server = self, .trans = &trans, .queue = &queue };
+        // Same stack sizing rationale as the connection thread (GAP-0018):
+        // the reader is the thread that allocates frame payloads, so it is
+        // the one that runs a capturing allocator's DWARF self-unwinder.
+        const reader_thread = std.Thread.spawn(
+            .{ .stack_size = self.conn_stack_size },
+            connectionReader,
+            .{&reader_ctx},
+        ) catch |err| {
+            std.log.err("Failed to spawn connection reader thread: {}", .{err});
+            return err;
+        };
+        // Deterministic teardown: unblock the reader's in-flight read and
+        // JOIN it before `trans.deinit()` (declared earlier, so it runs
+        // later) closes the socket. Nothing may touch `trans` afterwards.
+        defer {
+            reader_ctx.shutdown.store(true, .release);
+            // POSIX `close()` on one thread does not wake another blocked in
+            // `read()` on the same fd; `shutdown(SHUT_RDWR)` does. Mirrors
+            // `ClientMux.deinit`. Best-effort — the fd is closed next anyway.
+            if (trans.tls_io == null) {
+                _ = std.c.shutdown(trans.stream.socket.handle, 2);
+            }
+            reader_thread.join();
+        }
+
+        while (queue.pop()) |request| {
+            const message = request.payload;
             defer self.allocator.free(message);
 
             const compression_alg = compression.Compression.Algorithm.none;
@@ -404,8 +465,16 @@ pub const GrpcServer = struct {
             // multi-method services impossible (every method got the first
             // handler). On no match we send an UNIMPLEMENTED (12) trailer
             // so the client gets a definitive answer instead of hanging.
-            const method = trans.lastMethod();
-            const stream_id = trans.last_stream_id;
+            //
+            // `method` / `stream_id` come from the queued request rather
+            // than `trans.lastMethod()` / `trans.last_stream_id`: the reader
+            // thread may already have parsed a LATER request's HEADERS.
+            const method = request.method();
+            const stream_id = request.stream_id;
+            // The handler thread is the only writer of `last_stream_id`, so
+            // `writeMessage` / `writeStreamMessage` / `endStream` (which all
+            // default to it) keep targeting the stream we are serving.
+            trans.last_stream_id = stream_id;
 
             // Observability seam (Task 1.5). One server span per inbound
             // request iteration. Status updates flow from the dispatch
@@ -435,9 +504,10 @@ pub const GrpcServer = struct {
             // we must verify the `authorization` header before dispatching;
             // any failure produces a `grpc-status: 16` (UNAUTHENTICATED)
             // trailer with `@errorName(err)` as the message and we skip
-            // dispatch entirely.
+            // dispatch entirely. Ordering is unchanged: the gate still runs
+            // before handler lookup and before any handler runs.
             if (self.require_auth) {
-                const auth_value = trans.lastAuthorization();
+                const auth_value = request.authorization();
                 if (auth_value.len == 0) {
                     std.log.warn("auth gate: missing 'authorization' for {s}", .{method});
                     trans.endStreamWithStatus(stream_id, 16, "missing authorization") catch |err| {
@@ -493,5 +563,329 @@ pub const GrpcServer = struct {
                 continue;
             }
         }
+
+        // The reader closed the queue. A fatal (non peer-disconnect) frame
+        // error is propagated exactly as the pre-split `readMessage` loop
+        // propagated it, so `connectionThread` still counts it in
+        // `conn_error_count`.
+        if (queue.fatalError()) |err| return err;
     }
 };
+
+/// Upper bound on fully-assembled inbound requests a single connection may
+/// have waiting for its handler thread (SONNY-1560).
+///
+/// The reader thread must NEVER block on the handler — if it did, a handler
+/// parked in `reserveSendCredit` could not be rescued by the WINDOW_UPDATE
+/// the reader is supposed to deliver, which is exactly the deadlock this
+/// change removes. So the queue is bounded and overflow is rejected rather
+/// than waited on: a peer that pipelines more than this many requests
+/// without letting the server drain gets `grpc-status: 8`
+/// (RESOURCE_EXHAUSTED) on the overflowing stream and the connection stays
+/// healthy. 64 is far above anything a well-behaved client produces against
+/// a server that serves one request at a time per connection.
+pub const MAX_PENDING_REQUESTS: usize = 64;
+
+/// gRPC status 8 — RESOURCE_EXHAUSTED.
+const GRPC_STATUS_RESOURCE_EXHAUSTED: u8 = 8;
+
+/// One fully-assembled inbound request, handed from a connection's reader
+/// thread to its handler thread.
+///
+/// `method` / `authorization` are snapshotted (by value) at HEADERS-parse
+/// time rather than read back from the `Transport` at dispatch time: the
+/// reader may already have parsed a later request's HEADERS by then, which
+/// would make `Transport.lastMethod()` describe the wrong request.
+const PendingRequest = struct {
+    stream_id: u31,
+    method_buf: [256]u8 = .{0} ** 256,
+    method_len: usize = 0,
+    auth_buf: [1024]u8 = .{0} ** 1024,
+    auth_len: usize = 0,
+    /// Owned gRPC message bytes (gRPC 5-byte prefix already stripped).
+    /// Freed by whoever takes the request off the queue.
+    payload: []u8,
+
+    fn method(self: *const PendingRequest) []const u8 {
+        return self.method_buf[0..self.method_len];
+    }
+
+    fn authorization(self: *const PendingRequest) []const u8 {
+        return self.auth_buf[0..self.auth_len];
+    }
+};
+
+/// Bounded FIFO handoff between a connection's reader thread (single
+/// producer) and its handler thread (single consumer).
+///
+/// `mutex` guards `items`, `closed` and `fatal`; `cond` wakes the consumer.
+/// `close` is idempotent and always broadcasts, so the consumer can never
+/// be left parked after the reader exits.
+const RequestQueue = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    items: std.ArrayList(PendingRequest) = .empty,
+    closed: bool = false,
+    fatal: ?anyerror = null,
+
+    /// Free anything still queued. Call only after the reader thread has
+    /// been joined.
+    fn deinit(self: *RequestQueue) void {
+        for (self.items.items) |item| self.allocator.free(item.payload);
+        self.items.deinit(self.allocator);
+    }
+
+    /// Producer side. Returns false when the queue is closed or already at
+    /// `MAX_PENDING_REQUESTS`; the caller still owns `request.payload` then.
+    /// Never blocks.
+    fn push(self: *RequestQueue, request: PendingRequest) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return false;
+        if (self.items.items.len >= MAX_PENDING_REQUESTS) return false;
+        self.items.append(self.allocator, request) catch return false;
+        self.cond.signal(self.io);
+        return true;
+    }
+
+    /// Consumer side. Blocks until a request is available; returns null once
+    /// the queue is closed AND drained. The caller owns `payload`.
+    fn pop(self: *RequestQueue) ?PendingRequest {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (true) {
+            if (self.items.items.len > 0) return self.items.orderedRemove(0);
+            if (self.closed) return null;
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    /// Close the queue, recording an optional fatal error for the consumer
+    /// to propagate. Idempotent; the first error recorded wins.
+    fn close(self: *RequestQueue, err: ?anyerror) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.closed) {
+            self.closed = true;
+            self.fatal = err;
+        }
+        self.cond.broadcast(self.io);
+    }
+
+    fn fatalError(self: *RequestQueue) ?anyerror {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.fatal;
+    }
+};
+
+/// Everything the per-connection reader thread needs. Lives on the handler
+/// thread's stack for the lifetime of the connection; the handler joins the
+/// reader before this goes out of scope.
+const ConnReader = struct {
+    server: *GrpcServer,
+    trans: *transport.Transport,
+    queue: *RequestQueue,
+    /// Set by the handler thread to ask the reader to stop. The reader also
+    /// stops on EOF/error, which is the usual path.
+    shutdown: std.atomic.Value(bool) = .init(false),
+};
+
+/// Reader-thread entry point. Runs `readFrames` and translates its exit
+/// into a queue close, using exactly the error classification the pre-split
+/// `handleConnection` read loop applied to `Transport.readMessage`.
+fn connectionReader(ctx: *ConnReader) void {
+    var fatal: ?anyerror = null;
+    readFrames(ctx) catch |err| switch (err) {
+        // Treat all "client went away" signals as a clean shutdown.
+        // The kernel surfaces a peer-side close as ConnectionClosed
+        // when the read returns 0 bytes, but it can also surface as
+        // ConnectionResetByPeer or EndOfStream depending on whether
+        // the peer sent FIN cleanly or RST. Logging these as errors
+        // produces noise on every legitimate disconnect.
+        error.ConnectionClosed,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        error.BrokenPipe,
+        => {},
+        // TLS errors indicate the connection is gone — treat like
+        // ConnectionClosed to avoid propagating the error which could
+        // cause cleanup issues (double-free on aarch64).
+        error.TlsReadFailed,
+        error.TlsWriteFailed,
+        error.TlsHandshakeFailed,
+        error.TlsNotInitialized,
+        => std.log.warn("TLS connection error; closing: {}", .{err}),
+        error.MessageTooLarge => std.log.warn(
+            "closing connection: inbound gRPC message exceeded max_recv_message_bytes",
+            .{},
+        ),
+        error.ProtocolError, error.HeaderBlockTooLarge => std.log.warn(
+            "closing connection: HTTP/2 protocol violation in header block",
+            .{},
+        ),
+        else => fatal = err,
+    };
+    ctx.queue.close(fatal);
+}
+
+/// The connection's inbound frame loop. This is the ONLY caller of
+/// `Transport.readFrame` for a server connection, and it keeps running
+/// while handlers write — that is the whole point of SONNY-1560.
+///
+/// Frame handling mirrors `Transport.readMessageCore(null)` (the server /
+/// legacy path) one-for-one; the only difference is that a completed gRPC
+/// message is pushed onto the dispatch queue instead of being returned.
+fn readFrames(ctx: *ConnReader) !void {
+    const self = ctx.server;
+    const trans = ctx.trans;
+    const allocator = self.allocator;
+    const FT = http2.frame.FrameType;
+    const FF = http2.frame.FrameFlags;
+
+    // Inbound gRPC message assembly buffer. As in `readMessageCore`, DATA
+    // from any stream is accumulated and anything past the completed
+    // message is discarded.
+    var grpc_buf: std.ArrayList(u8) = .empty;
+    defer grpc_buf.deinit(allocator);
+
+    // Most recent request HEADERS seen, snapshotted for the next completed
+    // message (the server learns the stream id and `:path` from HEADERS).
+    var pending: PendingRequest = .{ .stream_id = trans.last_stream_id, .payload = undefined };
+
+    while (!ctx.shutdown.load(.acquire)) {
+        const frame = try trans.readFrame();
+        const payload = frame.payload;
+
+        switch (frame.frame_type) {
+            @intFromEnum(FT.DATA) => {
+                const data_len: u32 = @intCast(payload.len);
+                grpc_buf.appendSlice(allocator, payload) catch {
+                    allocator.free(payload);
+                    return error.OutOfMemory;
+                };
+                allocator.free(payload);
+                // Refill receive windows now that the bytes have been
+                // consumed (NW-2).
+                trans.maybeRefillRecvWindow(frame.stream_id, data_len);
+
+                // NEW-1 (#43): bound the assembly buffer BEFORE parsing.
+                transport.Transport.checkRecvBufferSize(grpc_buf.items.len, trans.max_recv_message_bytes) catch |err| {
+                    trans.writeRstStream(frame.stream_id, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                    return err;
+                };
+
+                if (grpc_buf.items.len < 5) continue;
+                const prefix = transport.decodeGrpcPrefix(grpc_buf.items) catch
+                    return transport.TransportError.Http2Error;
+                const msg_len = prefix.msg_len;
+                transport.Transport.checkRecvMessageSize(msg_len, trans.max_recv_message_bytes) catch |err| {
+                    trans.writeRstStream(frame.stream_id, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                    return err;
+                };
+                const need: usize = 5 + @as(usize, msg_len);
+                if (grpc_buf.items.len < need) continue;
+
+                const message = try allocator.alloc(u8, msg_len);
+                @memcpy(message, grpc_buf.items[5..need]);
+                grpc_buf.clearRetainingCapacity();
+
+                var request = pending;
+                request.payload = message;
+                if (!ctx.queue.push(request)) {
+                    // Queue full (or already closed): refuse this stream
+                    // rather than blocking the reader — see
+                    // MAX_PENDING_REQUESTS.
+                    std.log.warn(
+                        "connection request queue full ({d}); refusing stream {d}",
+                        .{ MAX_PENDING_REQUESTS, request.stream_id },
+                    );
+                    trans.endStreamWithStatus(
+                        request.stream_id,
+                        GRPC_STATUS_RESOURCE_EXHAUSTED,
+                        "server request queue full",
+                    ) catch {};
+                    allocator.free(message);
+                }
+                continue;
+            },
+            @intFromEnum(FT.HEADERS) => {
+                const end_headers = (frame.flags & FF.END_HEADERS) != 0;
+                if (end_headers) {
+                    trans.extractPathFromHpack(payload);
+                    allocator.free(payload);
+                } else {
+                    // I5 (#48): reassemble CONTINUATION fragments.
+                    const block = trans.collectContinuations(frame.stream_id, payload) catch |err| {
+                        allocator.free(payload);
+                        return err;
+                    };
+                    allocator.free(payload);
+                    trans.extractPathFromHpack(block);
+                    allocator.free(block);
+                }
+                // Snapshot the per-request metadata for the message that
+                // this HEADERS frame opens.
+                pending.stream_id = frame.stream_id;
+                const m = trans.lastMethod();
+                pending.method_len = @min(m.len, pending.method_buf.len);
+                @memcpy(pending.method_buf[0..pending.method_len], m[0..pending.method_len]);
+                const a = trans.lastAuthorization();
+                pending.auth_len = @min(a.len, pending.auth_buf.len);
+                @memcpy(pending.auth_buf[0..pending.auth_len], a[0..pending.auth_len]);
+                continue;
+            },
+            @intFromEnum(FT.SETTINGS) => {
+                const is_ack = (frame.flags & 0x1) != 0;
+                if (!is_ack) {
+                    // Apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE and
+                    // SETTINGS_INITIAL_WINDOW_SIZE) before ACKing.
+                    trans.applyPeerSettings(payload);
+                    allocator.free(payload);
+                    try trans.writeFrame(.SETTINGS, 0x1, 0, &.{});
+                } else {
+                    allocator.free(payload);
+                }
+                continue;
+            },
+            @intFromEnum(FT.WINDOW_UPDATE) => {
+                // THE fix (SONNY-1560): this now runs even while a handler
+                // is parked in `reserveSendCredit` writing a response.
+                trans.processWindowUpdate(frame.stream_id, payload);
+                allocator.free(payload);
+                continue;
+            },
+            @intFromEnum(FT.PING) => {
+                const is_ack = (frame.flags & 0x1) != 0;
+                if (!is_ack) {
+                    var ping_data: [8]u8 = .{0} ** 8;
+                    const copy_len = @min(payload.len, 8);
+                    @memcpy(ping_data[0..copy_len], payload[0..copy_len]);
+                    allocator.free(payload);
+                    try trans.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]);
+                } else {
+                    allocator.free(payload);
+                }
+                continue;
+            },
+            @intFromEnum(FT.RST_STREAM), @intFromEnum(FT.GOAWAY) => {
+                allocator.free(payload);
+                return transport.TransportError.ConnectionClosed;
+            },
+            @intFromEnum(FT.CONTINUATION) => {
+                // §6.10: a CONTINUATION with no preceding open header block
+                // is a connection error (PROTOCOL_ERROR).
+                allocator.free(payload);
+                trans.emitGoawayProtocolError();
+                return transport.TransportError.ProtocolError;
+            },
+            else => {
+                // Unknown frame type — skip
+                allocator.free(payload);
+                continue;
+            },
+        }
+    }
+}

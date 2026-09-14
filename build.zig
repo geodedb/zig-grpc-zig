@@ -590,6 +590,35 @@ pub fn build(b: *std.Build) void {
     const handler_error_test_step = b.step("handler-error-test", "Build the handler-error trailer test");
     handler_error_test_step.dependOn(&install_handler_error_test.step);
 
+    // SONNY-1560 — per-connection reader thread regression test. Verifies
+    // that WINDOW_UPDATE / PING keep being processed while a handler writes
+    // a response (a 4 MiB server-streaming response to a crediting client
+    // completes in seconds instead of stalling for `flow_credit_timeout_ns`),
+    // that a stream that never gets credit fails with the credit timeout
+    // without wedging the rest of the connection, and that the reader thread
+    // is joined when a client disappears mid-response. Unlike the other
+    // executable-based tests this step BUILDS AND RUNS the binary.
+    const flow_control_reader_test = b.addExecutable(.{
+        .name = "grpc-flow-control-reader-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/flow_control_reader_test_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    flow_control_reader_test.root_module.linkLibrary(zlib_lib);
+    flow_control_reader_test.root_module.addImport("build_options", build_options_mod);
+    flow_control_reader_test.root_module.addImport("crypto_backend", crypto_backend_mod);
+    const install_flow_control_reader_test = b.addInstallArtifact(flow_control_reader_test, .{});
+    const run_flow_control_reader_test = b.addRunArtifact(flow_control_reader_test);
+    run_flow_control_reader_test.step.dependOn(&install_flow_control_reader_test.step);
+    const flow_control_reader_test_step = b.step(
+        "test-flow-control-reader",
+        "Build and run the SONNY-1560 per-connection reader-thread regression test",
+    );
+    flow_control_reader_test_step.dependOn(&run_flow_control_reader_test.step);
+    check_step.dependOn(&flow_control_reader_test.step);
+
     // Interop wire-codec unit tests.
     const interop_codec_tests = b.addTest(.{
         .name = "interop-codec-tests",

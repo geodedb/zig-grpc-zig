@@ -743,7 +743,7 @@ pub const Transport = struct {
     /// one carries END_HEADERS. Returns the owned, assembled block
     /// (caller frees). `first_payload` is appended but NOT freed (caller
     /// still owns/frees it).
-    fn collectContinuations(self: *Transport, stream_id: u31, first_payload: []const u8) ![]u8 {
+    pub fn collectContinuations(self: *Transport, stream_id: u31, first_payload: []const u8) ![]u8 {
         var block: std.ArrayList(u8) = .empty;
         errdefer block.deinit(self.allocator);
         try appendHeaderFragment(&block, self.allocator, first_payload, MAX_HEADER_BLOCK_BYTES);
@@ -1115,7 +1115,7 @@ pub const Transport = struct {
     /// error: callers reach this on an already-failing path and a
     /// failed RST simply means the connection is gone, which the next
     /// read will surface anyway.
-    fn writeRstStream(self: *Transport, stream_id: u31, error_code: u32) void {
+    pub fn writeRstStream(self: *Transport, stream_id: u31, error_code: u32) void {
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u32, &payload, error_code, .big);
         self.writeFrame(.RST_STREAM, 0, stream_id, &payload) catch {};
@@ -1131,7 +1131,7 @@ pub const Transport = struct {
 
     /// Send a GOAWAY with PROTOCOL_ERROR. Best-effort (see
     /// emitGoawayFrameSizeError).
-    fn emitGoawayProtocolError(self: *Transport) void {
+    pub fn emitGoawayProtocolError(self: *Transport) void {
         const bytes = buildGoawayFrame(self.allocator, self.last_stream_id, HTTP2_ERROR_PROTOCOL_ERROR) catch return;
         defer self.allocator.free(bytes);
         _ = self.ioWrite(bytes) catch {};
@@ -2041,7 +2041,7 @@ pub const Transport = struct {
     ///
     /// Tracks the HPACK dynamic table so indexed references to :path work
     /// across requests on the same connection.
-    fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
+    pub fn extractPathFromHpack(self: *Transport, payload: []const u8) void {
         // Reset authorization on every request so a previous request's
         // value can't leak into a new one on the same connection.
         self.last_authorization_len = 0;
