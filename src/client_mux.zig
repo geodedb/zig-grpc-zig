@@ -288,6 +288,18 @@ pub const ClientMux = struct {
 };
 
 fn readerLoop(self: *ClientMux) void {
+    // SONNY-1568c: every exit path below (the `readFrame` error below, the
+    // SETTINGS/PING ACK write failures, GOAWAY, CONTINUATION, and the
+    // ordinary `shutdown`-flag loop exit `deinit` drives) means this mux's
+    // read side is done. A caller parked in `writeRequestOnStreamWithMetadata`
+    // -> `reserveSendCreditOrRst` waiting for the peer to credit a large
+    // request body is invisible to `broadcastError` (that only signals
+    // `StreamSlot.cond`, which a writer blocked on send credit is not
+    // waiting on) and would otherwise sleep out the full
+    // `flow_credit_timeout_ns` (30 s by default) before failing on the now-
+    // dead socket. One `defer` covers every return below, mirroring
+    // `GrpcServer.connectionReader`'s server-side fix for the same bug.
+    defer self.transport.markPeerGone();
     while (!self.shutdown.load(.acquire)) {
         const frame = self.transport.readFrame() catch |err| {
             self.broadcastError(err);

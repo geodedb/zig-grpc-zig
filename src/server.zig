@@ -761,25 +761,43 @@ fn connectionReader(ctx: *ConnReader) void {
 /// message is pushed onto the dispatch queue instead of being returned.
 ///
 /// HAZARD — the reader can be stalled by a peer that stops reading TCP
-/// (SONNY-1568, minor): three things this loop does take
-/// `Transport.write_mutex` — the SETTINGS ACK, the PING ACK, and the
-/// receive-window refills inside `Transport.maybeRefillRecvWindow`. If a
+/// (SONNY-1568, minor): several things this loop does take
+/// `Transport.write_mutex` — the SETTINGS ACK, the PING ACK, the
+/// receive-window refills inside `Transport.maybeRefillRecvWindow`, the
+/// queue-overflow refusal's `Transport.endStreamWithStatus` (the
+/// `RESOURCE_EXHAUSTED` trailer, below), and every `Transport.writeRstStream`
+/// call this loop makes (over-cap DATA, oversize gRPC message). If a
 /// handler is at that moment inside `ioWriteLocked` on a socket whose send
 /// buffer the peer has stopped draining, that handler holds `write_mutex`
 /// until the kernel accepts the bytes, and the reader blocks on the mutex
 /// and stops reading. The SONNY-1560 fix itself survives this — the
 /// WINDOW_UPDATE path (`Transport.processWindowUpdate`) needs only
 /// `flow_mutex`, never `write_mutex`, so credit keeps flowing and a stuck
-/// writer still makes progress the instant the peer credits it — but a peer
-/// that both withholds credit and refuses to read can wedge both threads
-/// until `flow_credit_timeout_ns` fires. Mitigations, neither taken here
+/// writer still makes progress the instant the peer credits it. But the
+/// bound on the OTHER wedge — a peer that refuses to read at all — is NOT
+/// `flow_credit_timeout_ns`: that timeout only fires for a writer PARKED in
+/// `reserveSendCredit` waiting on the futex. A handler stuck inside
+/// `ioWriteLocked` (kernel send buffer full, `write()` blocked) isn't
+/// parked on credit at all — it's parked on the socket — so no credit
+/// timeout ever fires for it, and the wedge (both threads, plus the
+/// connection's `conn_sem` admission permit, held) lasts until TCP itself
+/// gives up: retransmit timeout or `SO_KEEPALIVE` (already set by
+/// `setRpcSocketOptions`) eventually kills the connection, which on Linux
+/// defaults to minutes, not seconds. Mitigations, neither taken here
 /// because both are bigger than this change:
-///   * a bounded write deadline on the socket (`SO_SNDTIMEO`, or a
-///     deadline threaded through `ioWriteLocked`) so no writer can hold
-///     `write_mutex` longer than that bound. `Transport` has no such
-///     deadline today — `setRpcSocketOptions` sets only `TCP_NODELAY` and
-///     `SO_KEEPALIVE` — so there is nothing cheap to apply to the ACK and
-///     refill writes below;
+///   * a bounded write deadline on the socket. The cheap version is
+///     `SO_SNDTIMEO` set right beside the existing `TCP_NODELAY` /
+///     `SO_KEEPALIVE` calls in `setRpcSocketOptions` — one more
+///     `setsockopt`, no new plumbing. It's deferred anyway because it
+///     changes blocking semantics for EVERY write on the socket, not just
+///     the reader's control-frame writes: a handler's legitimate large
+///     response, mid-flight through a slow-but-healthy peer's receive
+///     window, could now fail with a spurious timeout it never would have
+///     hit before. That trade-off needs its own review and test coverage,
+///     not a rider on this fix pass. The alternative, a deadline threaded
+///     explicitly through `ioWriteLocked` (scoped only to the reader's
+///     control writes), avoids that blast radius but is real plumbing
+///     through every `Transport` write path;
 ///   * a dedicated writer thread with an outbound frame queue, so control
 ///     frames never contend with response bytes for the socket at all.
 ///

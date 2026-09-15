@@ -1037,6 +1037,20 @@ pub const Transport = struct {
         self.wakeFlowWaiters();
     }
 
+    /// SONNY-1568c: synchronized read of `peer_gone`, for write paths that
+    /// want to skip a doomed write rather than fail loudly. `endStream` /
+    /// `endStreamWithStatus` use this to avoid emitting a trailer to a
+    /// socket the reader has already declared dead after a `PeerGone`
+    /// unwind — that write always fails (`error.SocketUnconnected`) and
+    /// only produces "Failed to emit error trailer" log noise for a peer
+    /// that will never read it. Takes `flow_mutex` for a single read, the
+    /// same synchronization `reserveSendCredit` and `markPeerGone` use.
+    fn isPeerGone(self: *Transport) bool {
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        return self.peer_gone;
+    }
+
     /// Reserve `n` octets of send-window credit, blocking until both
     /// the connection and per-stream send windows have enough headroom
     /// or the configured `flow_credit_timeout_ns` elapses (whichever
@@ -2265,6 +2279,10 @@ pub const Transport = struct {
 
     /// End a gRPC server stream by sending TRAILERS with grpc-status: 0.
     pub fn endStream(self: *Transport) !void {
+        // SONNY-1568c: peer already gone (reader exited, `markPeerGone`
+        // fired) — the socket is dead, so skip the write instead of
+        // failing on it. See `isPeerGone`.
+        if (self.isPeerGone()) return;
         const sid = self.last_stream_id;
         try self.writeFrame(.HEADERS, http2.frame.FrameFlags.END_STREAM | http2.frame.FrameFlags.END_HEADERS, sid, &OK_TRAILERS_BYTES);
     }
@@ -2285,6 +2303,11 @@ pub const Transport = struct {
     /// bytes after any necessary truncation by the caller); longer messages
     /// are truncated to 127 bytes to stay within that prefix.
     pub fn endStreamWithStatus(self: *Transport, stream_id: u31, code: u8, message: ?[]const u8) !void {
+        // SONNY-1568c: peer already gone (reader exited, `markPeerGone`
+        // fired) — the socket is dead, so skip the write instead of
+        // failing on it. See `isPeerGone`.
+        if (self.isPeerGone()) return;
+
         // grpc-status decimal-ASCII (max 3 chars: 0..255).
         var code_buf: [3]u8 = undefined;
         const code_str = std.fmt.bufPrint(&code_buf, "{d}", .{code}) catch unreachable;

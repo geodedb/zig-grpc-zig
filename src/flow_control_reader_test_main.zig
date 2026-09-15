@@ -88,6 +88,23 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// 4x the initial window.
 const CHUNKS: usize = (4 * WINDOW) / CHUNK_BYTES;
 
+/// Wire size of one `/Big` message: the 5-byte gRPC length-prefix plus the
+/// chunk payload. `reserveSendCredit` is charged this whole amount per
+/// `writeStreamMessage` call, not just the payload.
+const GRPC_FRAME_LEN: usize = 5 + CHUNK_BYTES;
+
+/// SONNY-1568c: the largest number of response bytes a client can EVER
+/// observe without crediting anything back, i.e. the greatest multiple of
+/// `GRPC_FRAME_LEN` that fits inside one advertised window. `WINDOW` itself
+/// overcounts by the framing overhead (16 messages need 16 * 5 = 80 bytes
+/// more than `WINDOW` provides), so a client that waited for `got >=
+/// WINDOW` would hang forever: the server parks on the 16th message and
+/// never sends the remaining 80 bytes. Reading exactly this many bytes
+/// guarantees the server's NEXT `reserveSendCredit` call has strictly less
+/// than `GRPC_FRAME_LEN` remaining and MUST park — deterministically, by
+/// arithmetic, not by a timing race.
+const DELIVERABLE_BEFORE_PARK: usize = (WINDOW / GRPC_FRAME_LEN) * GRPC_FRAME_LEN;
+
 const SHORT_TIMEOUT_NS: u64 = 2 * std.time.ns_per_s;
 
 /// Upper bound on "the reader thread was joined and the admission permit
@@ -174,6 +191,27 @@ fn bigStreamHandler(
     try trans.endStream();
 }
 
+/// SONNY-1568c: `@intFromError` of the handler's terminal error, for
+/// scenario 4 (server D's `/Big`). 0 is "unset" — Zig error values are
+/// never 0 — so the scenario can assert the handler's OUTCOME
+/// (`error.PeerGone`), not just that the join happened inside the bound.
+/// A stale value from an earlier run can't leak into the assertion: this
+/// is the only handler registered for `/Big` on server D, and scenario 4
+/// resets it before making its request.
+var big_handler_result: std.atomic.Value(u16) = .init(0);
+
+fn bigStreamHandlerRecordErr(
+    request: []const u8,
+    path: []const u8,
+    trans: *transport.Transport,
+    allocator: std.mem.Allocator,
+) anyerror!void {
+    bigStreamHandler(request, path, trans, allocator) catch |err| {
+        big_handler_result.store(@intFromError(err), .release);
+        return err;
+    };
+}
+
 fn echoHandler(
     request: []const u8,
     _: []const u8,
@@ -208,6 +246,15 @@ fn serverThread(args: ServerArgs) void {
 
 fn registerHandlers(allocator: std.mem.Allocator, server: *GrpcServer) !void {
     try server.handlers.append(allocator, .{ .name = "/Big", .handler_fn = bigStreamHandler });
+    try server.handlers.append(allocator, .{ .name = "/Echo", .handler_fn = echoHandler });
+    try server.handlers.append(allocator, .{ .name = "/Block", .handler_fn = blockHandler });
+}
+
+/// Server D only: same as `registerHandlers` but `/Big` records its
+/// terminal error (SONNY-1568c) so scenario 4 can assert it's exactly
+/// `error.PeerGone`.
+fn registerHandlersD(allocator: std.mem.Allocator, server: *GrpcServer) !void {
+    try server.handlers.append(allocator, .{ .name = "/Big", .handler_fn = bigStreamHandlerRecordErr });
     try server.handlers.append(allocator, .{ .name = "/Echo", .handler_fn = echoHandler });
     try server.handlers.append(allocator, .{ .name = "/Block", .handler_fn = blockHandler });
 }
@@ -444,8 +491,24 @@ fn scenarioReaderExitsOnClientClose(allocator: std.mem.Allocator, io: std.Io) !v
 /// writer still in `ioWriteLocked` fails on the dead socket. The bound is
 /// what distinguishes the fix from the bug — 30 s of parked writer cannot
 /// hide inside `JOIN_BOUND_MS`.
+///
+/// SONNY-1568c: the client reads exactly `DELIVERABLE_BEFORE_PARK` bytes —
+/// not `WINDOW / 2` — before vanishing. Reading only half the window left
+/// the handler with credit still in hand, so it was never actually parked
+/// when the client vanished: the observed error was `error.SocketUnconnected`
+/// off the handler's next (unparked) write, and the scenario passed even
+/// with `markPeerGone`'s call reverted — it was only ever checking the JOIN
+/// bound, which the socket-error path satisfies on its own. Reading up to
+/// `DELIVERABLE_BEFORE_PARK` is the exact byte count after which the
+/// server's next `reserveSendCredit` call has too little credit to proceed —
+/// arithmetic, not a race — so the handler MUST be parked (or arrive at the
+/// park a moment later) when the client vanishes. The assertion below
+/// checks the handler's recorded outcome, not just the bound, so a future
+/// regression that makes the wake path silently no-op can't hide behind a
+/// coincidentally-fast socket error again.
 fn scenarioPeerVanishReleasesParkedWriter(allocator: std.mem.Allocator, io: std.Io) !void {
     std.log.info("[4/5] handler parked on send credit is released when the peer vanishes", .{});
+    big_handler_result.store(0, .release);
 
     {
         const address = try net.IpAddress.parseIp4("127.0.0.1", PORT_D);
@@ -456,13 +519,15 @@ fn scenarioPeerVanishReleasesParkedWriter(allocator: std.mem.Allocator, io: std.
         const sid: u31 = try t.nextClientStreamId();
         try t.writeRequestOnStream(sid, "go", "/Big");
 
-        // Consume half the peer window WITHOUT ever crediting it back. The
-        // handler has 4 MiB to write into a ~1 MiB window, so by the time
-        // this loop ends it is parked (or microseconds from parking) in
-        // `reserveSendCredit`. Bounded: every iteration reads a frame the
-        // server has already sent or is sending, no sleeps.
+        // Consume every byte the server can EVER send without credit back
+        // WITHOUT ever crediting it. Beyond `DELIVERABLE_BEFORE_PARK` the
+        // handler cannot have sent anything more — it parked — so by the
+        // time this loop ends the handler IS parked in `reserveSendCredit`,
+        // not merely "microseconds from parking". Bounded: every iteration
+        // reads a frame the server has already sent or is sending, no
+        // sleeps.
         var got: usize = 0;
-        while (got < WINDOW / 2) {
+        while (got < DELIVERABLE_BEFORE_PARK) {
             const frame = try t.readFrame();
             defer allocator.free(frame.payload);
             if (frame.frame_type == @intFromEnum(http2.frame.FrameType.DATA)) got += frame.payload.len;
@@ -484,7 +549,20 @@ fn scenarioPeerVanishReleasesParkedWriter(allocator: std.mem.Allocator, io: std.
             .{ elapsed_ms, JOIN_BOUND_MS },
         );
     }
-    std.log.info("    ok (parked writer released, permit returned in {d} ms)", .{elapsed_ms});
+
+    // The permit coming back happens-after the handler's dispatch (server.zig
+    // pops the next queue item / posts `conn_sem` only once `handleConnection`
+    // returns, which happens after `handler_fn` returns), so this load is
+    // guaranteed to observe the store `bigStreamHandlerRecordErr` made.
+    const raw_err = big_handler_result.load(.acquire);
+    const want_err = @intFromError(error.PeerGone);
+    if (raw_err != want_err) {
+        fail(
+            "handler's recorded outcome was error code {d}, want error.PeerGone ({d}) — the join happened inside the bound, but the handler did not actually unwind via the peer-gone wake path",
+            .{ raw_err, want_err },
+        );
+    }
+    std.log.info("    ok (parked writer released with error.PeerGone, permit returned in {d} ms)", .{elapsed_ms});
 }
 
 // ------------------------------------------------------------- scenario 5
@@ -664,7 +742,19 @@ fn scenarioQueueOverflowRefused(allocator: std.mem.Allocator, io: std.Io) !void 
             fail("probe connection echoed '{s}'", .{resp});
         }
         allocator.free(resp);
+
+        // SONNY-1568c: `total_requested_bytes` is mutated by server E's
+        // reader/handler threads under `server_e_gpa.mutex` (DebugAllocator's
+        // own internal lock, since `LeakGpa` is `thread_safe`); reading the
+        // field directly from this test thread was a data race against
+        // whichever server thread is still touching the live probe
+        // connection's allocations at that instant. Taking the SAME mutex
+        // for the read gives a synchronized, torn-free snapshot instead —
+        // the field itself is untouched, so the tolerance below is
+        // unaffected.
+        server_e_gpa.mutex.lockUncancelable(io);
         live_bytes[round] = server_e_gpa.total_requested_bytes;
+        server_e_gpa.mutex.unlock(io);
         probe.deinit();
     }
 
@@ -715,7 +805,7 @@ pub fn main(init: std.process.Init) !void {
     // on `peer_gone` is only proven by finishing far inside it.
     var server_d = try GrpcServer.init(allocator, io, PORT_D, "flow-reader-key");
     defer server_d.deinit();
-    try registerHandlers(allocator, &server_d);
+    try registerHandlersD(allocator, &server_d);
     server_d.conn_sem = .{ .permits = 1 };
 
     // Scenario 5 runs on a leak-checking allocator (see `LeakGpa`).
