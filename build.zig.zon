@@ -7,17 +7,14 @@
             .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
             .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",
         },
-        // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy). Local
-        // path dep until the fips package is published; the eventual form is:
-        //   .fips = .{
-        //       .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.0#<sha>",
-        //       .hash = "<zig-fetch-hash>",
-        //       .lazy = true,
-        //   },
-        // Zig 0.16 rejects absolute .path values, so this is the build-root-
-        // relative path to /home/benji/src/devnw/zig/fips.
+        // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy).
+        // SONNY-1852: pinned to the published fips v0.1.0 via git+https so
+        // `-Dfips=true` and CI resolve it from the registry instead of a
+        // machine-specific build-root-relative `.path` (which only existed on
+        // the author's disk and broke every other checkout).
         .fips = .{
-            .path = "../../../../../devnw/zig/fips",
+            .url = "git+https://gitlab.com/devnw/zig/fips.git#v0.1.0",
+            .hash = "fips-0.1.0-1wf3nbxWBgAp6yAk6cPRrF5l_U1tbblcVcN9xcjJDddy",
             .lazy = true,
         },
     },
