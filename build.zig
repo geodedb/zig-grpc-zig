@@ -623,6 +623,33 @@ pub fn build(b: *std.Build) void {
     flow_control_reader_test_step.dependOn(&run_flow_control_reader_test.step);
     check_step.dependOn(&flow_control_reader_test.step);
 
+    // SONNY-1838 — RST_STREAM is a STREAM error, not a connection teardown.
+    // Verifies that an inbound RST_STREAM on one stream fails ONLY that
+    // stream's RPC (its parked handler unwinds with error.StreamReset) while
+    // a sibling RPC on the SAME connection still completes, and that the
+    // server never GOAWAYs. Like the reader-thread test this step BUILDS AND
+    // RUNS the binary.
+    const rst_stream_isolation_test = b.addExecutable(.{
+        .name = "grpc-rst-stream-isolation-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/rst_stream_isolation_test_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    rst_stream_isolation_test.root_module.linkLibrary(zlib_lib);
+    rst_stream_isolation_test.root_module.addImport("build_options", build_options_mod);
+    rst_stream_isolation_test.root_module.addImport("crypto_backend", crypto_backend_mod);
+    const install_rst_stream_isolation_test = b.addInstallArtifact(rst_stream_isolation_test, .{});
+    const run_rst_stream_isolation_test = b.addRunArtifact(rst_stream_isolation_test);
+    run_rst_stream_isolation_test.step.dependOn(&install_rst_stream_isolation_test.step);
+    const rst_stream_isolation_test_step = b.step(
+        "test-rst-stream-isolation",
+        "Build and run the SONNY-1838 RST_STREAM stream-isolation regression test",
+    );
+    rst_stream_isolation_test_step.dependOn(&run_rst_stream_isolation_test.step);
+    check_step.dependOn(&rst_stream_isolation_test.step);
+
     // Interop wire-codec unit tests.
     const interop_codec_tests = b.addTest(.{
         .name = "interop-codec-tests",

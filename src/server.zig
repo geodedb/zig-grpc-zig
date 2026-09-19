@@ -484,6 +484,15 @@ pub const GrpcServer = struct {
             // default to it) keep targeting the stream we are serving.
             trans.last_stream_id = stream_id;
 
+            // SONNY-1838: the peer may have RST this stream while it sat in
+            // the queue (the reader flags it and keeps going). Skip it rather
+            // than run a handler and write to a stream the peer has abandoned
+            // — no trailer, the stream is gone — and move to the next RPC.
+            if (trans.isStreamReset(stream_id)) {
+                std.log.info("skipping queued RPC on reset stream {d}", .{stream_id});
+                continue;
+            }
+
             // Observability seam (Task 1.5). One server span per inbound
             // request iteration. Status updates flow from the dispatch
             // outcome below: 0 (OK) on handler success, gRPC UNKNOWN (2)
@@ -547,6 +556,16 @@ pub const GrpcServer = struct {
             }
             if (matched) |handler| {
                 handler.handler_fn(decompressed, method, &trans, self.allocator) catch |err| {
+                    // SONNY-1838: the peer RST this stream mid-RPC, so the
+                    // handler unwound stream-scoped. The stream is gone — do
+                    // NOT emit a trailer (there is nothing to carry it and the
+                    // write would only fail) — just record CANCELLED and move
+                    // on to the next queued RPC. The connection is healthy.
+                    if (err == error.StreamReset) {
+                        std.log.info("stream {d} reset by peer mid-RPC; abandoning it", .{stream_id});
+                        observability.endServerSpan(__obs_span, 1); // gRPC CANCELLED
+                        continue;
+                    }
                     // R1: surface handler errors to the client as a
                     // grpc-status: 2 (UNKNOWN) trailer. The legacy code
                     // logged the error and silently continued; clients
@@ -831,12 +850,32 @@ fn readFrames(ctx: *ConnReader) !void {
     // message (the server learns the stream id and `:path` from HEADERS).
     var pending: PendingRequest = .{ .stream_id = trans.last_stream_id, .payload = undefined };
 
+    // SONNY-1838: highest client-initiated stream id this connection has ever
+    // opened (seen in a HEADERS frame). Client stream ids are monotonically
+    // increasing (§5.1.1), so a stream id ABOVE this has never been opened and
+    // is "idle" — an RST_STREAM for it is a §5.1/§6.4.1 connection error, not a
+    // stream-scoped reset. A reset for an id at or below it (open or already
+    // closed) is a valid stream reset.
+    var max_opened_sid: u31 = 0;
+
     while (!ctx.shutdown.load(.acquire)) {
         const frame = try trans.readFrame();
         const payload = frame.payload;
 
         switch (frame.frame_type) {
             @intFromEnum(FT.DATA) => {
+                // SONNY-1838 / §5.1: a DATA frame for a stream the peer already
+                // reset (RST_STREAM) arrives on a CLOSED stream — a connection
+                // error of type STREAM_CLOSED. Pre-SONNY-1838 the RST tore the
+                // connection down, so this was covered for free; now that a
+                // valid RST keeps the connection alive we must reject the
+                // stray frame explicitly. (Legitimate peers stop sending after
+                // an RST; this only fires for a misbehaving/adversarial peer.)
+                if (trans.isStreamReset(frame.stream_id)) {
+                    allocator.free(payload);
+                    trans.emitGoawayProtocolError();
+                    return transport.TransportError.ProtocolError;
+                }
                 const data_len: u32 = @intCast(payload.len);
                 grpc_buf.appendSlice(allocator, payload) catch {
                     allocator.free(payload);
@@ -888,6 +927,14 @@ fn readFrames(ctx: *ConnReader) !void {
                 continue;
             },
             @intFromEnum(FT.HEADERS) => {
+                // SONNY-1838 / §5.1: HEADERS for a stream the peer already
+                // reset is a STREAM_CLOSED connection error (same rationale as
+                // the DATA case above).
+                if (trans.isStreamReset(frame.stream_id)) {
+                    allocator.free(payload);
+                    trans.emitGoawayProtocolError();
+                    return transport.TransportError.ProtocolError;
+                }
                 const end_headers = (frame.flags & FF.END_HEADERS) != 0;
                 if (end_headers) {
                     trans.extractPathFromHpack(payload);
@@ -905,6 +952,9 @@ fn readFrames(ctx: *ConnReader) !void {
                 // Snapshot the per-request metadata for the message that
                 // this HEADERS frame opens.
                 pending.stream_id = frame.stream_id;
+                // SONNY-1838: track the highest opened stream id for idle-RST
+                // detection below.
+                if (frame.stream_id > max_opened_sid) max_opened_sid = frame.stream_id;
                 const m = trans.lastMethod();
                 pending.method_len = @min(m.len, pending.method_buf.len);
                 @memcpy(pending.method_buf[0..pending.method_len], m[0..pending.method_len]);
@@ -946,9 +996,50 @@ fn readFrames(ctx: *ConnReader) !void {
                 }
                 continue;
             },
-            @intFromEnum(FT.RST_STREAM), @intFromEnum(FT.GOAWAY) => {
+            @intFromEnum(FT.GOAWAY) => {
+                // GOAWAY tears the whole connection down (the peer is done
+                // with it): exit the reader, which trips `markPeerGone` and
+                // releases every parked writer with `error.PeerGone`.
                 allocator.free(payload);
                 return transport.TransportError.ConnectionClosed;
+            },
+            @intFromEnum(FT.RST_STREAM) => {
+                // SONNY-1838 / HTTP/2 §5.4.2: a WELL-FORMED RST_STREAM
+                // terminates ONE stream, not the connection — flag that stream
+                // reset (releasing any handler parked on its send credit with
+                // the stream-scoped `error.StreamReset`, and letting the
+                // dispatch loop skip it if still queued) and KEEP READING so
+                // sibling RPCs survive. But a MALFORMED RST_STREAM is a
+                // CONNECTION error per §6.4/§6.4.1, exactly as the pre-SONNY-1838
+                // code (all-RST → teardown) satisfied in the h2spec gate; we
+                // must reproduce that for the malformed cases only:
+                //   * stream id 0x0          -> PROTOCOL_ERROR   (§6.4)
+                //   * length other than 4    -> FRAME_SIZE_ERROR (§6.4)
+                //   * idle (never-opened) id -> PROTOCOL_ERROR   (§5.1/§6.4.1)
+                // Each emits the matching GOAWAY and tears the connection down.
+                if (frame.stream_id == 0) {
+                    allocator.free(payload);
+                    trans.emitGoawayProtocolError();
+                    return transport.TransportError.ProtocolError;
+                }
+                if (payload.len != 4) {
+                    allocator.free(payload);
+                    trans.emitGoawayFrameSizeError();
+                    return transport.TransportError.ConnectionClosed;
+                }
+                if (frame.stream_id > max_opened_sid) {
+                    // Idle stream: never opened on this connection.
+                    allocator.free(payload);
+                    trans.emitGoawayProtocolError();
+                    return transport.TransportError.ProtocolError;
+                }
+                // Valid, non-zero, length-4 RST on a previously-opened stream:
+                // the SONNY-1838 stream-scoped reset. Reserving
+                // `ConnectionClosed`/`markPeerGone` for GOAWAY and real
+                // connection loss is the whole point of this fix.
+                trans.markStreamReset(frame.stream_id);
+                allocator.free(payload);
+                continue;
             },
             @intFromEnum(FT.CONTINUATION) => {
                 // §6.10: a CONTINUATION with no preceding open header block

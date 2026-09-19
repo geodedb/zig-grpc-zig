@@ -428,6 +428,17 @@ pub const Transport = struct {
     /// calls).
     stream_send_windows: []i32 = &[_]i32{},
     stream_recv_windows: []i32 = &[_]i32{},
+    /// SONNY-1838: per-stream "the peer sent RST_STREAM for this stream"
+    /// flags, parallel to the window arrays and bounded the same way
+    /// (MAX_TRACKED_STREAMS; ids beyond it are simply not tracked, which is
+    /// safe — the reader still keeps the connection alive). Set under
+    /// `flow_mutex` by the connection's reader thread via `markStreamReset`
+    /// and read under the same lock inside `reserveSendCredit`, so a handler
+    /// parked on that stream's send credit is released with the stream-scoped
+    /// `error.StreamReset` (NOT the connection-scoped `error.PeerGone`) the
+    /// instant its stream is reset. HTTP/2 stream ids are monotonic and never
+    /// reused on a connection, so a flag once set stays valid for that id.
+    stream_reset: []bool = &[_]bool{},
     /// Coordinates blocking writers waiting for additional send-window
     /// credit (peer sent WINDOW_UPDATE) without busy-spinning.
     ///
@@ -472,14 +483,17 @@ pub const Transport = struct {
 
     /// Allocate the per-stream flow-control arrays on the heap. Used by
     /// every init path so the embedded slices are non-empty and indexable.
-    fn allocStreamWindows(allocator: std.mem.Allocator) !struct { send: []i32, recv: []i32 } {
+    fn allocStreamWindows(allocator: std.mem.Allocator) !struct { send: []i32, recv: []i32, reset: []bool } {
         const send = try allocator.alloc(i32, MAX_TRACKED_STREAMS);
         errdefer allocator.free(send);
         const recv = try allocator.alloc(i32, MAX_TRACKED_STREAMS);
         errdefer allocator.free(recv);
+        const reset = try allocator.alloc(bool, MAX_TRACKED_STREAMS);
+        errdefer allocator.free(reset);
         @memset(send, INITIAL_WINDOW_SIZE_DEFAULT);
         @memset(recv, INITIAL_WINDOW_SIZE_DEFAULT);
-        return .{ .send = send, .recv = recv };
+        @memset(reset, false);
+        return .{ .send = send, .recv = recv, .reset = reset };
     }
 
     pub fn initClient(allocator: std.mem.Allocator, io: std.Io, stream_: net.Stream, authority: []const u8) !Transport {
@@ -488,6 +502,7 @@ pub const Transport = struct {
         const windows = try allocStreamWindows(allocator);
         errdefer allocator.free(windows.send);
         errdefer allocator.free(windows.recv);
+        errdefer allocator.free(windows.reset);
 
         var trans = Transport{
             .stream = stream_,
@@ -497,6 +512,7 @@ pub const Transport = struct {
             .authority = authority_owned,
             .stream_send_windows = windows.send,
             .stream_recv_windows = windows.recv,
+            .stream_reset = windows.reset,
         };
 
         try trans.setupHttp2Client();
@@ -510,6 +526,7 @@ pub const Transport = struct {
         const windows = try allocStreamWindows(allocator);
         errdefer allocator.free(windows.send);
         errdefer allocator.free(windows.recv);
+        errdefer allocator.free(windows.reset);
 
         var trans = Transport{
             .stream = stream_,
@@ -519,6 +536,7 @@ pub const Transport = struct {
             .authority = authority_owned,
             .stream_send_windows = windows.send,
             .stream_recv_windows = windows.recv,
+            .stream_reset = windows.reset,
         };
 
         try trans.setupHttp2Server();
@@ -532,6 +550,7 @@ pub const Transport = struct {
         const windows = try allocStreamWindows(allocator);
         errdefer allocator.free(windows.send);
         errdefer allocator.free(windows.recv);
+        errdefer allocator.free(windows.reset);
 
         var trans = Transport{
             .stream = stream_,
@@ -542,6 +561,7 @@ pub const Transport = struct {
             .authority = authority_owned,
             .stream_send_windows = windows.send,
             .stream_recv_windows = windows.recv,
+            .stream_reset = windows.reset,
         };
         // If setup fails, close the TLS connection to avoid leaking the
         // SSL object and SslConn allocation.
@@ -589,6 +609,7 @@ pub const Transport = struct {
         self.allocator.free(self.authority);
         if (self.stream_send_windows.len > 0) self.allocator.free(self.stream_send_windows);
         if (self.stream_recv_windows.len > 0) self.allocator.free(self.stream_recv_windows);
+        if (self.stream_reset.len > 0) self.allocator.free(self.stream_reset);
         self.ioClose();
     }
 
@@ -796,6 +817,7 @@ pub const Transport = struct {
         // check (idx >= MAX_TRACKED_STREAMS short-circuits).
         t.stream_send_windows = &[_]i32{};
         t.stream_recv_windows = &[_]i32{};
+        t.stream_reset = &[_]bool{};
         t.peer_gone = false;
     }
 
@@ -1037,6 +1059,41 @@ pub const Transport = struct {
         self.wakeFlowWaiters();
     }
 
+    /// SONNY-1838: record that the peer sent RST_STREAM for `stream_id` and
+    /// wake every writer parked in `reserveSendCredit` so a handler blocked on
+    /// THIS stream's send credit is released at once with `error.StreamReset`
+    /// (siblings re-check their own state and simply keep waiting). Called by
+    /// the connection's reader thread when it reads an RST_STREAM — unlike
+    /// GOAWAY / connection loss it does NOT set `peer_gone`, so the connection
+    /// and every other stream on it stay alive (HTTP/2 §5.4.2). Set under
+    /// `flow_mutex`, the same lock `reserveSendCredit` re-reads on entry and
+    /// after every wake, closing the lost-wakeup race. Streams beyond
+    /// MAX_TRACKED_STREAMS aren't flagged; the reader still keeps reading, so
+    /// the connection survives and such a stream's handler falls back to the
+    /// credit timeout — never a connection teardown.
+    pub fn markStreamReset(self: *Transport, stream_id: u31) void {
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        if (stream_id != 0) {
+            const i: usize = @intCast(stream_id);
+            if (i < self.stream_reset.len) self.stream_reset[i] = true;
+        }
+        self.wakeFlowWaiters();
+    }
+
+    /// SONNY-1838: synchronized read of a stream's reset flag, for the server
+    /// dispatch loop to skip an RPC whose stream the peer reset while it was
+    /// still queued (never dispatched). Takes `flow_mutex` for a single read,
+    /// the same synchronization `markStreamReset` uses.
+    pub fn isStreamReset(self: *Transport, stream_id: u31) bool {
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        if (stream_id == 0) return false;
+        const i: usize = @intCast(stream_id);
+        if (i >= self.stream_reset.len) return false;
+        return self.stream_reset[i];
+    }
+
     /// SONNY-1568c: synchronized read of `peer_gone`, for write paths that
     /// want to skip a doomed write rather than fail loudly. `endStream` /
     /// `endStreamWithStatus` use this to avoid emitting a trailer to a
@@ -1068,7 +1125,7 @@ pub const Transport = struct {
     /// opens streams but never advertises credit can no longer pin
     /// `MAX_CONNS` writer threads forever. When `flow_credit_timeout_ns`
     /// is `0` the wait is unbounded (legacy behaviour).
-    pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone }!void {
+    pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone, StreamReset }!void {
         if (n == 0) return;
         const idx: ?usize = blk: {
             if (stream_id == 0) break :blk null;
@@ -1099,6 +1156,15 @@ pub const Transport = struct {
             // the reader has already exited. `peer_gone` is only ever set
             // (never cleared) under `flow_mutex`, which we hold.
             if (self.peer_gone) return error.PeerGone;
+
+            // SONNY-1838: the peer reset THIS stream (RST_STREAM). Release
+            // only this writer, stream-scoped — the connection and every
+            // sibling stream stay alive. Checked under `flow_mutex` here (and
+            // after every wake), same protocol as `peer_gone`, so a writer
+            // that parks after the reader flags the stream still observes it.
+            if (idx) |i| {
+                if (i < self.stream_reset.len and self.stream_reset[i]) return error.StreamReset;
+            }
 
             const conn_avail = self.conn_send_window;
             const stream_avail: i32 = if (idx) |i| self.stream_send_windows[i] else std.math.maxInt(i32);
@@ -1157,12 +1223,17 @@ pub const Transport = struct {
     /// HTTP/2 `RST_STREAM` frame with `FLOW_CONTROL_ERROR` (0x03) for
     /// the offending stream and propagates the error. Used by every
     /// outbound DATA write path. Closes GAP-FU-002.
-    fn reserveSendCreditOrRst(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone }!void {
+    fn reserveSendCreditOrRst(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone, StreamReset }!void {
         self.reserveSendCredit(stream_id, n) catch |err| switch (err) {
             // SONNY-1568: the peer is gone, so there is nobody to receive
             // an RST_STREAM (and the write would only fail on a dead
             // socket). Propagate so the handler unwinds immediately.
             error.PeerGone => return err,
+            // SONNY-1838: the peer already RST this stream, so it is gone and
+            // we must NOT emit our own RST for it. Propagate stream-scoped so
+            // the handler unwinds and the dispatch loop moves to the next RPC
+            // without touching the (healthy) connection.
+            error.StreamReset => return err,
             error.FlowControlTimeout => {
                 std.log.warn(
                     "flow-control credit timeout on stream {d}; sending RST_STREAM(FLOW_CONTROL_ERROR)",
@@ -1187,7 +1258,7 @@ pub const Transport = struct {
 
     /// Send a GOAWAY frame with FRAME_SIZE_ERROR. Best-effort: ignores
     /// any write failure since we are about to tear the connection down.
-    fn emitGoawayFrameSizeError(self: *Transport) void {
+    pub fn emitGoawayFrameSizeError(self: *Transport) void {
         const bytes = buildGoawayFrameSizeError(self.allocator, self.last_stream_id) catch return;
         defer self.allocator.free(bytes);
         _ = self.ioWrite(bytes) catch {};
