@@ -662,16 +662,20 @@ pub const Transport = struct {
     /// The relative ordering of ACK vs. the server's own non-ACK
     /// SETTINGS / WINDOW_UPDATE isn't guaranteed: a server might emit
     /// its SETTINGS, then ACK ours, then send WINDOW_UPDATE — so we
-    /// can't stop on the ACK or we lose the credit. Track all three
-    /// expected frames and exit when all have been observed (or when
-    /// our small budget is exhausted, leaving any remaining work for
-    /// the application's read loop).
+    /// can't stop on the ACK or we lose the credit. But the
+    /// WINDOW_UPDATE is OPTIONAL: grpc-go (and any peer that keeps the
+    /// RFC 7540 default 65535-octet connection window) never sends one,
+    /// and waiting for it hung every call against a Go server (interop
+    /// go×zig). So once SETTINGS + ACK are in, we only keep reading while
+    /// more bytes arrive within `initial_frames_grace_ms`; otherwise we
+    /// stop and let the application's read loop handle anything later.
     fn consumeInitialServerFrames(self: *Transport) !void {
         var got_ack = false;
         var got_settings = false;
         var got_window_update = false;
         var max_frames: u8 = 16;
         while (max_frames > 0 and !(got_ack and got_settings and got_window_update)) : (max_frames -= 1) {
+            if (got_ack and got_settings and !self.peerBytesPending(initial_frames_grace_ms)) break;
             const frame = try self.readFrame();
             defer self.allocator.free(frame.payload);
             switch (frame.frame_type) {
@@ -706,6 +710,24 @@ pub const Transport = struct {
                 },
             }
         }
+    }
+
+    /// How long the client handshake waits for an optional trailing
+    /// connection WINDOW_UPDATE once SETTINGS + ACK have been exchanged.
+    const initial_frames_grace_ms: i32 = 200;
+
+    /// True when the peer has bytes ready to read within `timeout_ms`.
+    /// TLS transports buffer internally, so they conservatively report
+    /// false (no extra read) rather than risk blocking on the raw socket.
+    fn peerBytesPending(self: *Transport, timeout_ms: i32) bool {
+        if (self.tls_io != null) return false;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const n = std.posix.poll(&fds, timeout_ms) catch return false;
+        return n > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
     }
 
     /// Read exactly `buf.len` bytes from the stream, handling partial reads.
