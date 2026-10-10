@@ -6,3 +6,6 @@ zig-out/
 
 # Per-feature observability rollout artifacts (untracked baseline captures)
 .observability/
+
+# Zig 0.16 project-local package cache
+zig-pkg/
