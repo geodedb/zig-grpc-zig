@@ -214,7 +214,10 @@ zig-test-unit-releasesmall-0.16.0:
   interruptible: true
   before_script:
     - apt-get update -qq
-    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
+    # wget + sudo + gnupg + perl: required by scripts/install-openssl-fips.sh
+    # (canonical copy from devnw/zig/fips, kept byte-identical; sudo as root
+    # in the container is a no-op wrapper). Same as devnw/zig/fts-storage.
+    - apt-get install -y --no-install-recommends curl wget sudo gnupg ca-certificates xz-utils git build-essential python3 perl
     - bash scripts/install-zig.sh "$ZIG_VERSION"
     - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
     - zig version
@@ -330,17 +333,28 @@ interop-h2spec:
 # FIPS-140-3 dual-mode test (-Dfips=true).
 #
 # `fips-deps` builds the latest OpenSSL 3.x + FIPS provider into
-# /usr/local/ssl (via the repo `make deps` target, which the ci-catalog
+# .openssl-fips/ (via the vendored scripts/install-openssl-fips.sh, which the ci-catalog
 # `zig-fips-build` component also provides). `test-fips` then runs the suite
 # against the validated FIPS backend. Linux-only; MR + default-branch.
 fips-deps:
   extends: .zig-host-base
   stage: build
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   script:
-    - make deps   # builds latest OpenSSL + FIPS provider into /usr/local/ssl
+    # GitLab artifacts must live under $CI_PROJECT_DIR — /usr/local/ssl is
+    # outside the project dir and cannot be uploaded, so build into a
+    # project-relative prefix instead (still handed to test-fips below).
+    # OPENSSL_VERSION pinned: the script's "latest 3.x" resolver greps
+    # releases/latest for an openssl-3.* tag, but the latest release is now
+    # the 4.x line, so the grep silently falls back to the system OpenSSL
+    # (no ML-KEM, fails verify-fips-provider.sh). Bump this pin alongside
+    # OpenSSL 3.x LTS releases (same pattern as devnw/zig/fts-storage).
+    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.3" bash scripts/install-openssl-fips.sh
   artifacts:
     paths:
-      - /usr/local/ssl
+      - .openssl-fips/
     expire_in: 1 day
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -349,8 +363,11 @@ fips-deps:
 test-fips:
   extends: .zig-host-base
   stage: test
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   script:
-    - OPENSSL_CONF=/usr/local/ssl/ssl/openssl.cnf zig build test -Dfips=true -Dopenssl_path=/usr/local/ssl --summary all
+    - OPENSSL_CONF="$CI_PROJECT_DIR/.openssl-fips/ssl/openssl.cnf" zig build test -Dfips=true -Dopenssl_path="$CI_PROJECT_DIR/.openssl-fips" --summary all
   needs:
     - fips-deps
   rules:
