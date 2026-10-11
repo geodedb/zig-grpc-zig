@@ -9,6 +9,7 @@ const net = std.Io.net;
 const http2 = struct {
     pub const frame = @import("http2/frame.zig");
 };
+const hpack = @import("hpack_decoder.zig");
 
 pub const Transport = transport.Transport;
 pub const TlsIo = transport.TlsIo;
@@ -462,6 +463,9 @@ pub const GrpcServer = struct {
         while (queue.pop()) |request| {
             const message = request.payload;
             defer self.allocator.free(message);
+            defer if (request.counts_active) {
+                _ = reader_ctx.active_streams.fetchSub(1, .release);
+            };
 
             const compression_alg = compression.Compression.Algorithm.none;
             const decompressed = try self.compression.decompress(message, compression_alg);
@@ -632,6 +636,9 @@ const PendingRequest = struct {
     /// Owned gRPC message bytes (gRPC 5-byte prefix already stripped).
     /// Freed by whoever takes the request off the queue.
     payload: []u8,
+    /// This entry releases one slot of the connection's active-stream count
+    /// (§5.1.2) once the handler is done with it.
+    counts_active: bool = false,
 
     fn method(self: *const PendingRequest) []const u8 {
         return self.method_buf[0..self.method_len];
@@ -718,6 +725,10 @@ const ConnReader = struct {
     /// Set by the handler thread to ask the reader to stop. The reader also
     /// stops on EOF/error, which is the usual path.
     shutdown: std.atomic.Value(bool) = .init(false),
+    /// Streams opened by the client that we have not finished answering;
+    /// bounded by SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2). Incremented by
+    /// the reader, decremented by whoever drops or answers the stream.
+    active_streams: std.atomic.Value(u32) = .init(0),
 };
 
 /// Reader-thread entry point. Runs `readFrames` and translates its exit
@@ -750,7 +761,7 @@ fn connectionReader(ctx: *ConnReader) void {
             .{},
         ),
         error.ProtocolError, error.HeaderBlockTooLarge => std.log.warn(
-            "closing connection: HTTP/2 protocol violation in header block",
+            "closing connection: HTTP/2 protocol violation",
             .{},
         ),
         else => fatal = err,
@@ -833,226 +844,506 @@ fn connectionReader(ctx: *ConnReader) void {
 /// 16 messages). A general-purpose peer that fragments a large request
 /// across streams would need per-stream assembly buffers keyed by
 /// `frame.stream_id`; the `pending` snapshot is the seam for that.
+/// Per-stream reader state for a stream the client has opened and not yet
+/// half-closed (RFC 7540 §5.1 "open"). A stream leaves the map when the
+/// client sends END_STREAM, resets it, or we answer it with a stream error.
+const OpenStream = struct {
+    /// Request metadata, snapshotted from the stream's HEADERS.
+    req: PendingRequest,
+    /// `content-length` request header, if present (§8.1.2.6).
+    content_length: ?u64 = null,
+    /// DATA payload bytes received so far (padding excluded).
+    data_len: u64 = 0,
+    /// `content-type` is application/grpc[+...]; only those DATA frames
+    /// are assembled into gRPC messages.
+    is_grpc: bool = false,
+    is_head: bool = false,
+    /// A gRPC message from this stream has been queued for dispatch.
+    dispatched: bool = false,
+};
+
+/// Reader-side connection/stream error. `code` is the HTTP/2 error code.
+const H2Fault = struct {
+    code: u32,
+    /// Connection error (GOAWAY + close) vs stream error (RST_STREAM).
+    connection: bool,
+};
+
+/// Result of checking a request header list against RFC 7540 §8.1.2.
+const RequestInfo = struct {
+    path: []const u8 = "",
+    authorization: []const u8 = "",
+    content_length: ?u64 = null,
+    is_grpc: bool = false,
+    is_head: bool = false,
+};
+
+/// RFC 7540 §8.1.2 checks for a request's header list. Any failure makes
+/// the request malformed, which is a stream error of type PROTOCOL_ERROR.
+fn validateRequestHeaders(fields: []const hpack.Field) error{Malformed}!RequestInfo {
+    var info: RequestInfo = .{};
+    var method: ?[]const u8 = null;
+    var scheme: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var authority_seen = false;
+    var regular_seen = false;
+    for (fields) |f| {
+        // §8.1.2: header field names MUST be lowercase.
+        for (f.name) |c| if (c >= 'A' and c <= 'Z') return error.Malformed;
+        if (f.name.len > 0 and f.name[0] == ':') {
+            // §8.1.2.1: pseudo-headers precede regular ones, are defined
+            // for requests, and appear at most once.
+            if (regular_seen) return error.Malformed;
+            const slot: *?[]const u8 = if (std.mem.eql(u8, f.name, ":method"))
+                &method
+            else if (std.mem.eql(u8, f.name, ":scheme"))
+                &scheme
+            else if (std.mem.eql(u8, f.name, ":path"))
+                &path
+            else if (std.mem.eql(u8, f.name, ":authority")) {
+                if (authority_seen) return error.Malformed;
+                authority_seen = true;
+                continue;
+            } else return error.Malformed;
+            if (slot.* != null) return error.Malformed;
+            slot.* = f.value;
+            continue;
+        }
+        regular_seen = true;
+        // §8.1.2.2: no connection-specific header fields; TE may only
+        // carry "trailers".
+        const connection_specific = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+        for (connection_specific) |name| if (std.mem.eql(u8, f.name, name)) return error.Malformed;
+        if (std.mem.eql(u8, f.name, "te") and !std.mem.eql(u8, f.value, "trailers")) return error.Malformed;
+        if (std.mem.eql(u8, f.name, "content-length")) {
+            info.content_length = std.fmt.parseInt(u64, f.value, 10) catch return error.Malformed;
+        } else if (std.mem.eql(u8, f.name, "content-type")) {
+            info.is_grpc = std.mem.startsWith(u8, f.value, "application/grpc");
+        } else if (std.mem.eql(u8, f.name, "authorization")) {
+            info.authorization = f.value;
+        }
+    }
+    // §8.1.2.3: :method, :scheme and a non-empty :path are mandatory
+    // (CONNECT is not supported by a gRPC server).
+    const m = method orelse return error.Malformed;
+    if (scheme == null) return error.Malformed;
+    const p = path orelse return error.Malformed;
+    if (p.len == 0) return error.Malformed;
+    info.path = p;
+    info.is_head = std.mem.eql(u8, m, "HEAD");
+    return info;
+}
+
+/// RFC 7540 §8.1: trailers carry no pseudo-header fields.
+fn validateTrailers(fields: []const hpack.Field) error{Malformed}!void {
+    for (fields) |f| {
+        if (f.name.len > 0 and f.name[0] == ':') return error.Malformed;
+        for (f.name) |c| if (c >= 'A' and c <= 'Z') return error.Malformed;
+    }
+}
+
+/// Strip §6.1/§6.2 padding (and, for HEADERS, the §6.2 priority block).
+/// Returns the remaining fragment, or a PROTOCOL_ERROR when the pad length
+/// does not fit the frame.
+fn stripPadding(payload: []const u8, flags: u8, has_priority: bool) error{ProtocolError}!struct { body: []const u8, priority: ?[5]u8 } {
+    const FF = http2.frame.FrameFlags;
+    var start: usize = 0;
+    var pad: usize = 0;
+    if (flags & FF.PADDED != 0) {
+        if (payload.len < 1) return error.ProtocolError;
+        pad = payload[0];
+        start = 1;
+    }
+    var priority: ?[5]u8 = null;
+    if (has_priority) {
+        if (payload.len < start + 5) return error.ProtocolError;
+        priority = payload[start..][0..5].*;
+        start += 5;
+    }
+    if (pad > payload.len - start) return error.ProtocolError;
+    return .{ .body = payload[start .. payload.len - pad], .priority = priority };
+}
+
+fn priorityDependency(p: [5]u8) u31 {
+    return @intCast(std.mem.readInt(u32, p[0..4], .big) & 0x7FFF_FFFF);
+}
+
+/// The connection's inbound frame loop. This is the ONLY caller of
+/// `Transport.readFrame` for a server connection, and it keeps running
+/// while handlers write — that is the whole point of SONNY-1560.
+///
+/// It enforces the RFC 7540 frame, stream-state and request rules (the
+/// h2spec gate in CI): connection errors send GOAWAY and close the
+/// connection, stream errors send RST_STREAM and keep it alive. Requests
+/// that end without a gRPC message are still answered (415 for non-gRPC
+/// requests, INTERNAL for an empty gRPC call) instead of hanging.
+///
+/// HAZARD — the reader can be stalled by a peer that stops reading TCP
+/// (SONNY-1568, minor): the control-frame writes this loop makes (SETTINGS
+/// and PING ACKs, receive-window refills, RST_STREAM/GOAWAY, the
+/// queue-overflow trailer) take `Transport.write_mutex`. If a handler is
+/// at that moment inside `ioWriteLocked` on a socket whose send buffer the
+/// peer has stopped draining, the reader blocks on the mutex until TCP
+/// gives up (retransmit timeout or `SO_KEEPALIVE`). WINDOW_UPDATE
+/// processing needs only `flow_mutex`, so credit keeps flowing. A bounded
+/// socket write deadline or a dedicated writer thread would remove the
+/// wedge; both are larger changes.
+///
+/// INVARIANT — cross-stream DATA accumulation: `grpc_buf` is a SINGLE
+/// assembly buffer for the whole connection, inherited from
+/// `Transport.readMessageCore`. Interleaving gRPC DATA from two streams
+/// would splice their payloads. This repo's clients (`ClientMux`,
+/// `Transport.writeRequestOnStream`) write a request's HEADERS and DATA
+/// under one `write_mutex` acquisition, so that cannot happen with them;
+/// `loopback-test` scenario 6 covers the concurrent case.
 fn readFrames(ctx: *ConnReader) !void {
+    const self = ctx.server;
+    const trans = ctx.trans;
+    const allocator = self.allocator;
+
+    var grpc_buf: std.ArrayList(u8) = .empty;
+    defer grpc_buf.deinit(allocator);
+
+    var decoder = hpack.Decoder.init(allocator);
+    defer decoder.deinit();
+
+    var open = std.AutoHashMap(u31, OpenStream).init(allocator);
+    defer open.deinit();
+
+    // 415 answers whose body is waiting for send-window credit: stream id ->
+    // bytes of `UNSUPPORTED_MEDIA_TYPE_BODY` already sent. Flushed by the
+    // reader whenever credit arrives, so it never parks on flow control.
+    var pending_bodies = std.AutoHashMap(u31, usize).init(allocator);
+    defer pending_bodies.deinit();
+    var state: ReaderState = .{ .open = &open, .pending_bodies = &pending_bodies };
+
+    // SONNY-1838: highest client-initiated stream id this connection has ever
+    // opened. Client stream ids increase monotonically (§5.1.1), so an id
+    // above this is "idle" and an id at or below it that is not in `open`
+    // is closed (or half-closed remote).
+    var max_opened_sid: u31 = 0;
+
+    while (!ctx.shutdown.load(.acquire)) {
+        const frame = try trans.readFrame();
+        defer allocator.free(frame.payload);
+        const fault = try handleFrame(ctx, frame, &grpc_buf, &decoder, &state, &max_opened_sid);
+        if (fault) |f| {
+            if (f.connection) {
+                std.log.warn("HTTP/2 connection error 0x{x} on frame type {d} stream {d}", .{ f.code, frame.frame_type, frame.stream_id });
+                trans.emitGoaway(f.code);
+                return transport.TransportError.ProtocolError;
+            }
+            // Stream error: reset the stream, forget it, keep the connection.
+            trans.writeRstStream(frame.stream_id, f.code);
+            trans.markStreamReset(frame.stream_id);
+            if (open.fetchRemove(frame.stream_id)) |kv| {
+                if (!kv.value.dispatched) _ = ctx.active_streams.fetchSub(1, .release);
+            }
+        }
+    }
+}
+
+const ReaderState = struct {
+    open: *std.AutoHashMap(u31, OpenStream),
+    pending_bodies: *std.AutoHashMap(u31, usize),
+};
+
+fn connFault(code: u32) ?H2Fault {
+    return .{ .code = code, .connection = true };
+}
+
+fn streamFault(code: u32) ?H2Fault {
+    return .{ .code = code, .connection = false };
+}
+
+/// Handle one inbound frame. Returns a fault for the caller to act on, or
+/// null when the frame was processed. `frame.payload` is freed by the
+/// caller.
+fn handleFrame(
+    ctx: *ConnReader,
+    frame: transport.Transport.RawFrame,
+    grpc_buf: *std.ArrayList(u8),
+    decoder: *hpack.Decoder,
+    state: *ReaderState,
+    max_opened_sid: *u31,
+) !?H2Fault {
+    const open = state.open;
     const self = ctx.server;
     const trans = ctx.trans;
     const allocator = self.allocator;
     const FT = http2.frame.FrameType;
     const FF = http2.frame.FrameFlags;
+    const payload = frame.payload;
+    const sid = frame.stream_id;
 
-    // Inbound gRPC message assembly buffer. As in `readMessageCore`, DATA
-    // from any stream is accumulated and anything past the completed
-    // message is discarded.
-    var grpc_buf: std.ArrayList(u8) = .empty;
-    defer grpc_buf.deinit(allocator);
+    switch (frame.frame_type) {
+        @intFromEnum(FT.DATA) => {
+            if (sid == 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // SONNY-1838 / §5.1: DATA on a stream the peer already reset.
+            if (trans.isStreamReset(sid)) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            if (sid > max_opened_sid.*) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            const stripped = stripPadding(payload, frame.flags, false) catch
+                return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // Flow control counts the whole frame, padding included (§6.9.1).
+            trans.maybeRefillRecvWindow(sid, @intCast(payload.len));
+            const st = open.getPtr(sid) orelse return connFault(transport.HTTP2_ERROR_STREAM_CLOSED);
+            const data = stripped.body;
+            st.data_len += data.len;
 
-    // Most recent request HEADERS seen, snapshotted for the next completed
-    // message (the server learns the stream id and `:path` from HEADERS).
-    var pending: PendingRequest = .{ .stream_id = trans.last_stream_id, .payload = undefined };
-
-    // SONNY-1838: highest client-initiated stream id this connection has ever
-    // opened (seen in a HEADERS frame). Client stream ids are monotonically
-    // increasing (§5.1.1), so a stream id ABOVE this has never been opened and
-    // is "idle" — an RST_STREAM for it is a §5.1/§6.4.1 connection error, not a
-    // stream-scoped reset. A reset for an id at or below it (open or already
-    // closed) is a valid stream reset.
-    var max_opened_sid: u31 = 0;
-
-    while (!ctx.shutdown.load(.acquire)) {
-        const frame = try trans.readFrame();
-        const payload = frame.payload;
-
-        switch (frame.frame_type) {
-            @intFromEnum(FT.DATA) => {
-                // SONNY-1838 / §5.1: a DATA frame for a stream the peer already
-                // reset (RST_STREAM) arrives on a CLOSED stream — a connection
-                // error of type STREAM_CLOSED. Pre-SONNY-1838 the RST tore the
-                // connection down, so this was covered for free; now that a
-                // valid RST keeps the connection alive we must reject the
-                // stray frame explicitly. (Legitimate peers stop sending after
-                // an RST; this only fires for a misbehaving/adversarial peer.)
-                if (trans.isStreamReset(frame.stream_id)) {
-                    allocator.free(payload);
-                    trans.emitGoawayProtocolError();
-                    return transport.TransportError.ProtocolError;
-                }
-                const data_len: u32 = @intCast(payload.len);
-                grpc_buf.appendSlice(allocator, payload) catch {
-                    allocator.free(payload);
-                    return error.OutOfMemory;
-                };
-                allocator.free(payload);
-                // Refill receive windows now that the bytes have been
-                // consumed (NW-2).
-                trans.maybeRefillRecvWindow(frame.stream_id, data_len);
-
+            if (st.is_grpc and data.len > 0) {
+                try grpc_buf.appendSlice(allocator, data);
                 // NEW-1 (#43): bound the assembly buffer BEFORE parsing.
                 transport.Transport.checkRecvBufferSize(grpc_buf.items.len, trans.max_recv_message_bytes) catch |err| {
-                    trans.writeRstStream(frame.stream_id, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
+                    trans.writeRstStream(sid, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
                     return err;
                 };
-
-                if (grpc_buf.items.len < 5) continue;
-                const prefix = transport.decodeGrpcPrefix(grpc_buf.items) catch
-                    return transport.TransportError.Http2Error;
-                const msg_len = prefix.msg_len;
-                transport.Transport.checkRecvMessageSize(msg_len, trans.max_recv_message_bytes) catch |err| {
-                    trans.writeRstStream(frame.stream_id, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
-                    return err;
-                };
-                const need: usize = 5 + @as(usize, msg_len);
-                if (grpc_buf.items.len < need) continue;
-
-                const message = try allocator.alloc(u8, msg_len);
-                @memcpy(message, grpc_buf.items[5..need]);
-                grpc_buf.clearRetainingCapacity();
-
-                var request = pending;
-                request.payload = message;
-                if (!ctx.queue.push(request)) {
-                    // Queue full (or already closed): refuse this stream
-                    // rather than blocking the reader — see
-                    // MAX_PENDING_REQUESTS.
-                    std.log.warn(
-                        "connection request queue full ({d}); refusing stream {d}",
-                        .{ MAX_PENDING_REQUESTS, request.stream_id },
-                    );
-                    trans.endStreamWithStatus(
-                        request.stream_id,
-                        GRPC_STATUS_RESOURCE_EXHAUSTED,
-                        "server request queue full",
-                    ) catch {};
-                    allocator.free(message);
-                }
-                continue;
-            },
-            @intFromEnum(FT.HEADERS) => {
-                // SONNY-1838 / §5.1: HEADERS for a stream the peer already
-                // reset is a STREAM_CLOSED connection error (same rationale as
-                // the DATA case above).
-                if (trans.isStreamReset(frame.stream_id)) {
-                    allocator.free(payload);
-                    trans.emitGoawayProtocolError();
-                    return transport.TransportError.ProtocolError;
-                }
-                const end_headers = (frame.flags & FF.END_HEADERS) != 0;
-                if (end_headers) {
-                    trans.extractPathFromHpack(payload);
-                    allocator.free(payload);
-                } else {
-                    // I5 (#48): reassemble CONTINUATION fragments.
-                    const block = trans.collectContinuations(frame.stream_id, payload) catch |err| {
-                        allocator.free(payload);
+                if (grpc_buf.items.len >= 5) {
+                    const prefix = transport.decodeGrpcPrefix(grpc_buf.items) catch
+                        return transport.TransportError.Http2Error;
+                    const msg_len = prefix.msg_len;
+                    transport.Transport.checkRecvMessageSize(msg_len, trans.max_recv_message_bytes) catch |err| {
+                        trans.writeRstStream(sid, transport.HTTP2_ERROR_FLOW_CONTROL_ERROR);
                         return err;
                     };
-                    allocator.free(payload);
-                    trans.extractPathFromHpack(block);
-                    allocator.free(block);
+                    const need: usize = 5 + @as(usize, msg_len);
+                    if (grpc_buf.items.len >= need) {
+                        const message = try allocator.alloc(u8, msg_len);
+                        @memcpy(message, grpc_buf.items[5..need]);
+                        grpc_buf.clearRetainingCapacity();
+                        var request = st.req;
+                        request.payload = message;
+                        request.counts_active = !st.dispatched;
+                        st.dispatched = true;
+                        enqueue(ctx, request);
+                    }
                 }
-                // Snapshot the per-request metadata for the message that
-                // this HEADERS frame opens.
-                pending.stream_id = frame.stream_id;
-                // SONNY-1838: track the highest opened stream id for idle-RST
-                // detection below.
-                if (frame.stream_id > max_opened_sid) max_opened_sid = frame.stream_id;
-                const m = trans.lastMethod();
-                pending.method_len = @min(m.len, pending.method_buf.len);
-                @memcpy(pending.method_buf[0..pending.method_len], m[0..pending.method_len]);
-                const a = trans.lastAuthorization();
-                pending.auth_len = @min(a.len, pending.auth_buf.len);
-                @memcpy(pending.auth_buf[0..pending.auth_len], a[0..pending.auth_len]);
-                continue;
-            },
-            @intFromEnum(FT.SETTINGS) => {
-                const is_ack = (frame.flags & 0x1) != 0;
-                if (!is_ack) {
-                    // Apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE and
-                    // SETTINGS_INITIAL_WINDOW_SIZE) before ACKing.
-                    trans.applyPeerSettings(payload);
-                    allocator.free(payload);
-                    try trans.writeFrame(.SETTINGS, 0x1, 0, &.{});
-                } else {
-                    allocator.free(payload);
-                }
-                continue;
-            },
-            @intFromEnum(FT.WINDOW_UPDATE) => {
-                // THE fix (SONNY-1560): this now runs even while a handler
-                // is parked in `reserveSendCredit` writing a response.
-                trans.processWindowUpdate(frame.stream_id, payload);
-                allocator.free(payload);
-                continue;
-            },
-            @intFromEnum(FT.PING) => {
-                const is_ack = (frame.flags & 0x1) != 0;
-                if (!is_ack) {
-                    var ping_data: [8]u8 = .{0} ** 8;
-                    const copy_len = @min(payload.len, 8);
-                    @memcpy(ping_data[0..copy_len], payload[0..copy_len]);
-                    allocator.free(payload);
-                    try trans.writeFrame(.PING, 0x1, 0, ping_data[0..copy_len]);
-                } else {
-                    allocator.free(payload);
-                }
-                continue;
-            },
-            @intFromEnum(FT.GOAWAY) => {
-                // GOAWAY tears the whole connection down (the peer is done
-                // with it): exit the reader, which trips `markPeerGone` and
-                // releases every parked writer with `error.PeerGone`.
-                allocator.free(payload);
-                return transport.TransportError.ConnectionClosed;
-            },
-            @intFromEnum(FT.RST_STREAM) => {
-                // SONNY-1838 / HTTP/2 §5.4.2: a WELL-FORMED RST_STREAM
-                // terminates ONE stream, not the connection — flag that stream
-                // reset (releasing any handler parked on its send credit with
-                // the stream-scoped `error.StreamReset`, and letting the
-                // dispatch loop skip it if still queued) and KEEP READING so
-                // sibling RPCs survive. But a MALFORMED RST_STREAM is a
-                // CONNECTION error per §6.4/§6.4.1, exactly as the pre-SONNY-1838
-                // code (all-RST → teardown) satisfied in the h2spec gate; we
-                // must reproduce that for the malformed cases only:
-                //   * stream id 0x0          -> PROTOCOL_ERROR   (§6.4)
-                //   * length other than 4    -> FRAME_SIZE_ERROR (§6.4)
-                //   * idle (never-opened) id -> PROTOCOL_ERROR   (§5.1/§6.4.1)
-                // Each emits the matching GOAWAY and tears the connection down.
-                if (frame.stream_id == 0) {
-                    allocator.free(payload);
-                    trans.emitGoawayProtocolError();
-                    return transport.TransportError.ProtocolError;
-                }
-                if (payload.len != 4) {
-                    allocator.free(payload);
-                    trans.emitGoawayFrameSizeError();
-                    return transport.TransportError.ConnectionClosed;
-                }
-                if (frame.stream_id > max_opened_sid) {
-                    // Idle stream: never opened on this connection.
-                    allocator.free(payload);
-                    trans.emitGoawayProtocolError();
-                    return transport.TransportError.ProtocolError;
-                }
-                // Valid, non-zero, length-4 RST on a previously-opened stream:
-                // the SONNY-1838 stream-scoped reset. Reserving
-                // `ConnectionClosed`/`markPeerGone` for GOAWAY and real
-                // connection loss is the whole point of this fix.
-                trans.markStreamReset(frame.stream_id);
-                allocator.free(payload);
-                continue;
-            },
-            @intFromEnum(FT.CONTINUATION) => {
-                // §6.10: a CONTINUATION with no preceding open header block
-                // is a connection error (PROTOCOL_ERROR).
-                allocator.free(payload);
-                trans.emitGoawayProtocolError();
-                return transport.TransportError.ProtocolError;
-            },
-            else => {
-                // Unknown frame type — skip
-                allocator.free(payload);
-                continue;
-            },
+            }
+            if (frame.flags & FF.END_STREAM != 0) return finishStream(ctx, state, sid);
+            return null;
+        },
+        @intFromEnum(FT.HEADERS) => {
+            if (sid == 0 or sid % 2 == 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // SONNY-1838 / §5.1: HEADERS on a stream the peer already reset.
+            if (trans.isStreamReset(sid)) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            const stripped = stripPadding(payload, frame.flags, frame.flags & FF.PRIORITY != 0) catch
+                return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+
+            // Assemble the complete header block (I5 / #48).
+            var owned_block: ?[]u8 = null;
+            defer if (owned_block) |b| allocator.free(b);
+            const block: []const u8 = if (frame.flags & FF.END_HEADERS != 0)
+                stripped.body
+            else blk: {
+                owned_block = try trans.collectContinuations(sid, stripped.body);
+                break :blk owned_block.?;
+            };
+
+            // Decode it even if the stream turns out to be in error, so the
+            // HPACK dynamic table stays in sync (RFC 7540 §4.3).
+            var arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer arena_state.deinit();
+            var fields: std.ArrayList(hpack.Field) = .empty;
+            decoder.decode(block, arena_state.allocator(), &fields) catch |err| switch (err) {
+                error.CompressionError => return connFault(transport.HTTP2_ERROR_COMPRESSION_ERROR),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            const end_stream = frame.flags & FF.END_STREAM != 0;
+
+            if (open.getPtr(sid)) |_| {
+                // A second HEADERS on an open stream is the trailer block: it
+                // must end the stream and carry no pseudo-headers (§8.1).
+                if (!end_stream) return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+                validateTrailers(fields.items) catch return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+                return finishStream(ctx, state, sid);
+            }
+            if (sid <= max_opened_sid.*) {
+                // Half-closed (remote) or closed stream, or an id lower than
+                // one already used (§5.1, §5.1.1).
+                return connFault(transport.HTTP2_ERROR_STREAM_CLOSED);
+            }
+
+            // A new stream.
+            max_opened_sid.* = sid;
+            if (stripped.priority) |p| {
+                if (priorityDependency(p) == sid) return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            }
+            const info = validateRequestHeaders(fields.items) catch
+                return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // §5.1.2: enforce the SETTINGS_MAX_CONCURRENT_STREAMS we advertise.
+            if (ctx.active_streams.load(.acquire) >= transport.ADVERTISED_MAX_CONCURRENT_STREAMS)
+                return streamFault(transport.HTTP2_ERROR_REFUSED_STREAM);
+
+            var st: OpenStream = .{
+                .req = .{ .stream_id = sid, .payload = &.{} },
+                .content_length = info.content_length,
+                .is_grpc = info.is_grpc,
+                .is_head = info.is_head,
+            };
+            st.req.method_len = @min(info.path.len, st.req.method_buf.len);
+            @memcpy(st.req.method_buf[0..st.req.method_len], info.path[0..st.req.method_len]);
+            st.req.auth_len = @min(info.authorization.len, st.req.auth_buf.len);
+            @memcpy(st.req.auth_buf[0..st.req.auth_len], info.authorization[0..st.req.auth_len]);
+            try open.put(sid, st);
+            _ = ctx.active_streams.fetchAdd(1, .acq_rel);
+            // A fresh gRPC request starts a fresh message.
+            if (info.is_grpc) grpc_buf.clearRetainingCapacity();
+            if (end_stream) return finishStream(ctx, state, sid);
+            return null;
+        },
+        @intFromEnum(FT.PRIORITY) => {
+            if (sid == 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            if (payload.len != 5) return streamFault(transport.HTTP2_ERROR_FRAME_SIZE_ERROR);
+            if (priorityDependency(payload[0..5].*) == sid) return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // We do not prioritise; PRIORITY never opens a stream (§5.1).
+            return null;
+        },
+        @intFromEnum(FT.SETTINGS) => {
+            if (sid != 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            if (frame.flags & 0x1 != 0) {
+                if (payload.len != 0) return connFault(transport.HTTP2_ERROR_FRAME_SIZE_ERROR);
+                return null;
+            }
+            trans.applyPeerSettingsChecked(payload) catch |err| return connFault(switch (err) {
+                error.ProtocolError => transport.HTTP2_ERROR_PROTOCOL_ERROR,
+                error.FlowControlError => transport.HTTP2_ERROR_FLOW_CONTROL_ERROR,
+                error.FrameSizeError => transport.HTTP2_ERROR_FRAME_SIZE_ERROR,
+            });
+            try trans.writeFrame(.SETTINGS, 0x1, 0, &.{});
+            flushPendingBodies(ctx, state);
+            return null;
+        },
+        @intFromEnum(FT.WINDOW_UPDATE) => {
+            if (payload.len != 4) return connFault(transport.HTTP2_ERROR_FRAME_SIZE_ERROR);
+            if (sid > max_opened_sid.*) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // THE fix (SONNY-1560): this runs even while a handler is parked
+            // in `reserveSendCredit` writing a response.
+            trans.processWindowUpdateChecked(sid, payload) catch |err| {
+                const code = switch (err) {
+                    error.ProtocolError => transport.HTTP2_ERROR_PROTOCOL_ERROR,
+                    error.FlowControlError => transport.HTTP2_ERROR_FLOW_CONTROL_ERROR,
+                };
+                return if (sid == 0) connFault(code) else streamFault(code);
+            };
+            flushPendingBodies(ctx, state);
+            return null;
+        },
+        @intFromEnum(FT.PING) => {
+            if (sid != 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            if (payload.len != 8) return connFault(transport.HTTP2_ERROR_FRAME_SIZE_ERROR);
+            if (frame.flags & 0x1 == 0) try trans.writeFrame(.PING, 0x1, 0, payload);
+            return null;
+        },
+        @intFromEnum(FT.GOAWAY) => {
+            if (sid != 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // GOAWAY tears the whole connection down (the peer is done
+            // with it): exit the reader, which trips `markPeerGone` and
+            // releases every parked writer with `error.PeerGone`.
+            return transport.TransportError.ConnectionClosed;
+        },
+        @intFromEnum(FT.RST_STREAM) => {
+            // SONNY-1838 / §5.4.2: a well-formed RST_STREAM ends ONE stream;
+            // a malformed one is a connection error (§6.4):
+            //   * stream id 0x0          -> PROTOCOL_ERROR
+            //   * length other than 4    -> FRAME_SIZE_ERROR
+            //   * idle (never-opened) id -> PROTOCOL_ERROR (§5.1)
+            if (sid == 0) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            if (payload.len != 4) return connFault(transport.HTTP2_ERROR_FRAME_SIZE_ERROR);
+            if (sid > max_opened_sid.*) return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+            // Flag the stream so a handler parked on its send credit unwinds
+            // with `error.StreamReset` and a still-queued RPC is skipped.
+            trans.markStreamReset(sid);
+            if (open.fetchRemove(sid)) |kv| {
+                if (!kv.value.dispatched) _ = ctx.active_streams.fetchSub(1, .release);
+            }
+            if (state.pending_bodies.remove(sid)) _ = ctx.active_streams.fetchSub(1, .release);
+            return null;
+        },
+        @intFromEnum(FT.PUSH_PROMISE) => {
+            // §8.2: clients cannot push.
+            return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+        },
+        @intFromEnum(FT.CONTINUATION) => {
+            // §6.10: a CONTINUATION with no preceding open header block.
+            return connFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+        },
+        else => return null, // Unknown frame types are ignored (§4.1).
+    }
+}
+
+/// The client half-closed `sid` (END_STREAM). Check content-length, make
+/// sure the request gets an answer, and drop the stream from `open`.
+fn finishStream(ctx: *ConnReader, state: *ReaderState, sid: u31) !?H2Fault {
+    const st = state.open.getPtr(sid) orelse return null;
+    // §8.1.2.6: DATA length must match a declared content-length.
+    if (st.content_length) |cl| {
+        if (cl != st.data_len) return streamFault(transport.HTTP2_ERROR_PROTOCOL_ERROR);
+    }
+    const done = state.open.fetchRemove(sid).?.value;
+    if (done.dispatched) return null;
+
+    // The request ended without a complete gRPC message. Every request
+    // gets a response (§8.1), so answer it here; none of these writes waits
+    // for flow-control credit, so the reader stays responsive.
+    if (done.is_grpc) {
+        ctx.trans.endStreamWithStatus(sid, 13, "request ended without a message") catch {};
+    } else if (done.is_head) {
+        ctx.trans.writeUnsupportedMediaTypeHeaders(sid, true) catch {};
+    } else {
+        ctx.trans.writeUnsupportedMediaTypeHeaders(sid, false) catch {};
+        try state.pending_bodies.put(sid, 0);
+        flushPendingBodies(ctx, state);
+        return null;
+    }
+    _ = ctx.active_streams.fetchSub(1, .release);
+    return null;
+}
+
+/// Send as much of each pending 415 body as the send windows allow.
+fn flushPendingBodies(ctx: *ConnReader, state: *ReaderState) void {
+    const body = transport.Transport.UNSUPPORTED_MEDIA_TYPE_BODY;
+    var finished: [16]u31 = undefined;
+    var n_finished: usize = 0;
+    var it = state.pending_bodies.iterator();
+    while (it.next()) |entry| {
+        const sid = entry.key_ptr.*;
+        var offset = entry.value_ptr.*;
+        while (offset < body.len) {
+            const want: u32 = @intCast(@min(body.len - offset, ctx.trans.peer_max_frame_size));
+            const grant = ctx.trans.tryReserveSendCredit(sid, want);
+            if (grant == 0) break;
+            const end = offset + grant;
+            const flags: u8 = if (end == body.len) http2.frame.FrameFlags.END_STREAM else 0;
+            ctx.trans.writeFrame(.DATA, flags, sid, body[offset..end]) catch {
+                offset = body.len;
+                break;
+            };
+            offset = end;
+        }
+        entry.value_ptr.* = offset;
+        if (offset >= body.len and n_finished < finished.len) {
+            finished[n_finished] = sid;
+            n_finished += 1;
         }
     }
+    for (finished[0..n_finished]) |sid| {
+        _ = state.pending_bodies.remove(sid);
+        _ = ctx.active_streams.fetchSub(1, .release);
+    }
+}
+
+/// Hand a request to the handler thread. Never blocks: when the queue is
+/// full the stream is refused with RESOURCE_EXHAUSTED (MAX_PENDING_REQUESTS).
+fn enqueue(ctx: *ConnReader, request: PendingRequest) void {
+    if (ctx.queue.push(request)) return;
+    std.log.warn(
+        "connection request queue full ({d}); refusing stream {d}",
+        .{ MAX_PENDING_REQUESTS, request.stream_id },
+    );
+    ctx.trans.endStreamWithStatus(
+        request.stream_id,
+        GRPC_STATUS_RESOURCE_EXHAUSTED,
+        "server request queue full",
+    ) catch {};
+    ctx.server.allocator.free(request.payload);
+    if (request.counts_active) _ = ctx.active_streams.fetchSub(1, .release);
 }

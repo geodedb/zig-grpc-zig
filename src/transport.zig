@@ -76,6 +76,9 @@ pub const HTTP2_ERROR_NO_ERROR: u32 = 0x00;
 pub const HTTP2_ERROR_PROTOCOL_ERROR: u32 = 0x01;
 pub const HTTP2_ERROR_FRAME_SIZE_ERROR: u32 = 0x06;
 pub const HTTP2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x03;
+pub const HTTP2_ERROR_STREAM_CLOSED: u32 = 0x05;
+pub const HTTP2_ERROR_REFUSED_STREAM: u32 = 0x07;
+pub const HTTP2_ERROR_COMPRESSION_ERROR: u32 = 0x09;
 
 /// RFC 7540 §6.9.2 default initial window size for both connection and
 /// new streams. Until the peer sends SETTINGS we assume this value.
@@ -92,6 +95,10 @@ pub const ADVERTISED_INITIAL_WINDOW_SIZE: i32 = 1024 * 1024;
 /// no real gRPC client opens >1024 concurrent streams on one TCP
 /// connection.
 pub const MAX_TRACKED_STREAMS: usize = 1024;
+
+/// SETTINGS_MAX_CONCURRENT_STREAMS we advertise (and the server enforces,
+/// RFC 7540 §5.1.2).
+pub const ADVERTISED_MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// Build the HPACK-encoded HEADERS payload for a CLIENT request. The
 /// caller owns the returned slice and must free it with `allocator`.
@@ -910,7 +917,7 @@ pub const Transport = struct {
         const entries = [_]struct { id: u16, value: u32 }{
             .{ .id = SETTINGS_INITIAL_WINDOW_SIZE, .value = @intCast(ADVERTISED_INITIAL_WINDOW_SIZE) },
             .{ .id = SETTINGS_MAX_FRAME_SIZE, .value = DEFAULT_MAX_FRAME_SIZE },
-            .{ .id = SETTINGS_MAX_CONCURRENT_STREAMS, .value = 100 },
+            .{ .id = SETTINGS_MAX_CONCURRENT_STREAMS, .value = ADVERTISED_MAX_CONCURRENT_STREAMS },
             .{ .id = SETTINGS_MAX_HEADER_LIST_SIZE, .value = 8192 },
         };
         var bytes = try allocator.alloc(u8, entries.len * 6);
@@ -1014,6 +1021,30 @@ pub const Transport = struct {
             applyWindowUpdate(&self.stream_send_windows[idx], increment) catch return;
         }
         // Wake any writers blocked on send credit.
+        self.wakeFlowWaiters();
+    }
+
+    /// Strict §6.9 variant of `processWindowUpdate` for the server reader:
+    /// the caller has already checked the 4-byte length. A zero increment
+    /// is `error.ProtocolError` and a window pushed past 2^31-1 is
+    /// `error.FlowControlError`; the caller decides whether that is a
+    /// stream or a connection error from `stream_id`.
+    pub fn processWindowUpdateChecked(self: *Transport, stream_id: u31, payload: []const u8) error{ ProtocolError, FlowControlError }!void {
+        std.debug.assert(payload.len == 4);
+        const increment: u32 = ((@as(u32, payload[0]) & 0x7F) << 24) |
+            (@as(u32, payload[1]) << 16) |
+            (@as(u32, payload[2]) << 8) |
+            @as(u32, payload[3]);
+        if (increment == 0) return error.ProtocolError;
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        if (stream_id == 0) {
+            try applyWindowUpdate(&self.conn_send_window, increment);
+        } else {
+            const idx: usize = @intCast(stream_id);
+            if (idx >= self.stream_send_windows.len) return;
+            try applyWindowUpdate(&self.stream_send_windows[idx], increment);
+        }
         self.wakeFlowWaiters();
     }
 
@@ -1149,6 +1180,7 @@ pub const Transport = struct {
     /// is `0` the wait is unbounded (legacy behaviour).
     pub fn reserveSendCredit(self: *Transport, stream_id: u31, n: u32) error{ FlowControlTimeout, PeerGone, StreamReset }!void {
         if (n == 0) return;
+
         const idx: ?usize = blk: {
             if (stream_id == 0) break :blk null;
             const i: usize = @intCast(stream_id);
@@ -1286,6 +1318,14 @@ pub const Transport = struct {
         _ = self.ioWrite(bytes) catch {};
     }
 
+    /// Send a GOAWAY carrying `error_code`. Best-effort (see
+    /// emitGoawayFrameSizeError).
+    pub fn emitGoaway(self: *Transport, error_code: u32) void {
+        const bytes = buildGoawayFrame(self.allocator, self.last_stream_id, error_code) catch return;
+        defer self.allocator.free(bytes);
+        _ = self.ioWrite(bytes) catch {};
+    }
+
     /// Send a GOAWAY with PROTOCOL_ERROR. Best-effort (see
     /// emitGoawayFrameSizeError).
     pub fn emitGoawayProtocolError(self: *Transport) void {
@@ -1353,6 +1393,41 @@ pub const Transport = struct {
                 else => {},
             }
         }
+    }
+
+    /// Validate a peer SETTINGS payload (RFC 7540 §6.5) and apply it.
+    /// Nothing is applied when any entry is invalid:
+    ///   * length not a multiple of 6            -> FrameSizeError
+    ///   * ENABLE_PUSH other than 0 or 1         -> ProtocolError
+    ///   * INITIAL_WINDOW_SIZE above 2^31-1      -> FlowControlError
+    ///   * MAX_FRAME_SIZE outside [2^14, 2^24-1] -> ProtocolError
+    ///   * a stream window pushed past 2^31-1    -> FlowControlError (§6.9.2)
+    pub fn applyPeerSettingsChecked(self: *Transport, payload: []const u8) error{ ProtocolError, FlowControlError, FrameSizeError }!void {
+        if (payload.len % 6 != 0) return error.FrameSizeError;
+        var final_initial: i64 = self.peer_initial_window_size;
+        var i: usize = 0;
+        while (i + 6 <= payload.len) : (i += 6) {
+            const id: u16 = (@as(u16, payload[i]) << 8) | @as(u16, payload[i + 1]);
+            const value: u32 = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
+            switch (id) {
+                SETTINGS_ENABLE_PUSH => if (value > 1) return error.ProtocolError,
+                SETTINGS_INITIAL_WINDOW_SIZE => {
+                    if (value > @as(u32, std.math.maxInt(i32))) return error.FlowControlError;
+                    final_initial = value;
+                },
+                SETTINGS_MAX_FRAME_SIZE => if (value < DEFAULT_MAX_FRAME_SIZE or value > 0xFFFFFF) return error.ProtocolError,
+                else => {},
+            }
+        }
+        if (final_initial != self.peer_initial_window_size) {
+            const delta: i64 = final_initial - @as(i64, self.peer_initial_window_size);
+            self.flow_mutex.lockUncancelable(self.io);
+            defer self.flow_mutex.unlock(self.io);
+            for (self.stream_send_windows) |sw| {
+                if (@as(i64, sw) + delta > std.math.maxInt(i32)) return error.FlowControlError;
+            }
+        }
+        self.applyPeerSettings(payload);
     }
 
     /// Read a single HTTP/2 frame header and payload. Public so a
@@ -1459,7 +1534,11 @@ pub const Transport = struct {
         try self.readExact(&preface_buf);
 
         // Validate preface
+        // RFC 7540 §3.5: an invalid preface is a connection error of type
+        // PROTOCOL_ERROR. Say so with a GOAWAY before closing, rather than
+        // just dropping the socket (which the peer sees as a reset).
         if (!std.mem.eql(u8, &preface_buf, HTTP2_PREFACE)) {
+            self.emitGoaway(HTTP2_ERROR_PROTOCOL_ERROR);
             return TransportError.Http2Error;
         }
 
@@ -1467,13 +1546,23 @@ pub const Transport = struct {
         const frame = try self.readFrame();
         defer self.allocator.free(frame.payload);
 
-        if (frame.frame_type != @intFromEnum(http2.frame.FrameType.SETTINGS)) {
+        if (frame.frame_type != @intFromEnum(http2.frame.FrameType.SETTINGS) or
+            (frame.flags & 0x1) != 0 or frame.stream_id != 0)
+        {
+            self.emitGoaway(HTTP2_ERROR_PROTOCOL_ERROR);
             return TransportError.Http2Error;
         }
 
-        // Apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE) so subsequent
-        // readFrame() calls honour the negotiated cap.
-        self.applyPeerSettings(frame.payload);
+        // Validate and apply peer settings (e.g. SETTINGS_MAX_FRAME_SIZE) so
+        // subsequent readFrame() calls honour the negotiated cap.
+        self.applyPeerSettingsChecked(frame.payload) catch |err| {
+            self.emitGoaway(switch (err) {
+                error.ProtocolError => HTTP2_ERROR_PROTOCOL_ERROR,
+                error.FlowControlError => HTTP2_ERROR_FLOW_CONTROL_ERROR,
+                error.FrameSizeError => HTTP2_ERROR_FRAME_SIZE_ERROR,
+            });
+            return TransportError.Http2Error;
+        };
 
         // Send server's SETTINGS frame advertising our non-default values
         // (INITIAL_WINDOW_SIZE = 1 MiB, MAX_FRAME_SIZE = 16384, etc.) —
@@ -2457,6 +2546,44 @@ pub const Transport = struct {
             stream_id,
             payload,
         );
+    }
+
+    /// Body of the `415 Unsupported Media Type` answer to a non-gRPC request.
+    pub const UNSUPPORTED_MEDIA_TYPE_BODY = "grpc: this endpoint only serves application/grpc requests\n";
+
+    /// HEADERS of the `415 Unsupported Media Type` answer the gRPC-over-HTTP/2
+    /// spec asks for when a request's content-type is not application/grpc.
+    /// The body (`UNSUPPORTED_MEDIA_TYPE_BODY`) follows in DATA frames unless
+    /// `end_stream` is set (a HEAD request).
+    pub fn writeUnsupportedMediaTypeHeaders(self: *Transport, stream_id: u31, end_stream: bool) !void {
+        if (self.isPeerGone()) return;
+        // :status 415 (literal without indexing, indexed name 8) and
+        // content-type text/plain (literal without indexing, indexed name 31).
+        const headers = [_]u8{ 0x08, 0x03 } ++ "415".* ++ [_]u8{ 0x0f, 0x10, 0x0a } ++ "text/plain".*;
+        const flags: u8 = http2.frame.FrameFlags.END_HEADERS |
+            (if (end_stream) http2.frame.FrameFlags.END_STREAM else @as(u8, 0));
+        try self.writeFrame(.HEADERS, flags, stream_id, &headers);
+    }
+
+    /// Reserve up to `n` bytes of send credit WITHOUT waiting: returns the
+    /// amount reserved, 0 when the window is exhausted or the stream/peer is
+    /// gone. For the server reader, which must never park on credit.
+    pub fn tryReserveSendCredit(self: *Transport, stream_id: u31, n: u32) u32 {
+        if (n == 0) return 0;
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
+        if (self.peer_gone) return 0;
+        const idx: ?usize = if (stream_id != 0 and @as(usize, stream_id) < self.stream_send_windows.len) @as(usize, stream_id) else null;
+        if (idx) |i| {
+            if (i < self.stream_reset.len and self.stream_reset[i]) return 0;
+        }
+        const stream_avail: i32 = if (idx) |i| self.stream_send_windows[i] else std.math.maxInt(i32);
+        const avail = @min(self.conn_send_window, stream_avail);
+        if (avail <= 0) return 0;
+        const grant: u32 = @min(n, @as(u32, @intCast(avail)));
+        self.conn_send_window -= @as(i32, @intCast(grant));
+        if (idx) |i| self.stream_send_windows[i] -= @as(i32, @intCast(grant));
+        return grant;
     }
 
     /// Write a gRPC response message.
