@@ -4,21 +4,20 @@
     .fingerprint = 0xbcaa61f2a4ef59ec,
     .dependencies = .{
         .zlib = .{
-            .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
-            .hash = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o",
+            .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz",
+            .hash = "N-V-__8AAI4ANwDM8MWhHTUFLKfvLE_n2NQk6mh0sFDzhTqO",
         },
         // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy).
         // SONNY-1852: pinned to the published fips via git+https so
         // `-Dfips=true` and CI resolve it from the registry instead of a
         // machine-specific build-root-relative `.path` (which only existed on
-        // the author's disk and broke every other checkout). Pinned to the
-        // EXACT commit/hash the geode root and the devnw/zig spine already use
-        // for fips v0.1.1 (#4041d9cf) — the v0.1.1 tag was later re-cut to
-        // #8b006e08, so pinning by the moving tag would fork the ecosystem's
-        // fips into a diamond. Match the root's content hash instead.
+        // the author's disk and broke every other checkout). Pinned by
+        // tag AND exact commit (fips v0.1.2, #2db29e0a) so a re-cut tag can't
+        // silently change the content hash (the v0.1.1 tag was re-cut once,
+        // #4041d9cf -> #8b006e08). Keep in lockstep with the spine's fips pin.
         .fips = .{
-            .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.1#4041d9cfdeadcab665644b3f4d3362c276f94bb7",
-            .hash = "fips-0.1.1-1wf3na01BwC3voljVu61_0g6DXp6BCedXrq4QMuMeQBq",
+            .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.2#2db29e0add6e2e6111b1f27c0fa72afd366f9092",
+            .hash = "fips-0.1.2-1wf3naNnBwDb429FDp9qyF1irQ7otgjMxUafGKxjYTMG",
             .lazy = true,
         },
     },

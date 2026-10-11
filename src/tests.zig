@@ -118,3 +118,8 @@ test "compression - none algorithm" {
 
     try testing.expectEqualStrings(original, decompressed);
 }
+
+test {
+    // Full HPACK decoder used by the server reader (h2spec gate).
+    _ = @import("hpack_decoder.zig");
+}

@@ -40,26 +40,26 @@ default:
 
 include:
   # Security scanning.
-  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
-  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.7.1
-  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.7.1
-  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
 
   # SBOM.
-  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.7.1
-  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
 
   # Semantic release on main / tags.
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.7.1
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
 
   # Zig formatting (Linux). Paths cover everything we author in this repo.
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
     inputs:
       zig_version: "0.16.0"
       paths: "src/ examples/ integration_test/ interop/zig/"
 
   # Zig build (Linux): compile lib + tests via the build.zig `check` step.
-  - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-build@v1.55.8
     inputs:
       stage: build
       zig_version: "0.16.0"
@@ -71,28 +71,28 @@ include:
   # default — so without this, jobs match any untagged runner including
   # the broken Lab Devices ARM GPU box (`linux` is in its tag_list, but
   # `company` is not).
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
       tags: ["company", "linux"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
@@ -105,29 +105,29 @@ include:
   # macOS/Windows catalog components run `zig build "$build_step" $build_options`,
   # so use `build_step: "check"` and leave `build_options` empty — our
   # build.zig defines `check` but not a top-level `build` step.
-  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.55.8
     inputs:
       zig_version: "0.16.0"
       build_step: "check"
       build_options: ""
-  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
-  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.55.8
     inputs:
       zig_version: "0.16.0"
       build_step: "check"
       build_options: ""
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.22.0
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
       tags: ["company", "windows"]
-  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.27.0
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -210,11 +210,14 @@ zig-test-unit-releasesmall-0.16.0:
 # ---------------------------------------------------------------
 
 .zig-host-base:
-  image: "ubuntu:24.04"
+  image: "ubuntu:26.04"
   interruptible: true
   before_script:
     - apt-get update -qq
-    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
+    # wget + sudo + gnupg + perl: required by scripts/install-openssl-fips.sh
+    # (canonical copy from devnw/zig/fips, kept byte-identical; sudo as root
+    # in the container is a no-op wrapper). Same as devnw/zig/fts-storage.
+    - apt-get install -y --no-install-recommends curl wget sudo gnupg ca-certificates xz-utils git build-essential python3 perl
     - bash scripts/install-zig.sh "$ZIG_VERSION"
     - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
     - zig version
@@ -252,7 +255,7 @@ conn-stack-test:
 # Must pass — this never fails because of grpc-zig protocol gaps.
 interop-go-go:
   stage: interop
-  image: "golang:1.22"
+  image: "golang:1.27.2"
   tags: ["company", "linux"]
   needs: []
   before_script:
@@ -272,7 +275,7 @@ interop-go-go:
 # protocol break — don't paper over it with `allow_failure`.
 interop-cross:
   stage: interop
-  image: "golang:1.22"
+  image: "golang:1.27.2"
   tags: ["company", "linux"]
   needs: ["zig-build-0.16.0"]
   before_script:
@@ -298,7 +301,7 @@ interop-cross:
 # than allowed to silently pass.
 interop-h2spec:
   stage: interop
-  image: "ubuntu:24.04"
+  image: "ubuntu:26.04"
   tags: ["company", "linux"]
   needs: ["zig-build-0.16.0"]
   before_script:
@@ -330,17 +333,28 @@ interop-h2spec:
 # FIPS-140-3 dual-mode test (-Dfips=true).
 #
 # `fips-deps` builds the latest OpenSSL 3.x + FIPS provider into
-# /usr/local/ssl (via the repo `make deps` target, which the ci-catalog
+# .openssl-fips/ (via the vendored scripts/install-openssl-fips.sh, which the ci-catalog
 # `zig-fips-build` component also provides). `test-fips` then runs the suite
 # against the validated FIPS backend. Linux-only; MR + default-branch.
 fips-deps:
   extends: .zig-host-base
   stage: build
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   script:
-    - make deps   # builds latest OpenSSL + FIPS provider into /usr/local/ssl
+    # GitLab artifacts must live under $CI_PROJECT_DIR — /usr/local/ssl is
+    # outside the project dir and cannot be uploaded, so build into a
+    # project-relative prefix instead (still handed to test-fips below).
+    # OPENSSL_VERSION pinned: the script's "latest 3.x" resolver greps
+    # releases/latest for an openssl-3.* tag, but the latest release is now
+    # the 4.x line, so the grep silently falls back to the system OpenSSL
+    # (no ML-KEM, fails verify-fips-provider.sh). Bump this pin alongside
+    # OpenSSL 3.x LTS releases (same pattern as devnw/zig/fts-storage).
+    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.3" bash scripts/install-openssl-fips.sh
   artifacts:
     paths:
-      - /usr/local/ssl
+      - .openssl-fips/
     expire_in: 1 day
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -349,8 +363,11 @@ fips-deps:
 test-fips:
   extends: .zig-host-base
   stage: test
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   script:
-    - OPENSSL_CONF=/usr/local/ssl/ssl/openssl.cnf zig build test -Dfips=true -Dopenssl_path=/usr/local/ssl --summary all
+    - OPENSSL_CONF="$CI_PROJECT_DIR/.openssl-fips/ssl/openssl.cnf" zig build test -Dfips=true -Dopenssl_path="$CI_PROJECT_DIR/.openssl-fips" --summary all
   needs:
     - fips-deps
   rules:

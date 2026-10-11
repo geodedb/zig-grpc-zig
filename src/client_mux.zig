@@ -101,6 +101,12 @@ pub const ClientMux = struct {
 
     streams: std.AutoHashMap(u31, *StreamSlot) = undefined,
     streams_mutex: std.Io.Mutex = .init,
+    /// Held from stream-id allocation until that stream's request is on the
+    /// wire. RFC 7540 §5.1.1 requires new stream ids to appear in
+    /// increasing order; without this, two callers could allocate 5 and 7
+    /// and write 7 first, which a conforming server (grpc-go, or ours)
+    /// treats as a connection error.
+    open_mutex: std.Io.Mutex = .init,
 
     /// Next outgoing stream id. Client-initiated streams must be odd
     /// (RFC 7540 §5.1.1) and monotonically increasing. We reserve id 1 for
@@ -262,15 +268,23 @@ pub const ClientMux = struct {
         const compressed = try self.compression.compress(request, compression_alg);
         defer self.allocator.free(compressed);
 
-        const sid = try self.allocStreamId();
-
         var slot: StreamSlot = .{};
         defer slot.deinit(self.allocator);
 
-        try self.registerStream(sid, &slot);
+        self.open_mutex.lockUncancelable(self.io);
+        const sid = self.allocStreamId() catch |err| {
+            self.open_mutex.unlock(self.io);
+            return err;
+        };
+        self.registerStream(sid, &slot) catch |err| {
+            self.open_mutex.unlock(self.io);
+            return err;
+        };
         defer self.unregisterStream(sid);
 
-        try self.transport.writeRequestOnStreamWithMetadata(sid, compressed, method_path, metadata);
+        const write_result = self.transport.writeRequestOnStreamWithMetadata(sid, compressed, method_path, metadata);
+        self.open_mutex.unlock(self.io);
+        try write_result;
 
         // Block until the reader thread signals end-of-stream or an error.
         slot.mutex.lockUncancelable(self.io);

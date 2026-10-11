@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
 
     var server = try GrpcServer.init(allocator, io, port, "interop");
     defer server.deinit();
-    try server.handlers.append(allocator, .{ .name = "Echo", .handler_fn = echoHandler });
+    try server.handlers.append(allocator, .{ .name = "/interop.Interop/Echo", .handler_fn = echoHandler });
 
     try server.start();
 }
