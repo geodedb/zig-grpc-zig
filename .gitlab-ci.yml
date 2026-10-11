@@ -51,6 +51,10 @@ include:
 
   # Semantic release on main / tags.
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
+    inputs:
+      # Create the GitLab Release with CI_JOB_TOKEN: the group GITLAB_TOKEN
+      # lacks api scope, so the default glab path fails with 403 (SONNY-2447).
+      release_auth: job_token
 
   # Zig formatting (Linux). Paths cover everything we author in this repo.
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
