@@ -306,7 +306,9 @@ interop-cross:
 interop-h2spec:
   stage: interop
   image: "ubuntu:26.04"
-  tags: ["company", "linux"]
+  # x86: the job downloads the h2spec_linux_amd64 release binary, which fails
+  # with "Exec format error" when the job lands on an ARM Linux runner.
+  tags: ["company", "linux", "x86"]
   needs: ["zig-build-0.16.0"]
   before_script:
     - apt-get update -qq

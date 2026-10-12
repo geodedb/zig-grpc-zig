@@ -1,6 +1,6 @@
 .{
     .name = .grpc_zig,
-    .version = "0.1.13",
+    .version = "0.1.14",
     .fingerprint = 0xbcaa61f2a4ef59ec,
     .dependencies = .{
         .zlib = .{
@@ -16,8 +16,8 @@
         // silently change the content hash (the v0.1.1 tag was re-cut once,
         // #4041d9cf -> #8b006e08). Keep in lockstep with the spine's fips pin.
         .fips = .{
-            .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.2#2db29e0add6e2e6111b1f27c0fa72afd366f9092",
-            .hash = "fips-0.1.2-1wf3naNnBwDb429FDp9qyF1irQ7otgjMxUafGKxjYTMG",
+            .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.3#f7395a3bab363d75b651be0775f43dd037c14a9c",
+            .hash = "fips-0.1.3-1wf3natvCACgXCcDLw4o0KwZtrNNpXyyRp1hNIA9oi2m",
             .lazy = true,
         },
     },
