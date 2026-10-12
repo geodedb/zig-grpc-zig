@@ -37,21 +37,35 @@ default:
   tags:
     - company
     - linux
+    - x86
 
 include:
   # Security scanning.
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # SBOM.
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Semantic release on main / tags.
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
     inputs:
+      tags: ["company", "linux", "x86"]
       # Create the GitLab Release with CI_JOB_TOKEN: the group GITLAB_TOKEN
       # lacks api scope, so the default glab path fails with 403 (SONNY-2447).
       release_auth: job_token
@@ -59,12 +73,14 @@ include:
   # Zig formatting (Linux). Paths cover everything we author in this repo.
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
     inputs:
+      tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       paths: "src/ examples/ integration_test/ interop/zig/"
 
   # Zig build (Linux): compile lib + tests via the build.zig `check` step.
   - component: gitlab.com/devnw/ci-catalog/zig-build@v1.55.8
     inputs:
+      tags: ["company", "linux", "x86"]
       stage: build
       zig_version: "0.16.0"
       build_options: "check"
@@ -81,28 +97,28 @@ include:
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
     inputs:
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
-      tags: ["company", "linux"]
+      tags: ["company", "linux", "x86"]
 
   # Cross-OS build smoke (gated). The Linux test matrix above is the source
   # of truth; macOS/Windows just confirm we still compile everywhere. The
@@ -132,6 +148,8 @@ include:
       test_step: "test"
       tags: ["company", "windows"]
   - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -379,3 +397,22 @@ test-fips:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# SONNY-4778: tools must not redirect Git operations into this worktree.
+hook-env-regression:
+  stage: lint
+  image: python:3.14-slim-bookworm
+  tags: [company, linux, x86]
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/test_hook_env.py
+
+# Exercise the distributed package after Zig applies build.zig.zon .paths.
+test-source-package:
+  extends: .zig-host-base
+  stage: test
+  tags: [company, linux, x86]
+  needs: []
+  script:
+    - python3 scripts/check_source_package.py --jobs 2
