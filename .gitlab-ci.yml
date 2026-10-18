@@ -373,7 +373,7 @@ fips-deps:
     # the 4.x line, so the grep silently falls back to the system OpenSSL
     # (no ML-KEM, fails verify-fips-provider.sh). Bump this pin alongside
     # OpenSSL 3.x LTS releases (same pattern as devnw/zig/fts-storage).
-    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.3" bash scripts/install-openssl-fips.sh
+    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.5" bash scripts/install-openssl-fips.sh
   artifacts:
     paths:
       - .openssl-fips/
