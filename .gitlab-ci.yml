@@ -124,11 +124,13 @@ include:
   # build.zig defines `check` but not a top-level `build` step.
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       build_step: "check"
       build_options: ""
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
@@ -173,9 +175,8 @@ stages:
   - when: manual
     allow_failure: true
 
-# Cross-OS jobs are best-effort: GitLab's SaaS macOS fleet has been known
-# to hang for >25 min provisioning a VM (stuck on
-# "Creating nesting VM macos-15-xcode-16"). Three guards:
+# Cross-OS jobs are best-effort: a macOS or Windows runner can be busy or
+# offline for a long time. Three guards:
 #   * `allow_failure: true` — a stuck cross-OS job never fails the pipeline.
 #   * `timeout: 10m` — auto-cancel anything that sits in provisioning
 #     longer than a real run could plausibly need.
@@ -417,8 +418,7 @@ test-source-package:
 # Exercise OS entropy natively: cross-compilation cannot detect a wrong syscall.
 test-portable-entropy-macos:
   stage: test
-  image: macos-26-xcode-26
-  tags: [saas-macos-medium-m1]
+  tags: [dedicated, macos, arm]
   timeout: 10m
   interruptible: true
   needs: []
