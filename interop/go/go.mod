@@ -1,9 +1,9 @@
 module gitlab.com/devnw/zig/grpc-zig/interop/go
 
-go 1.27.3
+go 1.27.4
 
 require (
-	google.golang.org/grpc v1.84.0
+	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
 

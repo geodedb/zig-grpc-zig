@@ -275,7 +275,7 @@ conn-stack-test:
 # Must pass — this never fails because of grpc-zig protocol gaps.
 interop-go-go:
   stage: interop
-  image: "golang:1.27.3"
+  image: "golang:1.27.4"
   tags: ["company", "linux"]
   needs: []
   before_script:
@@ -295,7 +295,7 @@ interop-go-go:
 # protocol break — don't paper over it with `allow_failure`.
 interop-cross:
   stage: interop
-  image: "golang:1.27.3"
+  image: "golang:1.27.4"
   tags: ["company", "linux"]
   needs: ["zig-build-0.16.0"]
   before_script:
